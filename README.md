@@ -21,23 +21,8 @@
 如果系统已安装 ROS2 Humble 则跳过此步。
 
 ```bash
-# 设置 locale
-sudo apt update && sudo apt install locales
-sudo locale-gen en_US en_US.UTF-8
-sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-
-# 添加 ROS2 源
-sudo apt install software-properties-common
-sudo add-apt-repository universe
-sudo apt update && sudo apt install curl -y
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-
-# 安装
 sudo apt update
 sudo apt install ros-humble-ros-base ros-humble-vision-msgs python3-colcon-common-extensions -y
-
-# 写入 bashrc
 echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
 source ~/.bashrc
 ```
@@ -50,30 +35,19 @@ cd ~/ros2_ws
 git clone git@github.com:Tsumugi-W/detect_3588.git .
 ```
 
-或者如果已有代码，直接把 `src/panel_detection` 放入你的 ROS2 工作空间的 `src/` 下。
-
-### 第三步：安装 Python 依赖
+### 第三步：安装 Python 依赖（系统级）
 
 ```bash
-cd ~/ros2_ws
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
+# 清华镜像加速
+sudo pip3 install onnxruntime -i https://pypi.tuna.tsinghua.edu.cn/simple
+sudo pip3 install "numpy<2" -i https://pypi.tuna.tsinghua.edu.cn/simple
+sudo pip3 install pyorbbecsdk2 -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 核心依赖
-pip install onnxruntime
-pip install opencv-python
-pip install numpy
-pip install pyyaml
+# opencv、pyyaml 通常系统已自带，如果没有：
+# sudo pip3 install opencv-python pyyaml -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 相机 SDK (Orbbec)
-pip install pyorbbecsdk2
-
-# 如果使用 RealSense 相机则安装:
-# pip install pyrealsense2
-
-# 模型导出时需要 (运行时不需要):
-# pip install torch==2.7.0 torchvision==0.22.0 onnx
+# 如果使用 RealSense 相机：
+# sudo pip3 install pyrealsense2 -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 ### 第四步：配置相机权限
@@ -81,25 +55,17 @@ pip install pyorbbecsdk2
 **Orbbec 相机：**
 
 ```bash
-source .venv/bin/activate
 sudo bash $(python3 -c "import pyorbbecsdk,os; print(os.path.dirname(pyorbbecsdk.__file__))")/shared/install_udev_rules.sh
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-配置完成后需要**重新插拔相机** USB 线。
-
-**RealSense 相机：**
-
-```bash
-sudo apt install ros-humble-librealsense2* -y
-```
+配置完成后**重新插拔相机** USB 线。
 
 ### 第五步：编译
 
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
-source .venv/bin/activate
 colcon build --packages-select panel_detection
 source install/setup.bash
 ```
@@ -107,29 +73,21 @@ source install/setup.bash
 ### 第六步：运行
 
 ```bash
-# 确保环境已 source (每次新终端都需要)
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/.venv/bin/activate
-source ~/ros2_ws/install/setup.bash
-
-# 启动节点
-python3 -m panel_detection.panel_detect_node
+ros2 launch panel_detection panel_detection.launch.py
 ```
 
 启动后会弹出可视化窗口，显示检测框、3D 坐标、旋钮角度。按 `q` 或 `ESC` 退出。
 
-### 可选：写入 bashrc 简化启动
+### 可选：写入 bashrc 简化日常使用
 
 ```bash
-echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
-echo "source ~/ros2_ws/.venv/bin/activate" >> ~/.bashrc
 echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 ```
 
-之后每次打开终端直接运行：
+之后每次打开终端直接：
 
 ```bash
-python3 -m panel_detection.panel_detect_node
+ros2 launch panel_detection panel_detection.launch.py
 ```
 
 ## 发布话题
@@ -186,19 +144,9 @@ pose:
 
 ```bash
 # 另开终端
-source /opt/ros/humble/setup.bash
-source ~/ros2_ws/install/setup.bash
-
-# 查看所有活跃话题
 ros2 topic list
-
-# 查看旋钮位姿
 ros2 topic echo /panel/knobs
-
-# 查看旋钮角度
 ros2 topic echo /panel/knob_angles
-
-# 查看发布频率
 ros2 topic hz /panel/knobs
 ```
 
@@ -230,16 +178,15 @@ class PanelSubscriber(Node):
 
 ## 配置说明
 
-节点启动时默认使用内置配置。如需自定义，创建 yaml 文件并通过参数传入：
+创建 yaml 文件通过参数传入：
 
 ```bash
-python3 -m panel_detection.panel_detect_node --ros-args -p config_path:=/path/to/config.yaml
+ros2 launch panel_detection panel_detection.launch.py config_path:=/path/to/config.yaml
 ```
 
-配置文件示例：
+配置示例：
 
 ```yaml
-# 相机
 camera_backend: 'orbbec'       # 'orbbec' | 'realsense'
 camera:
   color_width: 1280
@@ -248,26 +195,18 @@ camera:
   depth_height: 720
   fps: 30
 
-# 推理
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
 onnx_model: '0520.onnx'
 onnx_threads: 4
 
-# 模型
-weight: '0520.pt'
-input_size: 640
 class_num: 7
 class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button']
 threshold:
   confidence: 0.3
   iou: 0.01
 
-# 旋钮角度
 knob_angle:
   enable: true
-  binary_thresh: 180
-  circle_mask_ratio: 0.85
-  knob_class: 'knob'
 ```
 
 ## 目录结构
@@ -277,55 +216,50 @@ ros2_ws/
 ├── README.md
 ├── .gitignore
 └── src/
-    └── panel_detection/            # ROS2 功能包
+    └── panel_detection/
         ├── package.xml
         ├── setup.py
         ├── setup.cfg
+        ├── launch/
+        │   └── panel_detection.launch.py
         ├── resource/panel_detection
-        └── panel_detection/        # 源码 + 模型 (自包含)
+        └── panel_detection/
             ├── __init__.py
-            ├── panel_detect_node.py    # 主节点
-            ├── camera/                 # 相机抽象层
+            ├── panel_detect_node.py
+            ├── camera/
             │   ├── __init__.py
             │   ├── base.py
             │   ├── orbbec.py
             │   └── realsense.py
-            ├── depth_utils.py          # 深度处理工具
-            ├── detector_onnx.py        # ONNX 推理器
-            ├── detector_rknn.py        # RKNN 推理器
-            ├── knob_angle.py           # 旋钮角度估计
-            ├── 0520.onnx               # ONNX 模型 (部署用)
-            └── 0520.pt                 # PyTorch 权重 (导出用)
+            ├── depth_utils.py
+            ├── detector_onnx.py
+            ├── detector_rknn.py
+            ├── knob_angle.py
+            ├── 0520.onnx
+            └── 0520.pt
 ```
 
 ## 常见问题
 
 **Q: 启动报 `No device found`**
 
-相机未连接或权限未配置。检查：
-- USB 线是否插好
-- 是否执行了 udev 规则安装
-- 是否重新插拔了相机
+相机未连接或权限未配置。检查 USB 连接和 udev 规则。
 
 **Q: 启动报 `No module named 'onnxruntime'`**
 
-Python 环境未正确激活。确保：
 ```bash
-source ~/ros2_ws/.venv/bin/activate
+sudo pip3 install onnxruntime -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-**Q: 检测帧率太低**
+**Q: numpy 版本冲突 (`_ARRAY_API not found`)**
 
-- 降低相机分辨率（640x480 比 1280x720 快一倍）
-- 调整 `onnx_threads` 参数
-- 未来可切换到 RKNN NPU 推理（~30FPS）
+```bash
+sudo pip3 install "numpy<2" -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
 
 **Q: 如何切换到 RealSense 相机**
 
-在配置文件中修改：
-```yaml
-camera_backend: 'realsense'
-```
+通过配置文件或直接改 `panel_detect_node.py` 中 `DEFAULT_CONFIG` 的 `camera_backend` 为 `'realsense'`。
 
 ## 许可证
 

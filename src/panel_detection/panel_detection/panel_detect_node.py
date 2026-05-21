@@ -234,7 +234,6 @@ class PanelDetectionNode(Node):
             threads = self.cfg.get('onnx_threads', 4)
             self.get_logger().info(f'推理后端: ONNX Runtime ({onnx_path})')
 
-            # 临时写一个 config 给 detector
             import tempfile
             tmp_cfg = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
             yaml.dump(self.cfg, tmp_cfg)
@@ -243,11 +242,15 @@ class PanelDetectionNode(Node):
             det = YoloV5ORT(onnx_path=onnx_path, config_path=tmp_cfg.name, threads=threads)
             os.unlink(tmp_cfg.name)
 
-            # 尝试从 PT 加载类别名
-            pt_path = self.cfg.get('weight', '0520.pt')
-            if not os.path.isabs(pt_path):
-                pt_path = os.path.join(pkg_dir, pt_path)
-            self._try_load_names(det, pt_path)
+            # 从配置文件设置类别名
+            class_names = self.cfg.get('class_name', [])
+            if class_names:
+                import random
+                det.class_names = class_names
+                det.class_num = len(class_names)
+                det.colors = [[random.randint(0, 255) for _ in range(3)]
+                              for _ in range(det.class_num)]
+            self.get_logger().info(f'模型类别: {det.class_names}')
             return det
 
         if backend == 'rknn':
@@ -266,25 +269,6 @@ class PanelDetectionNode(Node):
             return det
 
         return None
-
-    def _try_load_names(self, detector, pt_path):
-        try:
-            import torch
-            ckpt = torch.load(pt_path, map_location='cpu', weights_only=False)
-            model = ckpt.get('ema') or ckpt.get('model')
-            if hasattr(model, 'names') and model.names:
-                names = model.names
-                if isinstance(names, dict):
-                    detector.class_names = [names[i] for i in sorted(names.keys())]
-                else:
-                    detector.class_names = list(names)
-                detector.class_num = len(detector.class_names)
-                import random
-                detector.colors = [[random.randint(0, 255) for _ in range(3)]
-                                   for _ in range(detector.class_num)]
-                self.get_logger().info(f'模型类别: {detector.class_names}')
-        except Exception as e:
-            self.get_logger().warn(f'无法加载类别名: {e}')
 
     def _detection_callback(self):
         if not self._camera_ready:
