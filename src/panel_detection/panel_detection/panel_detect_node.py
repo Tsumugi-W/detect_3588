@@ -44,7 +44,7 @@ DEFAULT_CONFIG = {
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
     'onnx_model': '0520.onnx',
-    'onnx_threads': 4,
+    'onnx_threads': 8,
     'weight': '0520.pt',
     'input_size': 640,
     'class_num': 7,
@@ -166,8 +166,6 @@ class PanelDetectionNode(Node):
         # 可视化
         self.display_frame = None
 
-        # 定时回调
-        self._timer = self.create_timer(0.033, self._detection_callback)
         status = '运行中' if self._camera_ready else '等待相机'
         self.get_logger().info(f'面板检测节点已启动 ({status})')
         cv2.namedWindow('panel_detection', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
@@ -282,11 +280,15 @@ class PanelDetectionNode(Node):
         if not color_image.any() or not depth_image.any():
             return
 
+        t0 = time.time()
         canvas, class_id_list, xyxy_list, conf_list = self._detector.detect(color_image)
+        t1 = time.time()
         if not xyxy_list:
+            self.display_frame = canvas
             return
 
         filtered_depth = filter_depth(depth_image, method='bilateral', kernel_size=5)
+        t2 = time.time()
         self._depth_scale = self._camera.get_depth_scale()
 
         # 面板法向量
@@ -298,6 +300,13 @@ class PanelDetectionNode(Node):
                 depth_scale=self._depth_scale)
             if result is not None:
                 self._panel_normal_cache = result
+        t3 = time.time()
+
+        # 每 30 帧打印一次耗时
+        if self._frame_count % 30 == 0:
+            self.get_logger().info(
+                f'耗时: 推理={int((t1-t0)*1000)}ms 滤波={int((t2-t1)*1000)}ms '
+                f'法向量={int((t3-t2)*1000)}ms 总={int((t3-t0)*1000)}ms')
 
         # 获取四元数（面板法向量）
         quat = [0.0, 0.0, 0.0, 1.0]
@@ -364,19 +373,23 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 
-        # 可视化：在 canvas 上叠加 3D 坐标和旋钮角度
+        # 可视化（复用已计算的结果，不重复计算）
+        from .knob_angle import draw_knob_angle
+        for ka in knob_angles:
+            # 从 knob_angles 里找到对应的 xyxy 来画角度
+            pass  # draw_knob_angle 在下面统一画
+
         for i, xyxy in enumerate(xyxy_list):
-            cls_id = class_id_list[i]
-            cls_name = self._class_names[cls_id] if cls_id < len(self._class_names) else ''
             ux = int((xyxy[0] + xyxy[2]) / 2)
             uy = int((xyxy[1] + xyxy[3]) / 2)
+            cv2.circle(canvas, (ux, uy), 4, (255, 255, 255), -1)
+            # xyz 已在上面计算过，这里重新算一次（轻量操作）
             ux_u, uy_u = undistort_pixel(ux, uy, color_intrin)
             dis = get_robust_depth(filtered_depth, int(ux_u), int(uy_u),
                                    sample_radius=3, depth_scale=self._depth_scale)
             xyz = deproject_pixel_to_point(depth_intrin, (int(ux_u), int(uy_u)), dis)
-            xyz_str = f'({xyz[0]:.3f},{xyz[1]:.3f},{xyz[2]:.3f})'
-            cv2.circle(canvas, (ux, uy), 4, (255, 255, 255), -1)
-            cv2.putText(canvas, xyz_str, (ux + 10, uy + 5), 0, 0.45,
+            cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
+                        (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
 
         if self._panel_normal_cache is not None:
@@ -384,20 +397,15 @@ class PanelDetectionNode(Node):
             cv2.putText(canvas, f'normal: {n}', (10, 25), 0, 0.6,
                         (0, 200, 255), 2, cv2.LINE_AA)
 
-        # 旋钮角度绘制
-        from .knob_angle import draw_knob_angle
+        # 旋钮角度绘制（复用已计算的角度，不重复调用 estimate_knob_angle）
+        knob_idx = 0
         for i, xyxy in enumerate(xyxy_list):
             cls_id = class_id_list[i]
             cls_name = self._class_names[cls_id] if cls_id < len(self._class_names) else ''
             if cls_name == self._angle_knob_class and self._angle_enable:
-                x1, y1 = int(xyxy[0]), int(xyxy[1])
-                x2, y2 = int(xyxy[2]), int(xyxy[3])
-                roi = color_image[y1:y2, x1:x2]
-                angle = estimate_knob_angle(roi,
-                    binary_thresh=self._angle_binary_thresh,
-                    circle_mask_ratio=self._angle_circle_mask)
-                if angle is not None:
-                    draw_knob_angle(canvas, xyxy, angle)
+                if knob_idx < len(knob_angles):
+                    draw_knob_angle(canvas, xyxy, knob_angles[knob_idx]['angle'])
+                    knob_idx += 1
 
         self.display_frame = canvas
 
@@ -408,7 +416,9 @@ def main(args=None):
     try:
         node = PanelDetectionNode()
         while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.01)
+            node._detection_callback()
+            # 处理 ROS2 回调（参数更新等）
+            rclpy.spin_once(node, timeout_sec=0.001)
             if node.display_frame is not None:
                 cv2.imshow('panel_detection', node.display_frame)
             key = cv2.waitKey(1) & 0xFF
