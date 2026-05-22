@@ -1,18 +1,14 @@
 """
 ROS2 面板检测节点
 
-检测操作面板上的 7 类目标，每类一个独立话题，发布 PoseStamped。
-旋钮角度通过额外话题 /panel/knob_angles 发布。
+两阶段工作流：
+  1. 注册阶段：积累多帧检测结果，按 x 坐标排序 + 类别/颜色验证后为 7 个目标分配编号 1-7
+  2. 跟踪阶段：每帧检测结果匹配注册表，发布带编号的检测结果
 
 话题:
-  /panel/lights    (PoseStamped)  — 指示灯 3D 位姿
-  /panel/knobs     (PoseStamped)  — 旋钮 3D 位姿
-  /panel/buttons   (PoseStamped)  — 按钮 3D 位姿
-  /panel/bolts     (PoseStamped)  — 螺栓 3D 位姿
-  /panel/nuts      (PoseStamped)  — 螺母 3D 位姿
-  /panel/valves    (PoseStamped)  — 阀门 3D 位姿
-  /panel/pumps     (PoseStamped)  — 泵 3D 位姿
-  /panel/knob_angles (String, JSON) — 旋钮角度信息
+  /panel/targets   (String, JSON) — 带编号的检测结果（位置 + 类别 + ID）
+  /panel/knob_angles (String, JSON) — 旋钮角度信息（带编号）
+  /panel/status    (String)       — 注册状态（registering / registered）
 """
 import os
 import math
@@ -27,6 +23,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
+from sensor_msgs.msg import Image, CameraInfo
 
 from .camera import create_backend
 from .camera.base import CameraIntrinsics
@@ -35,6 +32,7 @@ from .depth_utils import (
     filter_depth, get_robust_depth, compute_panel_normal,
 )
 from .knob_angle import estimate_knob_angle
+from .target_registry import TargetRegistry, FrameDetection
 
 
 # ─── 配置 ─────────────────────────────────────────────────────────────────────
@@ -128,19 +126,45 @@ class PanelDetectionNode(Node):
             self.get_logger().info('使用默认配置')
             self.cfg = DEFAULT_CONFIG
 
-        # 创建话题 publisher (每类一个 PoseStamped)
+        # 创建话题 publisher (每类一个 PoseStamped，保留兼容)
         self._pose_pubs = {}
         for cls_name, topic in CLASS_TOPIC_MAP.items():
             self._pose_pubs[cls_name] = self.create_publisher(PoseStamped, topic, 10)
 
-        # 旋钮角度话题
+        # 带编号的统一话题
+        self._targets_pub = self.create_publisher(String, '/panel/targets', 10)
+        self._status_pub = self.create_publisher(String, '/panel/status', 10)
         self._angle_pub = self.create_publisher(String, '/panel/knob_angles', 10)
 
-        # 初始化相机
+        # 目标注册器
+        reg_cfg = self.cfg.get('registry', {})
+        self._registry = TargetRegistry(
+            stable_frames=reg_cfg.get('stable_frames', 15),
+            green_hue_range=tuple(reg_cfg.get('green_hue_range', [35, 85])),
+            match_distance_thresh=reg_cfg.get('match_distance_thresh', 80),
+        )
+
+        # 相机来源：直接连接 or 话题订阅
+        self.declare_parameter('use_topic', False)
+        self._use_topic = self.get_parameter('use_topic').get_parameter_value().bool_value
+
         self._camera = None
-        self._depth_scale = 0.001
+        # Orbbec 官方驱动深度图单位为 mm，× 0.001 转米
+        self._depth_scale = self.cfg.get('depth_scale', 0.001)
         self._camera_ready = False
-        self._init_camera()
+
+        # 话题订阅模式的缓存
+        self._topic_color = None
+        self._topic_depth = None
+        self._topic_color_intrin = None
+        self._topic_depth_intrin = None
+
+        if self._use_topic:
+            self._init_subscribers()
+            self._camera_ready = True
+            self.get_logger().info('使用话题订阅模式')
+        else:
+            self._init_camera()
 
         # 初始化检测器
         self._detector = self._create_detector()
@@ -169,6 +193,50 @@ class PanelDetectionNode(Node):
         status = '运行中' if self._camera_ready else '等待相机'
         self.get_logger().info(f'面板检测节点已启动 ({status})')
         cv2.namedWindow('panel_detection', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+
+    def _init_subscribers(self):
+        """订阅相机话题"""
+        from message_filters import ApproximateTimeSynchronizer, Subscriber
+        self._sub_color = Subscriber(self, Image, '/camera/color/image_raw')
+        self._sub_depth = Subscriber(self, Image, '/camera/depth/image_raw')
+        self._sub_color_info = Subscriber(self, CameraInfo, '/camera/color/camera_info')
+        self._sub_depth_info = Subscriber(self, CameraInfo, '/camera/depth/camera_info')
+
+        sync = ApproximateTimeSynchronizer(
+            [self._sub_color, self._sub_depth,
+             self._sub_color_info, self._sub_depth_info],
+            queue_size=5, slop=0.05)
+        sync.registerCallback(self._topic_callback)
+        self._sync = sync
+
+    def _topic_callback(self, color_msg, depth_msg, color_info_msg, depth_info_msg):
+        """接收同步的相机数据"""
+        # 解析彩色图
+        color_image = np.frombuffer(color_msg.data, dtype=np.uint8).reshape(
+            color_msg.height, color_msg.width, 3)
+
+        # 解析深度图
+        depth_image = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(
+            depth_msg.height, depth_msg.width)
+
+        # 解析内参
+        color_intrin = CameraIntrinsics(
+            fx=color_info_msg.k[0], fy=color_info_msg.k[4],
+            cx=color_info_msg.k[2], cy=color_info_msg.k[5],
+            width=color_info_msg.width, height=color_info_msg.height,
+            coeffs=list(color_info_msg.d) if color_info_msg.d else [0.0]*5,
+        )
+        depth_intrin = CameraIntrinsics(
+            fx=depth_info_msg.k[0], fy=depth_info_msg.k[4],
+            cx=depth_info_msg.k[2], cy=depth_info_msg.k[5],
+            width=depth_info_msg.width, height=depth_info_msg.height,
+            coeffs=list(depth_info_msg.d) if depth_info_msg.d else [0.0]*5,
+        )
+
+        self._topic_color = color_image
+        self._topic_depth = depth_image
+        self._topic_color_intrin = color_intrin
+        self._topic_depth_intrin = depth_intrin
 
     def _init_camera(self):
         backend_type = self.cfg.get('camera_backend', 'orbbec')
@@ -273,10 +341,19 @@ class PanelDetectionNode(Node):
             self._try_reconnect_camera()
             return
 
-        color_intrin, depth_intrin, color_image, depth_image = \
-            self._camera.get_aligned_frames()
-        if color_intrin is None:
-            return
+        if self._use_topic:
+            color_intrin = self._topic_color_intrin
+            depth_intrin = self._topic_depth_intrin
+            color_image = self._topic_color
+            depth_image = self._topic_depth
+            if color_intrin is None or color_image is None:
+                return
+        else:
+            color_intrin, depth_intrin, color_image, depth_image = \
+                self._camera.get_aligned_frames()
+            if color_intrin is None:
+                return
+
         if not color_image.any() or not depth_image.any():
             return
 
@@ -289,7 +366,8 @@ class PanelDetectionNode(Node):
 
         filtered_depth = filter_depth(depth_image, method='bilateral', kernel_size=5)
         t2 = time.time()
-        self._depth_scale = self._camera.get_depth_scale()
+        if not self._use_topic:
+            self._depth_scale = self._camera.get_depth_scale()
 
         # 面板法向量
         self._frame_count += 1
@@ -315,23 +393,73 @@ class PanelDetectionNode(Node):
             quat = _normal_to_quaternion(normal)
 
         stamp = self.get_clock().now().to_msg()
-        knob_angles = []
 
+        # 构建当前帧的 FrameDetection 列表
+        frame_detections = []
         for i, xyxy in enumerate(xyxy_list):
             cls_id = class_id_list[i]
             cls_name = self._class_names[cls_id] if cls_id < len(self._class_names) else 'unknown'
+            cx = (xyxy[0] + xyxy[2]) / 2.0
+            cy = (xyxy[1] + xyxy[3]) / 2.0
+            frame_detections.append(FrameDetection(
+                class_name=cls_name,
+                center_x=cx,
+                center_y=cy,
+                bbox=tuple(xyxy[:4]),
+                confidence=float(conf_list[i]),
+            ))
 
-            # 计算 3D 坐标
-            ux = int((xyxy[0] + xyxy[2]) / 2)
-            uy = int((xyxy[1] + xyxy[3]) / 2)
+        # ─── 注册阶段 ───
+        if not self._registry.is_registered:
+            registered = self._registry.update(frame_detections, color_image)
+            status_msg = String()
+            if registered:
+                self.get_logger().info('目标注册完成！')
+                for t in self._registry.targets:
+                    self.get_logger().info(
+                        f'  ID={t.target_id} {t.class_name} '
+                        f'({t.center_x:.0f}, {t.center_y:.0f})')
+                status_msg.data = 'registered'
+            else:
+                status_msg.data = 'registering'
+            self._status_pub.publish(status_msg)
+
+            # 注册阶段可视化：显示状态
+            cv2.putText(canvas, f'Registering... ({self._registry._stable_count}'
+                        f'/{self._registry._stable_frames})',
+                        (10, 25), 0, 0.7, (0, 128, 255), 2, cv2.LINE_AA)
+            self.display_frame = canvas
+            return
+
+        # ─── 跟踪阶段 ───
+        matched = self._registry.match(frame_detections)
+
+        targets_output = []
+        knob_angles = []
+
+        for target_id, det in matched:
+            ux = int(det.center_x)
+            uy = int(det.center_y)
             ux_u, uy_u = undistort_pixel(ux, uy, color_intrin)
             ux_u, uy_u = int(ux_u), int(uy_u)
             dis = get_robust_depth(filtered_depth, ux_u, uy_u,
                                    sample_radius=3, depth_scale=self._depth_scale)
             xyz = deproject_pixel_to_point(depth_intrin, (ux_u, uy_u), dis)
 
-            # 发布 PoseStamped
-            pub = self._pose_pubs.get(cls_name)
+            target_info = {
+                'id': target_id,
+                'class': det.class_name,
+                'position': {'x': round(xyz[0], 4),
+                             'y': round(xyz[1], 4),
+                             'z': round(xyz[2], 4)},
+                'orientation': {'x': quat[0], 'y': quat[1],
+                                'z': quat[2], 'w': quat[3]},
+                'confidence': round(det.confidence, 3),
+            }
+            targets_output.append(target_info)
+
+            # 兼容旧话题
+            pub = self._pose_pubs.get(det.class_name)
             if pub is not None:
                 msg = PoseStamped()
                 msg.header.stamp = stamp
@@ -346,9 +474,9 @@ class PanelDetectionNode(Node):
                 pub.publish(msg)
 
             # 旋钮角度
-            if cls_name == self._angle_knob_class and self._angle_enable:
-                x1, y1 = int(xyxy[0]), int(xyxy[1])
-                x2, y2 = int(xyxy[2]), int(xyxy[3])
+            if det.class_name == self._angle_knob_class and self._angle_enable:
+                x1, y1 = int(det.bbox[0]), int(det.bbox[1])
+                x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
                 angle = estimate_knob_angle(
                     roi,
@@ -357,12 +485,22 @@ class PanelDetectionNode(Node):
                 )
                 if angle is not None:
                     knob_angles.append({
+                        'id': target_id,
                         'position': {'x': round(xyz[0], 4),
                                      'y': round(xyz[1], 4),
                                      'z': round(xyz[2], 4)},
                         'angle': round(angle, 1),
-                        'confidence': round(float(conf_list[i]), 3),
+                        'confidence': round(det.confidence, 3),
                     })
+
+        # 发布带编号的检测结果
+        if targets_output:
+            msg = String()
+            msg.data = json.dumps({
+                'stamp': stamp.sec + stamp.nanosec * 1e-9,
+                'targets': targets_output,
+            }, ensure_ascii=False)
+            self._targets_pub.publish(msg)
 
         # 发布旋钮角度
         if knob_angles:
@@ -373,17 +511,20 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 
-        # 可视化（复用已计算的结果，不重复计算）
+        # ─── 可视化 ───
         from .knob_angle import draw_knob_angle
-        for ka in knob_angles:
-            # 从 knob_angles 里找到对应的 xyxy 来画角度
-            pass  # draw_knob_angle 在下面统一画
 
-        for i, xyxy in enumerate(xyxy_list):
-            ux = int((xyxy[0] + xyxy[2]) / 2)
-            uy = int((xyxy[1] + xyxy[3]) / 2)
+        for target_id, det in matched:
+            ux = int(det.center_x)
+            uy = int(det.center_y)
             cv2.circle(canvas, (ux, uy), 4, (255, 255, 255), -1)
-            # xyz 已在上面计算过，这里重新算一次（轻量操作）
+
+            # 显示编号
+            cv2.putText(canvas, f'#{target_id}',
+                        (ux - 10, uy - 15), 0, 0.6,
+                        (0, 255, 0), 2, cv2.LINE_AA)
+
+            # 显示3D坐标
             ux_u, uy_u = undistort_pixel(ux, uy, color_intrin)
             dis = get_robust_depth(filtered_depth, int(ux_u), int(uy_u),
                                    sample_radius=3, depth_scale=self._depth_scale)
@@ -397,15 +538,15 @@ class PanelDetectionNode(Node):
             cv2.putText(canvas, f'normal: {n}', (10, 25), 0, 0.6,
                         (0, 200, 255), 2, cv2.LINE_AA)
 
-        # 旋钮角度绘制（复用已计算的角度，不重复调用 estimate_knob_angle）
-        knob_idx = 0
-        for i, xyxy in enumerate(xyxy_list):
-            cls_id = class_id_list[i]
-            cls_name = self._class_names[cls_id] if cls_id < len(self._class_names) else ''
-            if cls_name == self._angle_knob_class and self._angle_enable:
-                if knob_idx < len(knob_angles):
-                    draw_knob_angle(canvas, xyxy, knob_angles[knob_idx]['angle'])
-                    knob_idx += 1
+        # 旋钮角度绘制
+        for ka in knob_angles:
+            for target_id, det in matched:
+                if target_id == ka['id']:
+                    draw_knob_angle(canvas, det.bbox, ka['angle'])
+                    break
+
+        cv2.putText(canvas, 'REGISTERED', (10, canvas.shape[0] - 15),
+                    0, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
         self.display_frame = canvas
 

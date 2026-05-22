@@ -135,8 +135,9 @@ class OrbbecBackend(CameraBackend):
         if color_frame is None or depth_frame is None:
             return None, None, None, None
 
-        # 更新深度缩放因子
-        self._depth_scale = depth_frame.get_depth_scale()
+        # Orbbec SDK get_depth_scale() 返回：原始值 × scale = 毫米
+        # 统一转为米：再除以 1000
+        self._depth_scale = depth_frame.get_depth_scale() * 0.001
 
         # 转换为 numpy
         color_image = _frame_to_bgr(color_frame)

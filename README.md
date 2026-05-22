@@ -2,7 +2,24 @@
 
 基于 YOLOv5 + 深度相机的操作面板实时 3D 检测系统，封装为标准 ROS2 Humble 功能包。
 
-检测 7 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)，输出每个目标的 3D 位姿(PoseStamped)和旋钮角度。
+检测 7 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)。支持目标注册编号和旋钮角度估计。
+
+## 系统架构
+
+```
+Orbbec 官方驱动 (独立 launch)
+    ├── /camera/color/image_raw
+    ├── /camera/depth/image_raw
+    ├── /camera/color/camera_info
+    └── /camera/depth/camera_info
+            │
+            ▼
+面板检测节点 (话题订阅模式)
+    ├── /panel/targets       (带编号的检测结果)
+    ├── /panel/knob_angles   (旋钮角度)
+    ├── /panel/status        (注册状态)
+    └── /panel/buttons, /panel/knobs ...  (兼容旧话题)
+```
 
 ## 平台要求
 
@@ -32,7 +49,7 @@ source ~/.bashrc
 ```bash
 mkdir -p ~/ros2_ws
 cd ~/ros2_ws
-git clone git@github.com:Tsumugi-W/detect_3588.git .
+git clone --recursive git@github.com:Tsumugi-W/detect_3588.git .
 ```
 
 ### 第三步：安装 Python 依赖（系统级）
@@ -66,17 +83,21 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
-colcon build --packages-select panel_detection
+colcon build
 source install/setup.bash
 ```
 
 ### 第六步：运行
 
 ```bash
+# 终端1：启动相机
+ros2 launch panel_detection camera.launch.py
+
+# 终端2：启动检测节点
 ros2 launch panel_detection panel_detection.launch.py
 ```
 
-启动后会弹出可视化窗口，显示检测框、3D 坐标、旋钮角度。按 `q` 或 `ESC` 退出。
+启动后检测节点会弹出可视化窗口。启动后先进入**注册阶段**（积累稳定帧为目标分配编号），注册完成后进入**跟踪阶段**（发布带编号的检测结果）。按 `q` 或 `ESC` 退出。
 
 ### 可选：写入 bashrc 简化日常使用
 
@@ -84,53 +105,58 @@ ros2 launch panel_detection panel_detection.launch.py
 echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 ```
 
-之后每次打开终端直接：
+## 两阶段工作流
 
-```bash
-ros2 launch panel_detection panel_detection.launch.py
-```
+### 注册阶段
+
+节点启动后自动进入注册阶段：
+1. 等待连续 N 帧同时检测到 5 个按钮 + 2 个旋钮
+2. 按 x 坐标从左到右排序
+3. 验证布局：[button, button, button, knob, knob, button, button]
+4. 验证第 1 个按钮为绿色
+5. 验证通过后分配编号 1-7
+
+### 跟踪阶段
+
+注册完成后，每帧检测结果与注册表匹配，输出带编号的目标信息。
 
 ## 发布话题
 
-每检测到一个目标，在对应类别话题上发布一条 `geometry_msgs/PoseStamped`。
+### /panel/targets (String, JSON) — 主话题
 
-| 话题 | 类别 | 消息类型 |
-|------|------|----------|
-| `/panel/lights` | 指示灯 | PoseStamped |
-| `/panel/knobs` | 旋钮 | PoseStamped |
-| `/panel/buttons` | 按钮 | PoseStamped |
-| `/panel/bolts` | 螺栓 | PoseStamped |
-| `/panel/nuts` | 螺母 | PoseStamped |
-| `/panel/valves` | 阀门 | PoseStamped |
-| `/panel/pumps` | 泵 | PoseStamped |
-| `/panel/knob_angles` | 旋钮角度 | String (JSON) |
-
-### PoseStamped 格式
-
-```
-header:
-  stamp: {sec: ..., nanosec: ...}
-  frame_id: "camera_color_optical_frame"
-pose:
-  position:
-    x: 0.123    # 相机坐标系 X (米)
-    y: -0.045   # 相机坐标系 Y (米)
-    z: 0.850    # 深度 (米)
-  orientation:
-    x: 0.01     # 面板法向量四元数
-    y: 0.02
-    z: 0.0
-    w: 0.99
+```json
+{
+  "stamp": 1716192000.123,
+  "targets": [
+    {
+      "id": 1,
+      "class": "button",
+      "position": {"x": 0.123, "y": -0.045, "z": 0.850},
+      "orientation": {"x": 0.01, "y": 0.02, "z": 0.0, "w": 0.99},
+      "confidence": 0.92
+    },
+    {
+      "id": 4,
+      "class": "knob",
+      "position": {"x": 0.320, "y": -0.040, "z": 0.845},
+      "orientation": {"x": 0.01, "y": 0.02, "z": 0.0, "w": 0.99},
+      "confidence": 0.88
+    }
+  ]
+}
 ```
 
-### 旋钮角度格式 (/panel/knob_angles)
+位置单位：**米 (m)**，相机坐标系。
+
+### /panel/knob_angles (String, JSON) — 旋钮角度
 
 ```json
 {
   "stamp": 1716192000.123,
   "knob_angles": [
     {
-      "position": {"x": 0.12, "y": -0.05, "z": 0.83},
+      "id": 4,
+      "position": {"x": 0.32, "y": -0.04, "z": 0.85},
       "angle": 171.5,
       "confidence": 0.92
     }
@@ -138,16 +164,33 @@ pose:
 }
 ```
 
-角度以 12 点钟方向为 0 度，顺时针增加，范围 [0, 360)。
+角度以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。
+
+### /panel/status (String) — 注册状态
+
+- `"registering"` — 注册中
+- `"registered"` — 注册完成
+
+### 兼容旧话题 (PoseStamped)
+
+| 话题 | 类别 |
+|------|------|
+| `/panel/lights` | 指示灯 |
+| `/panel/knobs` | 旋钮 |
+| `/panel/buttons` | 按钮 |
+| `/panel/bolts` | 螺栓 |
+| `/panel/nuts` | 螺母 |
+| `/panel/valves` | 阀门 |
+| `/panel/pumps` | 泵 |
 
 ## 验证话题
 
 ```bash
 # 另开终端
 ros2 topic list
-ros2 topic echo /panel/knobs
+ros2 topic echo /panel/targets
 ros2 topic echo /panel/knob_angles
-ros2 topic hz /panel/knobs
+ros2 topic echo /panel/status
 ```
 
 ## 在其他节点中订阅
@@ -155,7 +198,6 @@ ros2 topic hz /panel/knobs
 ```python
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 import json
 
@@ -163,17 +205,20 @@ import json
 class PanelSubscriber(Node):
     def __init__(self):
         super().__init__('panel_subscriber')
-        self.create_subscription(PoseStamped, '/panel/knobs', self.knob_cb, 10)
+        self.create_subscription(String, '/panel/targets', self.targets_cb, 10)
         self.create_subscription(String, '/panel/knob_angles', self.angle_cb, 10)
 
-    def knob_cb(self, msg):
-        p = msg.pose.position
-        self.get_logger().info(f'旋钮位置: ({p.x:.3f}, {p.y:.3f}, {p.z:.3f})')
+    def targets_cb(self, msg):
+        data = json.loads(msg.data)
+        for t in data['targets']:
+            p = t['position']
+            self.get_logger().info(
+                f"ID={t['id']} {t['class']} 位置: ({p['x']:.3f}, {p['y']:.3f}, {p['z']:.3f})")
 
     def angle_cb(self, msg):
         data = json.loads(msg.data)
         for k in data['knob_angles']:
-            self.get_logger().info(f"角度: {k['angle']}°, 置信度: {k['confidence']}")
+            self.get_logger().info(f"ID={k['id']} 角度: {k['angle']:.1f}°")
 ```
 
 ## 配置说明
@@ -207,6 +252,13 @@ threshold:
 
 knob_angle:
   enable: true
+
+depth_scale: 0.001             # 深度图原始值 × depth_scale = 米
+
+registry:
+  stable_frames: 15            # 注册需要的连续稳定帧数
+  green_hue_range: [35, 85]    # 绿色按钮 HSV 色调范围
+  match_distance_thresh: 80    # 匹配最大像素距离
 ```
 
 ## 目录结构
@@ -216,18 +268,18 @@ ros2_ws/
 ├── README.md
 ├── .gitignore
 └── src/
+    ├── OrbbecSDK_ROS2/          ← 官方相机驱动
     └── panel_detection/
         ├── package.xml
         ├── setup.py
-        ├── setup.cfg
         ├── launch/
-        │   └── panel_detection.launch.py
-        ├── resource/panel_detection
+        │   ├── camera.launch.py           ← 启动相机
+        │   └── panel_detection.launch.py  ← 启动检测节点
         └── panel_detection/
             ├── __init__.py
-            ├── panel_detect_node.py
+            ├── panel_detect_node.py       ← 检测主节点
+            ├── target_registry.py         ← 目标注册与跟踪
             ├── camera/
-            │   ├── __init__.py
             │   ├── base.py
             │   ├── orbbec.py
             │   └── realsense.py
@@ -257,9 +309,13 @@ sudo pip3 install onnxruntime -i https://pypi.tuna.tsinghua.edu.cn/simple
 sudo pip3 install "numpy<2" -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-**Q: 如何切换到 RealSense 相机**
+**Q: 检测节点报等待相机话题**
 
-通过配置文件或直接改 `panel_detect_node.py` 中 `DEFAULT_CONFIG` 的 `camera_backend` 为 `'realsense'`。
+确保先启动相机：`ros2 launch panel_detection camera.launch.py`
+
+**Q: 注册一直无法完成**
+
+检查是否同时检测到 5 个 button + 2 个 knob，可能需要调整相机角度或检测阈值。
 
 ## 许可证
 

@@ -38,7 +38,7 @@ def estimate_knob_angle(
         debug: 是否返回调试中间结果
 
     Returns:
-        角度值 (°)，以 12 点钟方向为 0°，顺时针增加，范围 [0, 180)
+        角度值 (°)，以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)
         如果无法检测到有效指针则返回 None
         当 debug=True 时返回 (angle, debug_dict)
     """
@@ -255,17 +255,13 @@ def _compute_angle_from_contour(contour, cx, cy) -> float:
     if vx * dx + vy * dy < 0:
         vx, vy = -vx, -vy
 
-    # 计算角度：以 12 点钟方向 (向上) 为 0°，顺时针增加
+    # 计算角度：以 12 点钟方向 (向上) 为 0°，顺时针增加，范围 [0, 360)
     # 图像坐标系中 y 轴向下，所以 12 点钟方向对应 (0, -1)
     # atan2(vx, -vy) 将 (vx, vy) 映射到以 y 负方向为 0° 顺时针的角度
     angle_rad = math.atan2(vx, -vy)
     angle_deg = math.degrees(angle_rad)
     if angle_deg < 0:
         angle_deg += 360.0
-
-    # 归一化到 [0, 180)
-    if angle_deg >= 180.0:
-        angle_deg -= 180.0
 
     return angle_deg
 
@@ -287,7 +283,7 @@ def draw_knob_angle(image, bbox, angle, color=(0, 255, 255), thickness=2):
     Args:
         image: 原始图像 (会被原地修改)
         bbox: (x1, y1, x2, y2) 旋钮边界框
-        angle: 角度 (°)，范围 [0, 180)
+        angle: 角度 (°)，范围 [0, 360)
         color: 标注颜色
         thickness: 线条粗细
     """
