@@ -52,42 +52,70 @@ cd ~/ros2_ws
 git clone --recursive git@github.com:Tsumugi-W/detect_3588.git .
 ```
 
-### 第三步：安装 Python 依赖（系统级）
+> 如果忘记 `--recursive`，需要手动初始化 submodule：
+> ```bash
+> git submodule update --init --recursive
+> ```
+
+### 第三步：安装系统依赖
+
+```bash
+# OrbbecSDK_ROS2 编译所需的 ROS2 包
+sudo apt install -y \
+  ros-humble-image-transport \
+  ros-humble-image-publisher \
+  ros-humble-cv-bridge \
+  ros-humble-camera-info-manager \
+  ros-humble-tf2-ros \
+  ros-humble-tf2-sensor-msgs \
+  ros-humble-backward-ros \
+  ros-humble-message-filters \
+  ros-humble-rclcpp-components \
+  ros-humble-statistics-msgs
+
+# libusb（相机驱动需要）
+sudo apt install -y libusb-1.0-0-dev libudev-dev
+```
+
+### 第四步：安装 Python 依赖（系统级）
 
 ```bash
 # 清华镜像加速
 sudo pip3 install onnxruntime -i https://pypi.tuna.tsinghua.edu.cn/simple
 sudo pip3 install "numpy<2" -i https://pypi.tuna.tsinghua.edu.cn/simple
-sudo pip3 install pyorbbecsdk2 -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # opencv、pyyaml 通常系统已自带，如果没有：
 # sudo pip3 install opencv-python pyyaml -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-# 如果使用 RealSense 相机：
-# sudo pip3 install pyrealsense2 -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
-### 第四步：配置相机权限
-
-**Orbbec 相机：**
+### 第五步：配置相机权限
 
 ```bash
-sudo bash $(python3 -c "import pyorbbecsdk,os; print(os.path.dirname(pyorbbecsdk.__file__))")/shared/install_udev_rules.sh
+# 安装 Orbbec udev 规则
+sudo bash src/OrbbecSDK_ROS2/orbbec_camera/scripts/install_udev_rules.sh
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
 配置完成后**重新插拔相机** USB 线。
 
-### 第五步：编译
+### 第六步：编译
 
 ```bash
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
-colcon build
+
+# 先编译相机驱动
+colcon build --packages-up-to orbbec_camera
+source install/setup.bash
+
+# 再编译检测节点
+colcon build --packages-select panel_detection
 source install/setup.bash
 ```
 
-### 第六步：运行
+> 也可以一次编译全部：`colcon build`，但如果遇到依赖问题建议分步。
+
+### 第七步：运行
 
 ```bash
 # 终端1：启动相机

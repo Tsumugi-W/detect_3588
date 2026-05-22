@@ -196,13 +196,15 @@ class PanelDetectionNode(Node):
 
     def _init_subscribers(self):
         """订阅相机话题"""
-        from message_filters import ApproximateTimeSynchronizer, Subscriber
-        self._sub_color = Subscriber(self, Image, '/camera/color/image_raw')
-        self._sub_depth = Subscriber(self, Image, '/camera/depth/image_raw')
-        self._sub_color_info = Subscriber(self, CameraInfo, '/camera/color/camera_info')
-        self._sub_depth_info = Subscriber(self, CameraInfo, '/camera/depth/camera_info')
+        import message_filters
+        self._sub_color = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
+        self._sub_depth = message_filters.Subscriber(self, Image, '/camera/depth/image_raw')
+        self._sub_color_info = message_filters.Subscriber(
+            self, CameraInfo, '/camera/color/camera_info')
+        self._sub_depth_info = message_filters.Subscriber(
+            self, CameraInfo, '/camera/depth/camera_info')
 
-        sync = ApproximateTimeSynchronizer(
+        sync = message_filters.ApproximateTimeSynchronizer(
             [self._sub_color, self._sub_depth,
              self._sub_color_info, self._sub_depth_info],
             queue_size=5, slop=0.05)
