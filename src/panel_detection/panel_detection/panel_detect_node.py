@@ -159,12 +159,24 @@ class PanelDetectionNode(Node):
         self._topic_color_intrin = None
         self._topic_depth_intrin = None
 
+        # 直连模式下转发图像话题，供其他节点使用
+        self._color_pub = None
+        self._depth_pub = None
+        self._color_info_pub = None
+        self._depth_info_pub = None
+
         if self._use_topic:
             self._init_subscribers()
             self._camera_ready = True
             self.get_logger().info('使用话题订阅模式')
         else:
             self._init_camera()
+            # 直连模式下发布图像话题
+            self._color_pub = self.create_publisher(Image, '/camera/color/image_raw', 5)
+            self._depth_pub = self.create_publisher(Image, '/camera/depth/image_raw', 5)
+            self._color_info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', 5)
+            self._depth_info_pub = self.create_publisher(CameraInfo, '/camera/depth/camera_info', 5)
+            self.get_logger().info('直连模式：同时发布相机话题供其他节点使用')
 
         # 初始化检测器
         self._detector = self._create_detector()
@@ -195,50 +207,39 @@ class PanelDetectionNode(Node):
         cv2.namedWindow('panel_detection', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
 
     def _init_subscribers(self):
-        """订阅相机话题"""
-        import message_filters
-        self._sub_color = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
-        self._sub_depth = message_filters.Subscriber(self, Image, '/camera/depth/image_raw')
-        self._sub_color_info = message_filters.Subscriber(
-            self, CameraInfo, '/camera/color/camera_info')
-        self._sub_depth_info = message_filters.Subscriber(
-            self, CameraInfo, '/camera/depth/camera_info')
+        """订阅相机话题（独立订阅，不依赖时间同步）"""
+        self._sub_color = self.create_subscription(
+            Image, '/camera/color/image_raw', self._color_callback, 5)
+        self._sub_depth = self.create_subscription(
+            Image, '/camera/depth/image_raw', self._depth_callback, 5)
+        self._sub_color_info = self.create_subscription(
+            CameraInfo, '/camera/color/camera_info', self._color_info_callback, 5)
+        self._sub_depth_info = self.create_subscription(
+            CameraInfo, '/camera/depth/camera_info', self._depth_info_callback, 5)
 
-        sync = message_filters.ApproximateTimeSynchronizer(
-            [self._sub_color, self._sub_depth,
-             self._sub_color_info, self._sub_depth_info],
-            queue_size=5, slop=0.05)
-        sync.registerCallback(self._topic_callback)
-        self._sync = sync
+    def _color_callback(self, msg):
+        self._topic_color = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            msg.height, msg.width, 3)
 
-    def _topic_callback(self, color_msg, depth_msg, color_info_msg, depth_info_msg):
-        """接收同步的相机数据"""
-        # 解析彩色图
-        color_image = np.frombuffer(color_msg.data, dtype=np.uint8).reshape(
-            color_msg.height, color_msg.width, 3)
+    def _depth_callback(self, msg):
+        self._topic_depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(
+            msg.height, msg.width)
 
-        # 解析深度图
-        depth_image = np.frombuffer(depth_msg.data, dtype=np.uint16).reshape(
-            depth_msg.height, depth_msg.width)
-
-        # 解析内参
-        color_intrin = CameraIntrinsics(
-            fx=color_info_msg.k[0], fy=color_info_msg.k[4],
-            cx=color_info_msg.k[2], cy=color_info_msg.k[5],
-            width=color_info_msg.width, height=color_info_msg.height,
-            coeffs=list(color_info_msg.d) if color_info_msg.d else [0.0]*5,
-        )
-        depth_intrin = CameraIntrinsics(
-            fx=depth_info_msg.k[0], fy=depth_info_msg.k[4],
-            cx=depth_info_msg.k[2], cy=depth_info_msg.k[5],
-            width=depth_info_msg.width, height=depth_info_msg.height,
-            coeffs=list(depth_info_msg.d) if depth_info_msg.d else [0.0]*5,
+    def _color_info_callback(self, msg):
+        self._topic_color_intrin = CameraIntrinsics(
+            fx=msg.k[0], fy=msg.k[4],
+            cx=msg.k[2], cy=msg.k[5],
+            width=msg.width, height=msg.height,
+            coeffs=list(msg.d) if msg.d else [0.0]*5,
         )
 
-        self._topic_color = color_image
-        self._topic_depth = depth_image
-        self._topic_color_intrin = color_intrin
-        self._topic_depth_intrin = depth_intrin
+    def _depth_info_callback(self, msg):
+        self._topic_depth_intrin = CameraIntrinsics(
+            fx=msg.k[0], fy=msg.k[4],
+            cx=msg.k[2], cy=msg.k[5],
+            width=msg.width, height=msg.height,
+            coeffs=list(msg.d) if msg.d else [0.0]*5,
+        )
 
     def _init_camera(self):
         backend_type = self.cfg.get('camera_backend', 'orbbec')
@@ -338,6 +339,54 @@ class PanelDetectionNode(Node):
 
         return None
 
+    def _publish_camera_topics(self, color_image, depth_image, color_intrin, depth_intrin):
+        """直连模式下转发图像和内参话题"""
+        stamp = self.get_clock().now().to_msg()
+
+        # 发布彩色图像
+        color_msg = Image()
+        color_msg.header.stamp = stamp
+        color_msg.header.frame_id = 'camera_color_optical_frame'
+        color_msg.height, color_msg.width = color_image.shape[:2]
+        color_msg.encoding = 'bgr8'
+        color_msg.step = color_msg.width * 3
+        color_msg.data = color_image.tobytes()
+        self._color_pub.publish(color_msg)
+
+        # 发布深度图像
+        depth_msg = Image()
+        depth_msg.header.stamp = stamp
+        depth_msg.header.frame_id = 'camera_depth_optical_frame'
+        depth_msg.height, depth_msg.width = depth_image.shape[:2]
+        depth_msg.encoding = '16UC1'
+        depth_msg.step = depth_msg.width * 2
+        depth_msg.data = depth_image.tobytes()
+        self._depth_pub.publish(depth_msg)
+
+        # 发布彩色相机内参
+        color_info_msg = CameraInfo()
+        color_info_msg.header.stamp = stamp
+        color_info_msg.header.frame_id = 'camera_color_optical_frame'
+        color_info_msg.width = color_intrin.width
+        color_info_msg.height = color_intrin.height
+        color_info_msg.k = [color_intrin.fx, 0.0, color_intrin.cx,
+                            0.0, color_intrin.fy, color_intrin.cy,
+                            0.0, 0.0, 1.0]
+        color_info_msg.d = color_intrin.coeffs
+        self._color_info_pub.publish(color_info_msg)
+
+        # 发布深度相机内参
+        depth_info_msg = CameraInfo()
+        depth_info_msg.header.stamp = stamp
+        depth_info_msg.header.frame_id = 'camera_depth_optical_frame'
+        depth_info_msg.width = depth_intrin.width
+        depth_info_msg.height = depth_intrin.height
+        depth_info_msg.k = [depth_intrin.fx, 0.0, depth_intrin.cx,
+                            0.0, depth_intrin.fy, depth_intrin.cy,
+                            0.0, 0.0, 1.0]
+        depth_info_msg.d = depth_intrin.coeffs
+        self._depth_info_pub.publish(depth_info_msg)
+
     def _detection_callback(self):
         if not self._camera_ready:
             self._try_reconnect_camera()
@@ -358,6 +407,10 @@ class PanelDetectionNode(Node):
 
         if not color_image.any() or not depth_image.any():
             return
+
+        # 直连模式下转发图像话题
+        if self._color_pub is not None:
+            self._publish_camera_topics(color_image, depth_image, color_intrin, depth_intrin)
 
         t0 = time.time()
         canvas, class_id_list, xyxy_list, conf_list = self._detector.detect(color_image)
@@ -556,12 +609,18 @@ class PanelDetectionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = None
+    spin_thread = None
     try:
         node = PanelDetectionNode()
+        # 用独立线程处理 ROS2 回调（话题订阅等）
+        from rclpy.executors import MultiThreadedExecutor
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread.start()
+
         while rclpy.ok():
             node._detection_callback()
-            # 处理 ROS2 回调（参数更新等）
-            rclpy.spin_once(node, timeout_sec=0.001)
             if node.display_frame is not None:
                 cv2.imshow('panel_detection', node.display_frame)
             key = cv2.waitKey(1) & 0xFF
@@ -577,6 +636,8 @@ def main(args=None):
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=2)
 
 
 if __name__ == '__main__':
