@@ -132,15 +132,16 @@ def get_robust_depth(depth_image, ux, uy, sample_radius=3, depth_scale=0.001):
     Returns:
         鲁棒的深度值（米）
     """
-    depths = []
-    for dx in range(-sample_radius, sample_radius + 1):
-        for dy in range(-sample_radius, sample_radius + 1):
-            x = max(0, min(depth_image.shape[1] - 1, ux + dx))
-            y = max(0, min(depth_image.shape[0] - 1, uy + dy))
-            d = depth_image[y, x]
-            if d > 0:
-                depths.append(d * depth_scale)
-    return np.median(depths) if depths else 0
+    h, w = depth_image.shape
+    x1 = max(0, ux - sample_radius)
+    x2 = min(w, ux + sample_radius + 1)
+    y1 = max(0, uy - sample_radius)
+    y2 = min(h, uy + sample_radius + 1)
+    patch = depth_image[y1:y2, x1:x2]
+    valid = patch[patch > 0]
+    if valid.size == 0:
+        return 0.0
+    return float(np.median(valid)) * depth_scale
 
 
 def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100, ransac_thresh=0.005):
@@ -186,7 +187,7 @@ def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100, ransac_thresh=0.
     # SVD 精化
     inlier_pts = points_3d[best_inlier_mask]
     centroid = np.mean(inlier_pts, axis=0)
-    _, _, Vt = np.linalg.svd(inlier_pts - centroid)
+    _, _, Vt = np.linalg.svd(inlier_pts - centroid, full_matrices=False)
     normal = Vt[2]
     if normal[2] > 0:
         normal = -normal

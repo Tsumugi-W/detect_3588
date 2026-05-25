@@ -31,7 +31,7 @@ from .depth_utils import (
     deproject_pixel_to_point, undistort_pixel,
     filter_depth, get_robust_depth, compute_panel_normal,
 )
-from .knob_angle import estimate_knob_angle
+from .knob_angle import estimate_knob_angle, draw_knob_angle
 from .target_registry import TargetRegistry, FrameDetection
 
 
@@ -41,9 +41,9 @@ DEFAULT_CONFIG = {
     'camera': {'color_width': 1280, 'color_height': 720,
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
-    'onnx_model': '0520.onnx',
+    'onnx_model': '0525.onnx',
     'onnx_threads': 8,
-    'weight': '0520.pt',
+    'weight': '0525.pt',
     'input_size': 640,
     'class_num': 7,
     'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button'],
@@ -201,25 +201,40 @@ class PanelDetectionNode(Node):
 
         # 可视化
         self.display_frame = None
+        self._gui_enabled = False
+        try:
+            cv2.namedWindow('panel_detection', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+            self._gui_enabled = True
+        except cv2.error:
+            self.get_logger().warn('无显示环境，禁用 GUI 可视化')
 
         status = '运行中' if self._camera_ready else '等待相机'
         self.get_logger().info(f'面板检测节点已启动 ({status})')
-        cv2.namedWindow('panel_detection', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
 
     def _init_subscribers(self):
         """订阅相机话题（独立订阅，不依赖时间同步）"""
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+        # 只保留最新1帧，避免推理跟不上时帧堆积导致 OOM
+        img_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST)
         self._sub_color = self.create_subscription(
-            Image, '/camera/color/image_raw', self._color_callback, 5)
+            Image, '/camera/color/image_raw', self._color_callback, img_qos)
         self._sub_depth = self.create_subscription(
-            Image, '/camera/depth/image_raw', self._depth_callback, 5)
+            Image, '/camera/depth/image_raw', self._depth_callback, img_qos)
         self._sub_color_info = self.create_subscription(
             CameraInfo, '/camera/color/camera_info', self._color_info_callback, 5)
         self._sub_depth_info = self.create_subscription(
             CameraInfo, '/camera/depth/camera_info', self._depth_info_callback, 5)
 
     def _color_callback(self, msg):
-        self._topic_color = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+        image = np.frombuffer(msg.data, dtype=np.uint8).reshape(
             msg.height, msg.width, 3)
+        # OrbbecSDK_ROS2 发布 rgb8，转换为 BGR 供 OpenCV/YOLO 使用
+        if msg.encoding == 'rgb8':
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        self._topic_color = image
 
     def _depth_callback(self, msg):
         self._topic_depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(
@@ -397,7 +412,7 @@ class PanelDetectionNode(Node):
             depth_intrin = self._topic_depth_intrin
             color_image = self._topic_color
             depth_image = self._topic_depth
-            if color_intrin is None or color_image is None:
+            if color_intrin is None or color_image is None or depth_image is None or depth_intrin is None:
                 return
         else:
             color_intrin, depth_intrin, color_image, depth_image = \
@@ -405,11 +420,13 @@ class PanelDetectionNode(Node):
             if color_intrin is None:
                 return
 
-        if not color_image.any() or not depth_image.any():
+        if color_image.size == 0 or depth_image.size == 0:
             return
 
-        # 直连模式下转发图像话题
-        if self._color_pub is not None:
+        # 直连模式下转发图像话题（仅在有订阅者时发布）
+        if self._color_pub is not None and (
+                self._color_pub.get_subscription_count() > 0 or
+                self._depth_pub.get_subscription_count() > 0):
             self._publish_camera_topics(color_image, depth_image, color_intrin, depth_intrin)
 
         t0 = time.time()
@@ -464,33 +481,12 @@ class PanelDetectionNode(Node):
                 confidence=float(conf_list[i]),
             ))
 
-        # ─── 注册阶段 ───
-        if not self._registry.is_registered:
-            registered = self._registry.update(frame_detections, color_image)
-            status_msg = String()
-            if registered:
-                self.get_logger().info('目标注册完成！')
-                for t in self._registry.targets:
-                    self.get_logger().info(
-                        f'  ID={t.target_id} {t.class_name} '
-                        f'({t.center_x:.0f}, {t.center_y:.0f})')
-                status_msg.data = 'registered'
-            else:
-                status_msg.data = 'registering'
-            self._status_pub.publish(status_msg)
-
-            # 注册阶段可视化：显示状态
-            cv2.putText(canvas, f'Registering... ({self._registry._stable_count}'
-                        f'/{self._registry._stable_frames})',
-                        (10, 25), 0, 0.7, (0, 128, 255), 2, cv2.LINE_AA)
-            self.display_frame = canvas
-            return
-
-        # ─── 跟踪阶段 ───
-        matched = self._registry.match(frame_detections)
+        # ─── 每帧独立识别绝对编号 ───
+        matched = self._registry.identify(frame_detections, color_image)
 
         targets_output = []
         knob_angles = []
+        matched_xyz = {}  # 缓存 3D 坐标避免重复计算
 
         for target_id, det in matched:
             ux = int(det.center_x)
@@ -500,6 +496,7 @@ class PanelDetectionNode(Node):
             dis = get_robust_depth(filtered_depth, ux_u, uy_u,
                                    sample_radius=3, depth_scale=self._depth_scale)
             xyz = deproject_pixel_to_point(depth_intrin, (ux_u, uy_u), dis)
+            matched_xyz[target_id] = xyz
 
             target_info = {
                 'id': target_id,
@@ -567,23 +564,16 @@ class PanelDetectionNode(Node):
             self._angle_pub.publish(msg)
 
         # ─── 可视化 ───
-        from .knob_angle import draw_knob_angle
-
         for target_id, det in matched:
             ux = int(det.center_x)
             uy = int(det.center_y)
             cv2.circle(canvas, (ux, uy), 4, (255, 255, 255), -1)
 
-            # 显示编号
             cv2.putText(canvas, f'#{target_id}',
                         (ux - 10, uy - 15), 0, 0.6,
                         (0, 255, 0), 2, cv2.LINE_AA)
 
-            # 显示3D坐标
-            ux_u, uy_u = undistort_pixel(ux, uy, color_intrin)
-            dis = get_robust_depth(filtered_depth, int(ux_u), int(uy_u),
-                                   sample_radius=3, depth_scale=self._depth_scale)
-            xyz = deproject_pixel_to_point(depth_intrin, (int(ux_u), int(uy_u)), dis)
+            xyz = matched_xyz[target_id]
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
@@ -593,7 +583,6 @@ class PanelDetectionNode(Node):
             cv2.putText(canvas, f'normal: {n}', (10, 25), 0, 0.6,
                         (0, 200, 255), 2, cv2.LINE_AA)
 
-        # 旋钮角度绘制
         for ka in knob_angles:
             for target_id, det in matched:
                 if target_id == ka['id']:
@@ -621,11 +610,14 @@ def main(args=None):
 
         while rclpy.ok():
             node._detection_callback()
-            if node.display_frame is not None:
-                cv2.imshow('panel_detection', node.display_frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord('q'), 27):
-                break
+            if node._gui_enabled:
+                if node.display_frame is not None:
+                    cv2.imshow('panel_detection', node.display_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('q'), 27):
+                    break
+            else:
+                time.sleep(0.001)
     except KeyboardInterrupt:
         pass
     finally:

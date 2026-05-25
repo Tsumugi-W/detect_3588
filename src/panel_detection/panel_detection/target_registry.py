@@ -1,21 +1,33 @@
 """
-操作目标注册模块
+操作目标识别模块
 
-两阶段设计：
-  阶段一（注册）：积累多帧检测结果，聚类去抖动，按 x 坐标排序 + 类别/颜色验证后分配编号 1-7
-  阶段二（跟踪）：每帧检测结果与注册表做最近邻匹配，输出带编号的结果
+通过类别 + 颜色特征，每帧独立识别绝对编号，无需注册阶段。
+支持视野中只出现部分目标的情况。
 
-场景假设：一列7个操作对象，从左到右为 button, button, button, knob, knob, button, button
+面板布局（从左到右）：
+  ID=1: button 绿色
+  ID=2: button 红色
+  ID=3: button 红色
+  ID=4: knob   红色
+  ID=5: knob   黑色
+  ID=6: button 红色
+  ID=7: button 绿色
+
+识别策略：
+  1. 按 x 坐标排序当前帧检测结果
+  2. 对每个检测提取颜色特征（绿/红/黑）
+  3. 构建当前帧的 (类别, 颜色) 序列
+  4. 在完整布局中做子序列匹配，利用 knob 颜色差异（红/黑）作为锚点消歧
 """
 import numpy as np
 import cv2
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Tuple
 
 
 @dataclass
 class RegisteredTarget:
-    """已注册的目标"""
+    """已注册的目标（保留兼容）"""
     target_id: int
     class_name: str
     center_x: float
@@ -34,184 +46,181 @@ class FrameDetection:
     confidence: float
 
 
-EXPECTED_LAYOUT = ['button', 'button', 'button', 'knob', 'knob', 'button', 'button']
+# 完整面板布局：(类别, 颜色)
+PANEL_LAYOUT = [
+    ('button', 'green'),   # ID=1
+    ('button', 'red'),     # ID=2
+    ('button', 'red'),     # ID=3
+    ('knob', 'red'),       # ID=4
+    ('knob', 'black'),     # ID=5
+    ('button', 'red'),     # ID=6
+    ('button', 'green'),   # ID=7
+]
+
+
+def _classify_color(color_image: np.ndarray, bbox: Tuple[float, float, float, float]) -> str:
+    """
+    判断 bbox 区域的主色调：green / red / black
+
+    使用 bbox 中心区域（50%）进行颜色分析，减少面板背景干扰
+    """
+    h, w = color_image.shape[:2]
+    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+    # 取中心 50% 区域
+    bw, bh = x2 - x1, y2 - y1
+    cx1 = x1 + bw // 4
+    cx2 = x2 - bw // 4
+    cy1 = y1 + bh // 4
+    cy2 = y2 - bh // 4
+    cx1, cy1 = max(0, cx1), max(0, cy1)
+    cx2, cy2 = min(w, cx2), min(h, cy2)
+
+    roi = color_image[cy1:cy2, cx1:cx2]
+    if roi.size == 0:
+        return 'unknown'
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    h_ch = hsv[:, :, 0]
+    s_ch = hsv[:, :, 1]
+    v_ch = hsv[:, :, 2]
+
+    total_pixels = h_ch.size
+    if total_pixels == 0:
+        return 'unknown'
+
+    # 绿色：H 在 35-85，S > 50
+    green_mask = (h_ch >= 35) & (h_ch <= 85) & (s_ch > 50)
+    green_ratio = np.sum(green_mask) / total_pixels
+
+    # 红色：H 在 0-10 或 160-180，S > 50
+    red_mask = ((h_ch <= 10) | (h_ch >= 160)) & (s_ch > 50)
+    red_ratio = np.sum(red_mask) / total_pixels
+
+    # 黑色：V < 80（暗区域）
+    black_mask = v_ch < 80
+    black_ratio = np.sum(black_mask) / total_pixels
+
+    # 取最大占比
+    ratios = {'green': green_ratio, 'red': red_ratio, 'black': black_ratio}
+    best = max(ratios, key=ratios.get)
+
+    # 至少要有 15% 的占比才认定
+    if ratios[best] < 0.15:
+        return 'unknown'
+
+    return best
+
+
+def _match_subsequence(observed: List[Tuple[str, str]]) -> List[int]:
+    """
+    将观测到的 (类别, 颜色) 序列匹配到完整布局，返回对应的绝对 ID 列表
+
+    使用滑动窗口 + 评分机制，找到最佳匹配位置
+    """
+    n_obs = len(observed)
+    n_layout = len(PANEL_LAYOUT)
+
+    if n_obs == 0:
+        return []
+    if n_obs > n_layout:
+        # 检测到的比布局多，只取前 n_layout 个
+        observed = observed[:n_layout]
+        n_obs = n_layout
+
+    best_score = -1
+    best_offset = 0
+
+    # 滑动窗口：在布局中找连续子序列的最佳匹配
+    for offset in range(n_layout - n_obs + 1):
+        score = 0
+        for i in range(n_obs):
+            layout_cls, layout_color = PANEL_LAYOUT[offset + i]
+            obs_cls, obs_color = observed[i]
+
+            # 类别匹配（必须）
+            if obs_cls == layout_cls:
+                score += 2
+            else:
+                score -= 5  # 类别不匹配重罚
+
+            # 颜色匹配（辅助）
+            if obs_color == layout_color:
+                score += 3
+            elif obs_color != 'unknown':
+                score -= 1
+
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+
+    # 返回对应的绝对 ID
+    return [best_offset + i + 1 for i in range(n_obs)]
 
 
 class TargetRegistry:
     """
-    操作目标注册器
-
-    Args:
-        stable_frames: 需要连续多少帧检测稳定才完成注册
-        green_hue_range: 绿色按钮 HSV 色调范围 (low, high)
-        match_distance_thresh: 跟踪匹配最大像素距离
+    目标识别器（每帧独立识别，无注册阶段）
     """
 
     def __init__(self, stable_frames=15, green_hue_range=(35, 85),
                  match_distance_thresh=80):
-        self._stable_frames = stable_frames
-        self._green_hue_range = green_hue_range
-        self._match_distance_thresh = match_distance_thresh
-
+        # 保留参数兼容，但不再使用注册逻辑
+        self._is_registered = True  # 始终认为已注册
         self._registered: List[RegisteredTarget] = []
-        self._history: List[List[FrameDetection]] = []
+        self._stable_frames = stable_frames
         self._stable_count = 0
-        self._is_registered = False
 
     @property
     def is_registered(self) -> bool:
-        return self._is_registered
+        return True
 
     @property
     def targets(self) -> List[RegisteredTarget]:
         return self._registered
 
     def reset(self):
-        """重置注册状态"""
-        self._registered = []
-        self._history = []
-        self._stable_count = 0
-        self._is_registered = False
+        pass
 
     def update(self, detections: List[FrameDetection],
                color_image: np.ndarray) -> bool:
-        """
-        注册阶段：输入一帧检测结果，尝试完成注册
-
-        Returns:
-            True 表示注册完成
-        """
-        if self._is_registered:
-            return True
-
-        buttons = [d for d in detections if d.class_name == 'button']
-        knobs = [d for d in detections if d.class_name == 'knob']
-
-        if len(buttons) == 5 and len(knobs) == 2:
-            self._history.append(detections)
-            self._stable_count += 1
-        else:
-            self._stable_count = 0
-            self._history = []
-
-        if self._stable_count >= self._stable_frames:
-            return self._try_register(color_image)
-
-        return False
-
-    def _try_register(self, color_image: np.ndarray) -> bool:
-        """尝试从积累的历史帧中完成注册"""
-        # 取最近 stable_frames 帧做聚类
-        recent = self._history[-self._stable_frames:]
-
-        # 对每帧按 x 排序，取各位置中位数
-        all_sorted = []
-        for frame_dets in recent:
-            sorted_dets = sorted(frame_dets, key=lambda d: d.center_x)
-            all_sorted.append(sorted_dets)
-
-        # 验证类别布局一致性
-        for frame_dets in all_sorted:
-            layout = [d.class_name for d in frame_dets]
-            if layout != EXPECTED_LAYOUT:
-                self._stable_count = 0
-                self._history = []
-                return False
-
-        # 计算每个位置的中位坐标
-        n_targets = 7
-        median_centers = []
-        median_bboxes = []
-        for i in range(n_targets):
-            xs = [all_sorted[f][i].center_x for f in range(len(all_sorted))]
-            ys = [all_sorted[f][i].center_y for f in range(len(all_sorted))]
-            ws = [all_sorted[f][i].bbox[2] - all_sorted[f][i].bbox[0]
-                  for f in range(len(all_sorted))]
-            hs = [all_sorted[f][i].bbox[3] - all_sorted[f][i].bbox[1]
-                  for f in range(len(all_sorted))]
-            median_centers.append((np.median(xs), np.median(ys)))
-            median_bboxes.append((np.median(ws), np.median(hs)))
-
-        # 验证第1个按钮是绿色
-        first_button_cx = int(median_centers[0][0])
-        first_button_cy = int(median_centers[0][1])
-        if not self._is_green(color_image, first_button_cx, first_button_cy,
-                              int(median_bboxes[0][0]), int(median_bboxes[0][1])):
-            self._stable_count = 0
-            self._history = []
-            return False
-
-        # 注册成功
-        self._registered = []
-        for i in range(n_targets):
-            self._registered.append(RegisteredTarget(
-                target_id=i + 1,
-                class_name=EXPECTED_LAYOUT[i],
-                center_x=median_centers[i][0],
-                center_y=median_centers[i][1],
-                bbox_w=median_bboxes[i][0],
-                bbox_h=median_bboxes[i][1],
-            ))
-        self._is_registered = True
+        """兼容接口，始终返回 True"""
         return True
 
-    def _is_green(self, color_image: np.ndarray, cx: int, cy: int,
-                  w: int, h: int) -> bool:
-        """检查指定区域是否为绿色"""
-        half_w, half_h = w // 4, h // 4
-        y1 = max(0, cy - half_h)
-        y2 = min(color_image.shape[0], cy + half_h)
-        x1 = max(0, cx - half_w)
-        x2 = min(color_image.shape[1], cx + half_w)
-
-        roi = color_image[y1:y2, x1:x2]
-        if roi.size == 0:
-            return False
-
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        h_channel = hsv[:, :, 0]
-        s_channel = hsv[:, :, 1]
-
-        low, high = self._green_hue_range
-        green_mask = (h_channel >= low) & (h_channel <= high) & (s_channel > 50)
-        green_ratio = np.sum(green_mask) / green_mask.size
-
-        return green_ratio > 0.2
-
-    def match(self, detections: List[FrameDetection]) -> List[Tuple[int, FrameDetection]]:
+    def identify(self, detections: List[FrameDetection],
+                 color_image: np.ndarray) -> List[Tuple[int, FrameDetection]]:
         """
-        跟踪阶段：将当前帧检测结果匹配到注册表
+        每帧独立识别：根据检测结果的类别和颜色确定绝对编号
+
+        Args:
+            detections: 当前帧的检测结果列表
+            color_image: BGR 彩色图像
 
         Returns:
-            [(target_id, detection), ...] 匹配成功的结果列表
-            未匹配的检测会被丢弃，未匹配的注册目标不输出
+            [(absolute_id, detection), ...] 带绝对编号的结果
         """
-        if not self._is_registered:
+        if not detections:
             return []
 
+        # 按 x 坐标排序
+        sorted_dets = sorted(detections, key=lambda d: d.center_x)
+
+        # 提取每个检测的颜色特征
+        observed = []
+        for det in sorted_dets:
+            color = _classify_color(color_image, det.bbox)
+            observed.append((det.class_name, color))
+
+        # 子序列匹配确定绝对编号
+        ids = _match_subsequence(observed)
+
         results = []
-        used_reg = set()
-        used_det = set()
-
-        # 贪心最近邻匹配（先按距离排序）
-        pairs = []
-        for di, det in enumerate(detections):
-            for ri, reg in enumerate(self._registered):
-                if det.class_name != reg.class_name:
-                    continue
-                dist = np.sqrt((det.center_x - reg.center_x) ** 2 +
-                               (det.center_y - reg.center_y) ** 2)
-                pairs.append((dist, di, ri))
-
-        pairs.sort(key=lambda x: x[0])
-
-        for dist, di, ri in pairs:
-            if di in used_det or ri in used_reg:
-                continue
-            if dist > self._match_distance_thresh:
-                continue
-            used_det.add(di)
-            used_reg.add(ri)
-            results.append((self._registered[ri].target_id, detections[di]))
+        for i, det in enumerate(sorted_dets):
+            if i < len(ids):
+                results.append((ids[i], det))
 
         return results
+
+    def match(self, detections: List[FrameDetection]) -> List[Tuple[int, FrameDetection]]:
+        """兼容旧接口 — 不应该再被调用"""
+        return []
