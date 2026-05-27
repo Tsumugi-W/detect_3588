@@ -230,38 +230,37 @@ def _compute_angle_from_contour(contour, cx, cy) -> float:
     """
     从轮廓计算指针角度
 
-    策略：用 fitLine 获取方向向量，再用轮廓质心相对于旋钮中心的偏移消解 180° 歧义。
+    策略：用 fitLine 获取方向向量，再用轮廓最远点（而非质心）消解 180° 歧义。
+    最远点比质心更稳定，因为指针的尖端总是离中心最远的部分。
     """
     # fitLine 拟合方向
     line = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01)
     vx, vy = float(line[0][0]), float(line[1][0])
 
-    # 轮廓质心（白色区域重心）
-    M = cv2.moments(contour)
-    if M['m00'] > 0:
-        mcx = M['m10'] / M['m00']
-        mcy = M['m01'] / M['m00']
-    else:
-        # fallback: 用轮廓边界框中心
-        x, y, w, h = cv2.boundingRect(contour)
-        mcx, mcy = x + w / 2, y + h / 2
+    # 找轮廓上离旋钮中心最远的点（指针尖端）
+    pts = contour.reshape(-1, 2).astype(np.float64)
+    dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
+    farthest = pts[np.argmax(dists)]
 
-    # 质心相对于旋钮中心的偏移方向
-    dx = mcx - cx
-    dy = mcy - cy
+    # 最远点相对于旋钮中心的偏移方向
+    dx = farthest[0] - cx
+    dy = farthest[1] - cy
 
-    # 用偏移方向消解 180° 歧义：
-    # 指针从中心指向质心方向
+    # 用最远点方向消解 180° 歧义：指针从中心指向最远点
     if vx * dx + vy * dy < 0:
         vx, vy = -vx, -vy
 
-    # 计算角度：以 12 点钟方向 (向上) 为 0°，顺时针增加，范围 [0, 360)
-    # 图像坐标系中 y 轴向下，所以 12 点钟方向对应 (0, -1)
-    # atan2(vx, -vy) 将 (vx, vy) 映射到以 y 负方向为 0° 顺时针的角度
+    # 计算角度：以 12 点钟方向 (向上) 为 0°，顺时针增加
     angle_rad = math.atan2(vx, -vy)
     angle_deg = math.degrees(angle_rad)
     if angle_deg < 0:
         angle_deg += 360.0
+
+    # 旋钮物理范围约束 [0, 90]：如果超出范围，折回 180°
+    if angle_deg > 135 and angle_deg < 315:
+        angle_deg -= 180.0
+        if angle_deg < 0:
+            angle_deg += 360.0
 
     return angle_deg
 
