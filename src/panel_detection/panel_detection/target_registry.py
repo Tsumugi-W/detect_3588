@@ -116,7 +116,8 @@ def _match_subsequence(observed: List[Tuple[str, str]]) -> List[int]:
     """
     将观测到的 (类别, 颜色) 序列匹配到完整布局，返回对应的绝对 ID 列表
 
-    使用滑动窗口 + 评分机制，找到最佳匹配位置
+    使用滑动窗口 + 评分机制，找到最佳匹配位置。
+    强制约束：button 只能匹配 #1#2#3#6#7，knob 只能匹配 #4#5
     """
     n_obs = len(observed)
     n_layout = len(PANEL_LAYOUT)
@@ -124,38 +125,105 @@ def _match_subsequence(observed: List[Tuple[str, str]]) -> List[int]:
     if n_obs == 0:
         return []
     if n_obs > n_layout:
-        # 检测到的比布局多，只取前 n_layout 个
         observed = observed[:n_layout]
         n_obs = n_layout
 
     best_score = -1
-    best_offset = 0
+    best_offset = -1
 
     # 滑动窗口：在布局中找连续子序列的最佳匹配
     for offset in range(n_layout - n_obs + 1):
         score = 0
+        valid = True
+
         for i in range(n_obs):
             layout_cls, layout_color = PANEL_LAYOUT[offset + i]
             obs_cls, obs_color = observed[i]
 
-            # 类别匹配（必须）
-            if obs_cls == layout_cls:
-                score += 2
-            else:
-                score -= 5  # 类别不匹配重罚
+            # 类别必须严格匹配（button→button, knob→knob）
+            if obs_cls != layout_cls:
+                valid = False
+                break
 
-            # 颜色匹配（辅助）
+            # 颜色匹配评分
             if obs_color == layout_color:
                 score += 3
             elif obs_color != 'unknown':
                 score -= 1
 
+        if not valid:
+            continue
+
         if score > best_score:
             best_score = score
             best_offset = offset
 
-    # 返回对应的绝对 ID
+    if best_offset < 0:
+        # 无法找到类别完全匹配的连续子序列，退回逐个匹配
+        return _match_individual(observed)
+
     return [best_offset + i + 1 for i in range(n_obs)]
+
+
+def _match_individual(observed: List[Tuple[str, str]]) -> List[int]:
+    """
+    当无法做连续子序列匹配时，逐个独立匹配每个检测结果
+
+    强制约束：button→{1,2,3,6,7}, knob→{4,5}
+    """
+    # 可用 ID 池
+    button_ids = [1, 2, 3, 6, 7]  # 对应颜色: green, red, red, red, green
+    knob_ids = [4, 5]              # 对应颜色: red, black
+    button_colors = {1: 'green', 2: 'red', 3: 'red', 6: 'red', 7: 'green'}
+    knob_colors = {4: 'red', 5: 'black'}
+
+    results = []
+    used_ids = set()
+
+    for obs_cls, obs_color in observed:
+        if obs_cls == 'knob':
+            # 优先按颜色匹配
+            best_id = None
+            for kid in knob_ids:
+                if kid in used_ids:
+                    continue
+                if obs_color == knob_colors[kid]:
+                    best_id = kid
+                    break
+            # 颜色没匹配上就取剩余的
+            if best_id is None:
+                for kid in knob_ids:
+                    if kid not in used_ids:
+                        best_id = kid
+                        break
+            if best_id is not None:
+                used_ids.add(best_id)
+                results.append(best_id)
+            else:
+                results.append(0)  # 无可用 ID
+        elif obs_cls == 'button':
+            # 优先按颜色匹配
+            best_id = None
+            for bid in button_ids:
+                if bid in used_ids:
+                    continue
+                if obs_color == button_colors[bid]:
+                    best_id = bid
+                    break
+            if best_id is None:
+                for bid in button_ids:
+                    if bid not in used_ids:
+                        best_id = bid
+                        break
+            if best_id is not None:
+                used_ids.add(best_id)
+                results.append(best_id)
+            else:
+                results.append(0)
+        else:
+            results.append(0)
+
+    return results
 
 
 class TargetRegistry:
