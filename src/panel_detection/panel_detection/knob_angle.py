@@ -378,6 +378,98 @@ def _build_debug(gray, circle_mask, binary, pointer_contour):
     }
 
 
+def estimate_hex_angle(color_roi: np.ndarray, circle_mask_ratio: float = 0.9,
+                       n_sides: int = 6) -> float | None:
+    """
+    估计正多边形螺母/螺栓/阀门的旋转角度
+
+    正六边形有 60° 对称性，正八边形有 45° 对称性。
+    输出 [0, 360/n_sides) 之间的角度。
+    0° 表示有一条边是水平的（平边朝上）。
+
+    Args:
+        color_roi: BGR 格式的裁剪图
+        circle_mask_ratio: 圆形 mask 比例，排除背景
+        n_sides: 边数（6=六边形 nut/bolt，8=八边形 valve）
+
+    Returns:
+        角度 [0, 360/n_sides)°，None 表示无法检测
+    """
+    if color_roi is None or color_roi.size == 0:
+        return None
+
+    h, w = color_roi.shape[:2]
+    if h < 15 or w < 15:
+        return None
+
+    cx, cy = w // 2, h // 2
+    radius = int(min(cx, cy) * circle_mask_ratio)
+
+    # 圆形 mask
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), radius, 255, -1)
+
+    gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
+    masked = cv2.bitwise_and(gray, gray, mask=mask)
+
+    # 边缘检测
+    edges = cv2.Canny(masked, 50, 150)
+    edges = cv2.bitwise_and(edges, mask)
+
+    # Hough 直线检测
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                            threshold=15,
+                            minLineLength=radius * 0.3,
+                            maxLineGap=radius * 0.2)
+    if lines is None or len(lines) < 2:
+        return None
+
+    # 对称周期角度
+    sym_angle = 360.0 / n_sides  # 60° for hex, 45° for octagon
+
+    # 收集所有线段角度，归一化到 [0, sym_angle)
+    angles_mod = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        # 线段角度（相对水平，范围 [0, 180)）
+        angle = math.degrees(math.atan2(abs(y2 - y1), abs(x2 - x1)))
+        # 利用对称性归一化到 [0, sym_angle)
+        angle_m = angle % sym_angle
+        angles_mod.append(angle_m)
+
+    if not angles_mod:
+        return None
+
+    # 用圆形平均处理跨界情况（如 1° 和 59° 应该平均为 0°）
+    # 将角度映射到单位圆取平均方向
+    scale = 360.0 / sym_angle  # 放大到 [0, 360)
+    rads = [math.radians(a * scale) for a in angles_mod]
+    sin_sum = sum(math.sin(r) for r in rads)
+    cos_sum = sum(math.cos(r) for r in rads)
+
+    mean_rad = math.atan2(sin_sum, cos_sum)
+    mean_deg = math.degrees(mean_rad) / scale  # 缩回 [0, sym_angle)
+    if mean_deg < 0:
+        mean_deg += sym_angle
+
+    return mean_deg
+
+
+def draw_hex_angle(image, bbox, angle, color=(0, 0, 0), thickness=1):
+    """
+    在图像上绘制六边形角度标注
+
+    Args:
+        image: 原始图像
+        bbox: (x1, y1, x2, y2)
+        angle: 角度 [0, 60)°
+    """
+    x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    label = f'{angle:.1f}deg'
+    cv2.putText(image, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                0.4, color, 1, cv2.LINE_AA)
+
+
 def draw_knob_angle(image, bbox, angle, color=(0, 255, 255), thickness=2):
     """
     在图像上绘制旋钮角度标注

@@ -31,7 +31,7 @@ from .depth_utils import (
     deproject_pixel_to_point, undistort_pixel,
     filter_depth, get_robust_depth, compute_panel_normal,
 )
-from .knob_angle import estimate_knob_angle, draw_knob_angle
+from .knob_angle import estimate_knob_angle, draw_knob_angle, estimate_hex_angle, draw_hex_angle
 from .target_registry import TargetRegistry, FrameDetection
 
 
@@ -585,6 +585,39 @@ class PanelDetectionNode(Node):
                         'confidence': round(det.confidence, 3),
                     })
 
+
+        # 对所有非编号目标计算 3D 坐标并标注
+        for det in frame_detections:
+            if det.class_name in ('button', 'knob'):
+                continue  # 已在 matched 中处理
+            ux = int(det.center_x)
+            uy = int(det.center_y)
+            ux_u, uy_u = undistort_pixel(ux, uy, color_intrin)
+            ux_u, uy_u = int(ux_u), int(uy_u)
+            dis = get_robust_depth(filtered_depth, ux_u, uy_u,
+                                   sample_radius=3, depth_scale=self._depth_scale)
+            xyz = deproject_pixel_to_point(depth_intrin, (ux_u, uy_u), dis)
+            cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
+                        (ux + 10, uy + 5), 0, 0.4,
+                        (225, 255, 255), 1, cv2.LINE_AA)
+
+        # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
+        hex_angles = []
+        for det in frame_detections:
+            if det.class_name in ('nut', 'bolt', 'valve'):
+                x1, y1 = int(det.bbox[0]), int(det.bbox[1])
+                x2, y2 = int(det.bbox[2]), int(det.bbox[3])
+                roi = color_image[y1:y2, x1:x2]
+                n_sides = 8 if det.class_name == 'valve' else 6
+                hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
+                if hex_angle is not None:
+                    hex_angles.append({
+                        'class': det.class_name,
+                        'bbox': det.bbox,
+                        'hex_angle': round(hex_angle, 1),
+                    })
+                    draw_hex_angle(canvas, det.bbox, hex_angle)
+
         # 发布带编号的检测结果
         if targets_output:
             msg = String()
@@ -594,12 +627,14 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._targets_pub.publish(msg)
 
-        # 发布旋钮角度
-        if knob_angles:
+        # 发布旋钮角度 + 六边形角度
+        all_angles = knob_angles + hex_angles
+        if all_angles:
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp.sec + stamp.nanosec * 1e-9,
                 'knob_angles': knob_angles,
+                'hex_angles': hex_angles,
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 
@@ -626,7 +661,10 @@ class PanelDetectionNode(Node):
         for ka in knob_angles:
             for target_id, det in matched:
                 if target_id == ka['id']:
-                    draw_knob_angle(canvas, det.bbox, ka['angle'])
+                    if 'hex_angle' in ka:
+                        draw_hex_angle(canvas, det.bbox, ka['hex_angle'])
+                    elif 'angle' in ka:
+                        draw_knob_angle(canvas, det.bbox, ka['angle'])
                     break
 
         cv2.putText(canvas, 'REGISTERED', (10, canvas.shape[0] - 15),
