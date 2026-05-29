@@ -19,6 +19,7 @@ def estimate_knob_angle(
     min_pointer_area_ratio: float = 0.01,
     max_pointer_area_ratio: float = 0.25,
     circle_mask_ratio: float = 0.85,
+    angle_range: tuple = None,
     debug: bool = False,
 ) -> float | None:
     """
@@ -35,10 +36,14 @@ def estimate_knob_angle(
         max_pointer_area_ratio: 指针最大面积占圆形区域的比例
         circle_mask_ratio: 圆形 mask 半径相对于 ROI 短边半径的比例
                            用于去除旋钮边框（银色金属圈）干扰
+        angle_range: (min_angle, max_angle) 物理角度范围，用于消歧和 clamp
+                     例如 (-45, 135) 表示黑色旋钮，(135, 315) 表示红色旋钮
+                     超出范围的值会被 clamp 到边界
         debug: 是否返回调试中间结果
 
     Returns:
-        角度值 (°)，以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)
+        角度值 (°)，以 12 点钟方向为 0°，顺时针增加
+        如果设定了 angle_range，返回值在该范围内（可能为负数）
         如果无法检测到有效指针则返回 None
         当 debug=True 时返回 (angle, debug_dict)
     """
@@ -62,6 +67,7 @@ def estimate_knob_angle(
         binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
 
     if angle is not None:
+        angle = _constrain_angle(angle, angle_range)
         if debug:
             gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
             dbg = _build_debug(gray, circle_mask, binary, pointer_contour)
@@ -70,17 +76,18 @@ def estimate_knob_angle(
             return angle, dbg
         return angle
 
-    # 白色指针失败，尝试彩色把手方法
-    angle, handle_contour, handle_mask = _try_color_handle(
+    # 白色指针失败，尝试径向亮度扫描法
+    angle, _, _ = _try_color_handle(
         color_roi, circle_mask, circle_area,
         min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
 
     if angle is not None:
+        angle = _constrain_angle(angle, angle_range)
         if debug:
             gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
-            dbg = _build_debug(gray, circle_mask, handle_mask, handle_contour)
+            dbg = _build_debug(gray, circle_mask, np.zeros_like(circle_mask), None)
             dbg['angle'] = angle
-            dbg['method'] = 'color_handle'
+            dbg['method'] = 'radial_scan'
             return angle, dbg
         return angle
 
@@ -131,65 +138,65 @@ def _try_white_pointer(color_roi, circle_mask, radius, circle_area,
 def _try_color_handle(color_roi, circle_mask, circle_area,
                       min_area_ratio, max_area_ratio, cx, cy):
     """
-    尝试用自适应阈值提取暗色把手区域
+    径向亮度扫描法检测把手方向
 
-    适用于红色/棕色旋转把手类旋钮，把手相对于底座有局部亮度差异。
-    使用自适应阈值（反向）捕捉局部暗色区域（把手阴影/轮廓）。
+    把手比底座更亮。将圆形区域分为 36 个扇区（每 10°），
+    计算外圈（半径 40%-90%）每个扇区的平均亮度，
+    最亮的方向就是把手指向。
     """
-    gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
-    masked_gray = cv2.bitwise_and(gray, gray, mask=circle_mask)
+    gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    h, w = gray.shape
+    radius = int(min(cx, cy) * 0.85)
 
-    # 自适应阈值（反向）：提取局部暗色区域
-    adaptive = cv2.adaptiveThreshold(
-        masked_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 21, 5)
-    adaptive = cv2.bitwise_and(adaptive, circle_mask)
+    # 构建角度和距离映射
+    ys, xs = np.mgrid[0:h, 0:w]
+    dx = xs - cx
+    dy = ys - cy
+    dist = np.sqrt(dx ** 2 + dy ** 2)
 
-    # 形态学处理：连接把手碎片
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    handle_mask = cv2.morphologyEx(adaptive, cv2.MORPH_OPEN, kernel_small, iterations=1)
-    handle_mask = cv2.morphologyEx(handle_mask, cv2.MORPH_CLOSE, kernel_large, iterations=2)
+    # 只看外圈（40%~90% 半径），排除中心和边缘
+    inner_r = radius * 0.4
+    outer_r = radius * 0.9
+    ring_mask = (dist >= inner_r) & (dist <= outer_r)
 
-    # 查找轮廓
-    contours, _ = cv2.findContours(handle_mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, None, handle_mask
+    # 计算每个像素的角度（0°=12点钟方向，顺时针）
+    angles = np.degrees(np.arctan2(dx, -dy)) % 360
 
-    # 把手特征：细长形状，长宽比 > 1.5，面积适中
-    handle_min_area = circle_area * 0.02
-    handle_max_area = circle_area * 0.5
+    # 分成 36 个扇区，每个 10°
+    n_sectors = 36
+    sector_brightness = np.zeros(n_sectors)
+    sector_counts = np.zeros(n_sectors)
 
-    best_contour = None
-    best_score = -1
+    for s in range(n_sectors):
+        a_lo = s * 10.0
+        a_hi = (s + 1) * 10.0
+        mask = ring_mask & (angles >= a_lo) & (angles < a_hi)
+        pixels = gray[mask]
+        if len(pixels) > 0:
+            sector_brightness[s] = np.mean(pixels)
+            sector_counts[s] = len(pixels)
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < handle_min_area or area > handle_max_area:
-            continue
+    # 用高斯平滑扇区亮度（循环卷积，消除噪声）
+    from scipy.ndimage import uniform_filter1d
+    # 简单用滑窗平均代替（避免依赖 scipy）
+    smooth = np.zeros(n_sectors)
+    kernel_half = 2  # ±2 扇区 = ±20° 平滑
+    for s in range(n_sectors):
+        total = 0.0
+        count = 0
+        for k in range(-kernel_half, kernel_half + 1):
+            idx = (s + k) % n_sectors
+            if sector_counts[idx] > 0:
+                total += sector_brightness[idx]
+                count += 1
+        smooth[s] = total / count if count > 0 else 0
 
-        rect = cv2.minAreaRect(cnt)
-        box_w, box_h = rect[1]
-        if min(box_w, box_h) < 1:
-            continue
-        aspect = max(box_w, box_h) / min(box_w, box_h)
+    # 找最亮扇区
+    best_sector = int(np.argmax(smooth))
+    angle = (best_sector + 0.5) * 10.0  # 扇区中心角度
 
-        # 把手应该是细长形
-        if aspect < 1.5:
-            continue
-
-        # 打分：偏好细长且面积大的轮廓
-        score = aspect * math.sqrt(area)
-        if score > best_score:
-            best_score = score
-            best_contour = cnt
-
-    if best_contour is None:
-        return None, None, handle_mask
-
-    angle = _compute_angle_from_contour(best_contour, cx, cy)
-    return angle, best_contour, handle_mask
+    # 返回兼容接口（无 contour）
+    return angle, None, None
 
 
 def _find_pointer_contour(binary, circle_area, min_area_ratio, max_area_ratio):
@@ -230,39 +237,75 @@ def _compute_angle_from_contour(contour, cx, cy) -> float:
     """
     从轮廓计算指针角度
 
-    策略：用 fitLine 获取方向向量，再用轮廓最远点（而非质心）消解 180° 歧义。
-    最远点比质心更稳定，因为指针的尖端总是离中心最远的部分。
+    策略：取轮廓上距离中心最远的 top 10% 点，计算它们的平均方向。
+    比单个最远点更稳定，不容易被噪声干扰。
     """
-    # fitLine 拟合方向
-    line = cv2.fitLine(contour, cv2.DIST_L2, 0, 0.01, 0.01)
-    vx, vy = float(line[0][0]), float(line[1][0])
-
-    # 找轮廓上离旋钮中心最远的点（指针尖端）
     pts = contour.reshape(-1, 2).astype(np.float64)
     dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
-    farthest = pts[np.argmax(dists)]
 
-    # 最远点相对于旋钮中心的偏移方向
-    dx = farthest[0] - cx
-    dy = farthest[1] - cy
+    # 取距离最远的 top 10% 点（至少 3 个）
+    n_top = max(3, len(pts) // 10)
+    top_indices = np.argsort(dists)[-n_top:]
+    top_pts = pts[top_indices]
 
-    # 用最远点方向消解 180° 歧义：指针从中心指向最远点
-    if vx * dx + vy * dy < 0:
-        vx, vy = -vx, -vy
+    # 计算这些点相对于中心的平均方向
+    dx = np.mean(top_pts[:, 0]) - cx
+    dy = np.mean(top_pts[:, 1]) - cy
 
     # 计算角度：以 12 点钟方向 (向上) 为 0°，顺时针增加
-    angle_rad = math.atan2(vx, -vy)
+    angle_rad = math.atan2(dx, -dy)
     angle_deg = math.degrees(angle_rad)
     if angle_deg < 0:
         angle_deg += 360.0
 
-    # 旋钮物理范围约束 [0, 90]：如果超出范围，折回 180°
-    if angle_deg > 135 and angle_deg < 315:
-        angle_deg -= 180.0
-        if angle_deg < 0:
-            angle_deg += 360.0
-
     return angle_deg
+
+
+def _constrain_angle(angle: float, angle_range: tuple = None) -> float:
+    """
+    将角度约束到物理范围内
+
+    Args:
+        angle: 原始角度 [0, 360)
+        angle_range: (min_angle, max_angle)，允许负数和 >360 的值
+                     例如 (-45, 135) 或 (135, 315)
+
+    Returns:
+        约束后的角度值，超出范围 clamp 到边界
+        如果检测到 180° 翻转（距离范围中心 > 90°），先折回再 clamp
+    """
+    if angle_range is None:
+        return angle
+
+    lo, hi = angle_range
+    mid = (lo + hi) / 2.0
+
+    # 将 angle 转换到以 mid 为中心的 [-180, 180) 区间
+    # 这样可以正确处理跨 0°/360° 的情况
+    diff = angle - mid
+    # 归一化 diff 到 [-180, 180)
+    while diff > 180:
+        diff -= 360
+    while diff <= -180:
+        diff += 360
+
+    # 如果偏离中心超过 90°，说明方向反了，折回 180°
+    half_span = (hi - lo) / 2.0
+    if abs(diff) > half_span + 90:
+        diff -= 180 if diff > 0 else -180
+        # 再次归一化
+        while diff > 180:
+            diff -= 360
+        while diff <= -180:
+            diff += 360
+
+    # 转回绝对角度
+    result = mid + diff
+
+    # Clamp 到范围边界
+    result = max(lo, min(hi, result))
+
+    return result
 
 
 def _build_debug(gray, circle_mask, binary, pointer_contour):

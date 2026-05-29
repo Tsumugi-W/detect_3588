@@ -481,8 +481,43 @@ class PanelDetectionNode(Node):
                 confidence=float(conf_list[i]),
             ))
 
-        # ─── 每帧独立识别绝对编号 ───
-        matched = self._registry.identify(frame_detections, color_image)
+        # 检测到两个 knob 时：
+        # 1. 将连线附近的 light 强制改为 button
+        # 2. 只有连线上的 button/knob 参与编号（过滤掉不在面板行的目标）
+        knobs = [d for d in frame_detections if d.class_name == 'knob']
+        panel_detections = []  # 只有在面板行上的目标才参与编号
+
+        if len(knobs) >= 2:
+            k1, k2 = knobs[0], knobs[1]
+            line_vec = np.array([k2.center_x - k1.center_x, k2.center_y - k1.center_y])
+            line_len = np.linalg.norm(line_vec)
+            if line_len > 1:
+                line_unit = line_vec / line_len
+                line_normal = np.array([-line_unit[1], line_unit[0]])
+                for d in frame_detections:
+                    pt = np.array([d.center_x - k1.center_x, d.center_y - k1.center_y])
+                    dist = abs(np.dot(pt, line_normal))
+                    on_line = dist < 80
+                    if d.class_name == 'light' and on_line:
+                        d.class_name = 'button'
+                        x1, y1 = int(d.bbox[0]), int(d.bbox[1])
+                        cv2.rectangle(canvas, (x1, y1 - 20), (x1 + 80, y1), (0, 0, 0), -1)
+                        cv2.putText(canvas, 'button', (x1, y1 - 5),
+                                    0, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                    # 只有在连线上的 button/knob 参与编号
+                    if on_line and d.class_name in ('button', 'knob'):
+                        panel_detections.append(d)
+            else:
+                # knob 重叠退化，取所有 button/knob
+                panel_detections = [d for d in frame_detections
+                                    if d.class_name in ('button', 'knob')]
+        else:
+            # 没有两个 knob 可见，取所有 button/knob
+            panel_detections = [d for d in frame_detections
+                                if d.class_name in ('button', 'knob')]
+
+        # ─── 每帧独立识别绝对编号（只对面板行上的目标）───
+        matched = self._registry.identify(panel_detections, color_image)
 
         targets_output = []
         knob_angles = []
@@ -530,10 +565,13 @@ class PanelDetectionNode(Node):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
                 x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
+                # 红色旋钮(#4): 180°~270°, 黑色旋钮(#5): 0°~90°
+                knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)
                 angle = estimate_knob_angle(
                     roi,
                     binary_thresh=self._angle_binary_thresh,
                     circle_mask_ratio=self._angle_circle_mask,
+                    angle_range=knob_range,
                 )
                 if angle is not None:
                     knob_angles.append({
