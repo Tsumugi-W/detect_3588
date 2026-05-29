@@ -20,32 +20,25 @@ def estimate_knob_angle(
     max_pointer_area_ratio: float = 0.25,
     circle_mask_ratio: float = 0.85,
     angle_range: tuple = None,
+    pointer_color: str = 'auto',
     debug: bool = False,
 ) -> float | None:
     """
     估计旋钮指针角度
 
-    自动判断旋钮类型：
-      - 白色指针旋钮（黑色旋钮上有白色标记）：灰度二值化提取
-      - 彩色把手旋钮（红色/棕色旋转把手）：HSV 颜色隔离提取
-
     Args:
         color_roi: BGR 格式的旋钮裁剪图 (来自 YOLO bbox)
-        binary_thresh: 二值化阈值，用于提取白色指针（高亮区域）
+        binary_thresh: 二值化阈值
         min_pointer_area_ratio: 指针最小面积占圆形区域的比例
         max_pointer_area_ratio: 指针最大面积占圆形区域的比例
-        circle_mask_ratio: 圆形 mask 半径相对于 ROI 短边半径的比例
-                           用于去除旋钮边框（银色金属圈）干扰
-        angle_range: (min_angle, max_angle) 物理角度范围，用于消歧和 clamp
-                     例如 (-45, 135) 表示黑色旋钮，(135, 315) 表示红色旋钮
-                     超出范围的值会被 clamp 到边界
+        circle_mask_ratio: 圆形 mask 半径比例
+        angle_range: (min_angle, max_angle) 物理角度范围
+        pointer_color: 'dark'=暗色指针, 'bright'=亮色把手, 'auto'=自动
         debug: 是否返回调试中间结果
 
     Returns:
         角度值 (°)，以 12 点钟方向为 0°，顺时针增加
-        如果设定了 angle_range，返回值在该范围内（可能为负数）
         如果无法检测到有效指针则返回 None
-        当 debug=True 时返回 (angle, debug_dict)
     """
     if color_roi is None or color_roi.size == 0:
         return (None, {}) if debug else None
@@ -61,10 +54,28 @@ def estimate_knob_angle(
     cv2.circle(circle_mask, (cx, cy), radius, 255, -1)
     circle_area = math.pi * radius * radius
 
-    # 先尝试白色指针方法
-    angle, pointer_contour, binary = _try_white_pointer(
-        color_roi, circle_mask, radius, circle_area,
-        binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+    # 根据指针颜色选择策略
+    if pointer_color == 'dark':
+        # 先尝试暗色指针，失败则 fallback 到白色指针
+        angle, pointer_contour, binary = _try_dark_pointer(
+            color_roi, circle_mask, radius, circle_area,
+            min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+        if angle is None:
+            angle, pointer_contour, binary = _try_white_pointer(
+                color_roi, circle_mask, radius, circle_area,
+                binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+    elif pointer_color == 'bright':
+        # 亮色把手：径向扫描
+        angle, pointer_contour, binary = None, None, None
+    else:
+        # auto: 先尝试白色指针，再尝试暗色指针
+        angle, pointer_contour, binary = _try_white_pointer(
+            color_roi, circle_mask, radius, circle_area,
+            binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+        if angle is None:
+            angle, pointer_contour, binary = _try_dark_pointer(
+                color_roi, circle_mask, radius, circle_area,
+                min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
 
     if angle is not None:
         angle = _constrain_angle(angle, angle_range)
@@ -97,6 +108,33 @@ def estimate_knob_angle(
                                   binary if binary is not None else np.zeros_like(circle_mask),
                                   None)
     return None
+
+
+def _try_dark_pointer(color_roi, circle_mask, radius, circle_area,
+                      min_area_ratio, max_area_ratio, cx, cy):
+    """提取暗色指针（黑色指针在浅色/灰色底上）"""
+    gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
+    masked_gray = cv2.bitwise_and(gray, gray, mask=circle_mask)
+
+    # 反向二值化：提取暗色区域
+    # 用 OTSU 自适应找阈值，然后反转
+    _, binary_otsu = cv2.threshold(masked_gray, 0, 255,
+                                   cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    binary = cv2.bitwise_and(binary_otsu, circle_mask)
+
+    # 形态学去噪
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    # 轮廓筛选
+    contour = _find_pointer_contour(
+        binary, circle_area, min_area_ratio, max_area_ratio)
+    if contour is None:
+        return None, None, binary
+
+    angle = _compute_angle_from_contour(contour, cx, cy)
+    return angle, contour, binary
 
 
 def _try_white_pointer(color_roi, circle_mask, radius, circle_area,
@@ -237,23 +275,45 @@ def _compute_angle_from_contour(contour, cx, cy) -> float:
     """
     从轮廓计算指针角度
 
-    策略：取轮廓上距离中心最远的 top 10% 点，计算它们的平均方向。
-    比单个最远点更稳定，不容易被噪声干扰。
+    策略：
+    1. 用 minAreaRect 获取长轴方向（对细长指针非常准确）
+    2. minAreaRect 有 180° 歧义，通过比较长轴两端哪端离旋钮中心更远来消歧
+       — 指针尖端离中心更远
     """
-    pts = contour.reshape(-1, 2).astype(np.float64)
-    dists = np.sqrt((pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2)
+    rect = cv2.minAreaRect(contour)
+    (rect_cx, rect_cy), (w, h), angle_rect = rect
 
-    # 取距离最远的 top 10% 点（至少 3 个）
-    n_top = max(3, len(pts) // 10)
-    top_indices = np.argsort(dists)[-n_top:]
-    top_pts = pts[top_indices]
+    # minAreaRect 的 angle 是短边与 x 轴的夹角
+    # 转换为长轴方向
+    if w < h:
+        # 长轴方向 = angle_rect + 90
+        axis_angle = angle_rect + 90
+    else:
+        axis_angle = angle_rect
 
-    # 计算这些点相对于中心的平均方向
-    dx = np.mean(top_pts[:, 0]) - cx
-    dy = np.mean(top_pts[:, 1]) - cy
+    # axis_angle 是长轴与 x 轴正方向的夹角（逆时针）
+    # 转换为方向向量
+    rad = math.radians(axis_angle)
+    vx = math.cos(rad)
+    vy = math.sin(rad)
+
+    # 沿长轴两个方向各取一个端点，看哪端离旋钮中心更远
+    half_len = max(w, h) / 2.0
+    end1_x = rect_cx + vx * half_len
+    end1_y = rect_cy + vy * half_len
+    end2_x = rect_cx - vx * half_len
+    end2_y = rect_cy - vy * half_len
+
+    dist1 = math.sqrt((end1_x - cx) ** 2 + (end1_y - cy) ** 2)
+    dist2 = math.sqrt((end2_x - cx) ** 2 + (end2_y - cy) ** 2)
+
+    # 指针指向离中心更远的那端
+    if dist2 > dist1:
+        vx, vy = -vx, -vy
 
     # 计算角度：以 12 点钟方向 (向上) 为 0°，顺时针增加
-    angle_rad = math.atan2(dx, -dy)
+    # 图像坐标系 y 向下，所以 12 点钟是 (0, -1)
+    angle_rad = math.atan2(vx, -vy)
     angle_deg = math.degrees(angle_rad)
     if angle_deg < 0:
         angle_deg += 360.0

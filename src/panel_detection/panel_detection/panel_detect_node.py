@@ -565,13 +565,15 @@ class PanelDetectionNode(Node):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
                 x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
-                # 红色旋钮(#4): 180°~270°, 黑色旋钮(#5): 0°~90°
+                # 红色旋钮(#4): 亮色把手, 黑色旋钮(#5): 暗色指针
+                ptr_color = 'bright' if target_id == 4 else 'dark'
                 knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)
                 angle = estimate_knob_angle(
                     roi,
                     binary_thresh=self._angle_binary_thresh,
                     circle_mask_ratio=self._angle_circle_mask,
                     angle_range=knob_range,
+                    pointer_color=ptr_color,
                 )
                 if angle is not None:
                     knob_angles.append({
