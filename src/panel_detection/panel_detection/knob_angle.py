@@ -112,29 +112,65 @@ def estimate_knob_angle(
 
 def _try_dark_pointer(color_roi, circle_mask, radius, circle_area,
                       min_area_ratio, max_area_ratio, cx, cy):
-    """提取暗色指针（黑色指针在浅色/灰色底上）"""
+    """
+    最远点法：手柄比圆形底座直径长，
+    轮廓上离中心最远的一簇点即为手柄方向。
+
+    步骤：
+    1. 边缘检测拿到旋钮轮廓
+    2. 计算轮廓上每个点到 bbox 中心的距离
+    3. 取距离 > 中位数 * 1.1 的远点簇
+    4. 远点簇质心相对中心的方向 = 手柄角度
+    """
     gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
-    masked_gray = cv2.bitwise_and(gray, gray, mask=circle_mask)
+    h, w = gray.shape
 
-    # 反向二值化：提取暗色区域
-    # 用 OTSU 自适应找阈值，然后反转
-    _, binary_otsu = cv2.threshold(masked_gray, 0, 255,
-                                   cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-    binary = cv2.bitwise_and(binary_otsu, circle_mask)
+    # 高斯模糊 + Canny 边缘
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 30, 100)
 
-    # 形态学去噪
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    # 只保留圆形区域内的边缘
+    edges = cv2.bitwise_and(edges, circle_mask)
 
-    # 轮廓筛选
-    contour = _find_pointer_contour(
-        binary, circle_area, min_area_ratio, max_area_ratio)
-    if contour is None:
-        return None, None, binary
+    # 找轮廓
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None, None, edges
 
-    angle = _compute_angle_from_contour(contour, cx, cy)
-    return angle, contour, binary
+    # 合并所有轮廓点
+    all_pts = np.vstack(contours).squeeze()
+    if all_pts.ndim != 2 or len(all_pts) < 20:
+        return None, None, edges
+
+    # 计算每个轮廓点到 bbox 中心的距离
+    dists = np.sqrt((all_pts[:, 0] - cx) ** 2 + (all_pts[:, 1] - cy) ** 2)
+
+    # 用中位距离作为 "底座半径" 的估计
+    median_dist = np.median(dists)
+    if median_dist < 5:
+        return None, None, edges
+
+    # 取距离超过中位数 * 1.15 的点作为远点（手柄突出部分）
+    threshold = median_dist * 1.15
+    far_mask = dists > threshold
+
+    far_pts = all_pts[far_mask]
+    if len(far_pts) < 5:
+        return None, None, edges
+
+    # 远点质心
+    mass_x = np.mean(far_pts[:, 0])
+    mass_y = np.mean(far_pts[:, 1])
+
+    # 从中心到远点质心的角度
+    dx = mass_x - cx
+    dy = mass_y - cy
+    angle_rad = math.atan2(dx, -dy)  # 0° = 12点钟，顺时针
+    angle_deg = math.degrees(angle_rad)
+    if angle_deg < 0:
+        angle_deg += 360.0
+
+    return angle_deg, None, edges
 
 
 def _try_white_pointer(color_roi, circle_mask, radius, circle_area,
@@ -486,11 +522,15 @@ def draw_knob_angle(image, bbox, angle, color=(0, 255, 255), thickness=2):
     cy = (y1 + y2) // 2
     r = min(x2 - x1, y2 - y1) // 3
 
-    # 画指针方向线
+    # 画直线（从中心向两侧延伸）
     angle_rad = math.radians(angle)
-    ex = int(cx + r * math.sin(angle_rad))
-    ey = int(cy - r * math.cos(angle_rad))
-    cv2.line(image, (cx, cy), (ex, ey), color, thickness, cv2.LINE_AA)
+    dx = r * math.sin(angle_rad)
+    dy = -r * math.cos(angle_rad)
+    ex1 = int(cx + dx)
+    ey1 = int(cy + dy)
+    ex2 = int(cx - dx)
+    ey2 = int(cy - dy)
+    cv2.line(image, (ex1, ey1), (ex2, ey2), color, thickness, cv2.LINE_AA)
     cv2.circle(image, (cx, cy), 3, color, -1, cv2.LINE_AA)
 
     # 标注角度数值

@@ -41,15 +41,16 @@ DEFAULT_CONFIG = {
     'camera': {'color_width': 1280, 'color_height': 720,
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
-    'onnx_model': '0527.onnx',
+    'onnx_model': '0601.onnx',
     'onnx_threads': 8,
-    'weight': '0527.pt',
+    'weight': '0601.pt',
     'input_size': 640,
     'class_num': 7,
     'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button'],
     'threshold': {'iou': 0.01, 'confidence': 0.3},
     'knob_angle': {'enable': True, 'binary_thresh': 180,
-                   'circle_mask_ratio': 0.85, 'knob_class': 'knob'},
+                   'circle_mask_ratio': 0.85, 'knob_class': 'knob',
+                   'use_constraint': True},
     'panel_normal_interval': 10,
 }
 
@@ -189,6 +190,7 @@ class PanelDetectionNode(Node):
         self._angle_binary_thresh = angle_cfg.get('binary_thresh', 180)
         self._angle_circle_mask = angle_cfg.get('circle_mask_ratio', 0.85)
         self._angle_knob_class = angle_cfg.get('knob_class', 'knob')
+        self._angle_use_constraint = angle_cfg.get('use_constraint', True)
 
         # 面板法向量
         self._panel_normal_cache = None
@@ -567,7 +569,9 @@ class PanelDetectionNode(Node):
                 roi = color_image[y1:y2, x1:x2]
                 # 红色旋钮(#4): 亮色把手, 黑色旋钮(#5): 暗色指针
                 ptr_color = 'bright' if target_id == 4 else 'dark'
-                knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)
+                knob_range = None
+                if self._angle_use_constraint:
+                    knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)
                 angle = estimate_knob_angle(
                     roi,
                     binary_thresh=self._angle_binary_thresh,
