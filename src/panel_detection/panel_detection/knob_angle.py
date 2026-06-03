@@ -147,13 +147,102 @@ def _try_red_handle_pointer(color_roi, radius, circle_area,
     if len(pts) < 20:
         return None, None, binary
 
-    angle_deg = _red_handle_angle_from_radial_profile(
+    profile_angle = _red_handle_angle_from_radial_profile(
         pts, cx, cy, radius, angle_range)
+    stem_angle, stem_conf = _red_handle_angle_from_lower_stem(
+        color_roi, binary, cx, cy, radius)
+    angle_deg = _select_red_handle_angle(
+        profile_angle, stem_angle, stem_conf, angle_range)
     if angle_deg is None:
         return None, None, binary
 
     contour = max(red_contours, key=cv2.contourArea)
     return angle_deg, contour, binary
+
+
+def _red_handle_angle_from_lower_stem(color_roi, red_binary, cx, cy, radius):
+    """
+    对垂直/下垂红色手柄的兜底估计。
+
+    ref4 这类角度下，红色圆环右侧会让径向 profile 跳到 300° 附近。
+    手柄本体比内腔更亮，且位于中心下半区；在这个窗口里做 PCA 可稳定
+    找到下垂长柄方向。
+    """
+    hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
+    v_ch = hsv[:, :, 2]
+    yy, xx = np.mgrid[0:color_roi.shape[0], 0:color_roi.shape[1]]
+
+    red_pixels = v_ch[red_binary > 0]
+    if red_pixels.size < 20:
+        return None, 0.0
+
+    value_thresh = max(75.0, float(np.percentile(red_pixels, 65)))
+    stem_mask = (
+        (red_binary > 0) &
+        (v_ch >= value_thresh) &
+        (np.abs(xx - cx) <= radius * 0.42) &
+        (yy >= cy - radius * 0.25)
+    )
+
+    pts_yx = np.column_stack(np.where(stem_mask))
+    if len(pts_yx) < max(30, int(red_pixels.size * 0.03)):
+        return None, 0.0
+
+    pts = pts_yx[:, ::-1].astype(np.float64)
+    mean = np.mean(pts, axis=0)
+    centered = pts - mean
+    _, s_vals, vt = np.linalg.svd(centered, full_matrices=False)
+    if len(s_vals) < 2 or s_vals[1] < 1e-6:
+        return None, 0.0
+
+    elongation = float(s_vals[0] / s_vals[1])
+    if elongation < 1.6:
+        return None, 0.0
+
+    axis = vt[0]
+    projections = centered @ axis
+    end_a = mean + axis * np.percentile(projections, 95)
+    end_b = mean + axis * np.percentile(projections, 5)
+    center = np.array([cx, cy], dtype=np.float64)
+    end = end_b if np.linalg.norm(end_b - center) > np.linalg.norm(end_a - center) else end_a
+
+    vx, vy = float(end[0] - cx), float(end[1] - cy)
+    if math.hypot(vx, vy) < radius * 0.35:
+        return None, 0.0
+
+    angle = math.degrees(math.atan2(vx, -vy)) % 360.0
+    confidence = min(1.0, (elongation - 1.2) / 2.5) * min(1.0, len(pts) / 1500.0)
+    return angle, confidence
+
+
+def _select_red_handle_angle(profile_angle, stem_angle, stem_conf, angle_range):
+    """在径向 profile 和下垂手柄兜底之间做保守选择。"""
+    if profile_angle is None:
+        return stem_angle if stem_conf >= 0.25 else None
+
+    if stem_angle is None or stem_conf < 0.25:
+        return profile_angle
+
+    profile_outside_range = (
+        angle_range is not None and
+        not _angle_in_range(profile_angle, angle_range, margin=8.0)
+    )
+    stem_inside_range = (
+        angle_range is None or
+        _angle_in_range(stem_angle, angle_range, margin=8.0)
+    )
+    suspicious_right_rim = 285.0 <= profile_angle <= 340.0
+    stem_is_downward = 150.0 <= stem_angle <= 230.0
+    angle_gap = abs(((profile_angle - stem_angle + 180.0) % 360.0) - 180.0)
+
+    if stem_inside_range and stem_is_downward and (
+            suspicious_right_rim or profile_outside_range):
+        return stem_angle
+
+    if stem_inside_range and stem_is_downward and stem_conf >= 0.35 and angle_gap >= 45.0:
+        return stem_angle
+
+    return profile_angle
 
 
 def _red_handle_angle_from_radial_profile(points, cx, cy, radius, angle_range=None):

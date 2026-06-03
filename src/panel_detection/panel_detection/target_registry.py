@@ -119,19 +119,32 @@ def _match_subsequence(observed: List[Tuple[str, str]]) -> List[int]:
     使用滑动窗口 + 评分机制，找到最佳匹配位置。
     强制约束：button 只能匹配 #1#2#3#6#7，knob 只能匹配 #4#5
     """
+    ids, _, contiguous = _match_subsequence_scored(observed)
+    if not contiguous:
+        # 无法找到类别完全匹配的连续子序列，退回逐个匹配
+        return _match_individual(observed)
+    return ids
+
+
+def _match_subsequence_scored(observed: List[Tuple[str, str]]) -> Tuple[List[int], int, bool]:
+    """
+    匹配连续布局子序列并返回分数。
+
+    Returns:
+        (ids, score, contiguous_match)
+    """
     n_obs = len(observed)
     n_layout = len(PANEL_LAYOUT)
 
     if n_obs == 0:
-        return []
+        return [], -10_000, False
     if n_obs > n_layout:
         observed = observed[:n_layout]
         n_obs = n_layout
 
-    best_score = -1
+    best_score = -10_000
     best_offset = -1
 
-    # 滑动窗口：在布局中找连续子序列的最佳匹配
     for offset in range(n_layout - n_obs + 1):
         score = 0
         valid = True
@@ -140,29 +153,74 @@ def _match_subsequence(observed: List[Tuple[str, str]]) -> List[int]:
             layout_cls, layout_color = PANEL_LAYOUT[offset + i]
             obs_cls, obs_color = observed[i]
 
-            # 类别必须严格匹配（button→button, knob→knob）
             if obs_cls != layout_cls:
                 valid = False
                 break
 
-            # 颜色匹配评分
             if obs_color == layout_color:
                 score += 3
-            elif obs_color != 'unknown':
-                score -= 1
+            elif obs_color == 'unknown':
+                score += 0
+            else:
+                score -= 2
 
         if not valid:
             continue
 
+        # 连续子序列比逐个颜色匹配更可信，避免两个绿色按钮互换 #1/#7。
+        score += 20
         if score > best_score:
             best_score = score
             best_offset = offset
 
     if best_offset < 0:
-        # 无法找到类别完全匹配的连续子序列，退回逐个匹配
-        return _match_individual(observed)
+        return [], -10_000, False
 
-    return [best_offset + i + 1 for i in range(n_obs)]
+    return [best_offset + i + 1 for i in range(n_obs)], best_score, True
+
+
+def _match_best_direction(
+        sorted_dets: List[FrameDetection],
+        color_image: np.ndarray) -> List[Tuple[int, FrameDetection]]:
+    """同时评估轴线正反两个方向，选择更符合完整布局的一边。"""
+    candidates = []
+    for dets in (sorted_dets, list(reversed(sorted_dets))):
+        observed = []
+        for det in dets:
+            color = _classify_color(color_image, det.bbox)
+            observed.append((det.class_name, color))
+
+        ids, score, contiguous = _match_subsequence_scored(observed)
+        if not contiguous:
+            ids = _match_individual(observed)
+            score = _score_individual_match(observed, ids)
+        candidates.append((score, ids, dets))
+
+    score, ids, dets = max(candidates, key=lambda item: item[0])
+    results = []
+    for i, det in enumerate(dets):
+        if i < len(ids):
+            results.append((ids[i], det))
+    return results
+
+
+def _score_individual_match(observed: List[Tuple[str, str]], ids: List[int]) -> int:
+    """给逐个匹配一个较低分，仅在两边都无法连续匹配时使用。"""
+    if not observed or not ids:
+        return -10_000
+    score = -100
+    for (obs_cls, obs_color), target_id in zip(observed, ids):
+        if target_id <= 0 or target_id > len(PANEL_LAYOUT):
+            score -= 5
+            continue
+        layout_cls, layout_color = PANEL_LAYOUT[target_id - 1]
+        if obs_cls == layout_cls:
+            score += 1
+        if obs_color == layout_color:
+            score += 2
+        elif obs_color != 'unknown':
+            score -= 1
+    return score
 
 
 def _match_individual(observed: List[Tuple[str, str]]) -> List[int]:
@@ -289,21 +347,7 @@ class TargetRegistry:
         else:
             sorted_dets = sorted(detections, key=lambda d: d.center_x)
 
-        # 提取每个检测的颜色特征
-        observed = []
-        for det in sorted_dets:
-            color = _classify_color(color_image, det.bbox)
-            observed.append((det.class_name, color))
-
-        # 子序列匹配确定绝对编号
-        ids = _match_subsequence(observed)
-
-        results = []
-        for i, det in enumerate(sorted_dets):
-            if i < len(ids):
-                results.append((ids[i], det))
-
-        return results
+        return _match_best_direction(sorted_dets, color_image)
 
     def match(self, detections: List[FrameDetection]) -> List[Tuple[int, FrameDetection]]:
         """兼容旧接口 — 不应该再被调用"""
