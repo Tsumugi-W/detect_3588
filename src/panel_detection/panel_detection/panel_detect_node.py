@@ -8,6 +8,7 @@ ROS2 面板检测节点
 话题:
   /panel/targets   (String, JSON) — 带编号的检测结果（位置 + 类别 + ID）
   /panel/knob_angles (String, JSON) — 旋钮角度信息（带编号）
+  /panel/distance  (String, JSON) — 相机到操作面板平面的垂直距离
   /panel/status    (String)       — 注册状态（registering / registered）
 """
 import os
@@ -29,8 +30,8 @@ from sensor_msgs.msg import Image, CameraInfo
 from .camera import create_backend
 from .camera.base import CameraIntrinsics
 from .depth_utils import (
-    deproject_pixel_to_point, undistort_pixel,
-    filter_depth, get_robust_depth, compute_panel_normal,
+    deproject_pixel_to_point,
+    filter_depth, get_robust_depth, get_bbox_robust_depth, compute_panel_normal,
 )
 from .knob_angle import estimate_knob_angle, draw_knob_angle, estimate_hex_angle, draw_hex_angle
 from .target_registry import TargetRegistry, FrameDetection
@@ -118,6 +119,37 @@ def _normal_to_quaternion(normal):
     angle = math.acos(np.clip(np.dot(ref, n), -1.0, 1.0))
     s = math.sin(angle / 2)
     return [axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2)]
+
+
+def _panel_plane_distance(normal, centroid):
+    """计算相机原点到面板平面的垂直距离，单位米。"""
+    n = np.array(normal, dtype=np.float64)
+    p = np.array(centroid, dtype=np.float64)
+    n_norm = np.linalg.norm(n)
+    if n_norm < 1e-10:
+        return None
+    n = n / n_norm
+    return float(abs(np.dot(n, p)))
+
+
+def _estimate_detection_point(det, depth_image, intrin, depth_scale):
+    """
+    估计检测目标中心 3D 点。
+
+    话题模式下深度图已通过 depth_registration 对齐到彩色图，采样深度
+    应使用检测框原始像素坐标；不在采样前做 undistort，避免取错深度像素。
+    """
+    ux = int(round(det.center_x))
+    uy = int(round(det.center_y))
+    if det.class_name in ('button', 'knob'):
+        depth = get_bbox_robust_depth(
+            depth_image, det.bbox, depth_scale=depth_scale,
+            center_ratio=0.45, min_valid=8, quantile=0.5)
+    else:
+        depth = get_robust_depth(
+            depth_image, ux, uy, sample_radius=3, depth_scale=depth_scale)
+    xyz = deproject_pixel_to_point(intrin, (ux, uy), depth)
+    return ux, uy, xyz
 
 
 def _is_button_like_detection(det):
@@ -241,6 +273,7 @@ class PanelDetectionNode(Node):
         self._targets_pub = self.create_publisher(String, '/panel/targets', 10)
         self._status_pub = self.create_publisher(String, '/panel/status', 10)
         self._angle_pub = self.create_publisher(String, '/panel/knob_angles', 10)
+        self._distance_pub = self.create_publisher(String, '/panel/distance', 10)
 
         # 目标注册器
         reg_cfg = self.cfg.get('registry', {})
@@ -264,6 +297,7 @@ class PanelDetectionNode(Node):
         self._topic_depth = None
         self._topic_color_intrin = None
         self._topic_depth_intrin = None
+        self._intrinsics_checked = False
 
         # 直连模式下转发图像话题，供其他节点使用
         self._color_pub = None
@@ -534,6 +568,17 @@ class PanelDetectionNode(Node):
             depth_image = self._topic_depth
             if color_intrin is None or color_image is None or depth_image is None or depth_intrin is None:
                 return
+            if not self._intrinsics_checked:
+                self._intrinsics_checked = True
+                if (color_image.shape[:2] == depth_image.shape[:2] and
+                        (abs(color_intrin.fx - depth_intrin.fx) > 1.0 or
+                         abs(color_intrin.fy - depth_intrin.fy) > 1.0 or
+                         abs(color_intrin.cx - depth_intrin.cx) > 1.0 or
+                         abs(color_intrin.cy - depth_intrin.cy) > 1.0)):
+                    self.get_logger().warn(
+                        '深度图和彩色图尺寸相同但内参不同。若相机已开启 depth_registration，'
+                        '请确认 /camera/depth/camera_info 是否为注册后深度图内参；'
+                        '否则 3D 坐标会有系统性偏差。')
         else:
             color_intrin, depth_intrin, color_image, depth_image = \
                 self._camera.get_aligned_frames()
@@ -721,13 +766,8 @@ class PanelDetectionNode(Node):
         position_measurements = []
 
         for target_id, det in matched:
-            ux = int(det.center_x)
-            uy = int(det.center_y)
-            ux_u, uy_u = undistort_pixel(ux, uy, color_intrin)
-            ux_u, uy_u = int(ux_u), int(uy_u)
-            dis = get_robust_depth(filtered_depth, ux_u, uy_u,
-                                   sample_radius=3, depth_scale=self._depth_scale)
-            xyz = deproject_pixel_to_point(depth_intrin, (ux_u, uy_u), dis)
+            ux, uy, xyz = _estimate_detection_point(
+                det, filtered_depth, depth_intrin, self._depth_scale)
             matched_xyz[target_id] = xyz
             position_measurements.append((target_id, (ux, uy), xyz))
 
@@ -796,13 +836,8 @@ class PanelDetectionNode(Node):
         for det in frame_detections:
             if det.class_name in ('button', 'knob'):
                 continue  # 已在 matched 中处理
-            ux = int(det.center_x)
-            uy = int(det.center_y)
-            ux_u, uy_u = undistort_pixel(ux, uy, color_intrin)
-            ux_u, uy_u = int(ux_u), int(uy_u)
-            dis = get_robust_depth(filtered_depth, ux_u, uy_u,
-                                   sample_radius=3, depth_scale=self._depth_scale)
-            xyz = deproject_pixel_to_point(depth_intrin, (ux_u, uy_u), dis)
+            ux, uy, xyz = _estimate_detection_point(
+                det, filtered_depth, depth_intrin, self._depth_scale)
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
@@ -844,6 +879,21 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 
+        # 发布相机到操作面板平面的垂直距离
+        panel_distance = None
+        if self._panel_normal_cache is not None:
+            normal, centroid = self._panel_normal_cache
+            panel_distance = _panel_plane_distance(normal, centroid)
+            if panel_distance is not None:
+                msg = String()
+                msg.data = json.dumps({
+                    'stamp': stamp.sec + stamp.nanosec * 1e-9,
+                    'distance_m': round(panel_distance, 4),
+                    'normal': [round(float(v), 6) for v in normal],
+                    'centroid': [round(float(v), 4) for v in centroid],
+                }, ensure_ascii=False)
+                self._distance_pub.publish(msg)
+
         # ─── 可视化 ───
         for target_id, det in matched:
             ux = int(det.center_x)
@@ -863,6 +913,10 @@ class PanelDetectionNode(Node):
             n = np.round(self._panel_normal_cache[0], 3).tolist()
             cv2.putText(canvas, f'normal: {n}', (10, 25), 0, 0.6,
                         (0, 200, 255), 2, cv2.LINE_AA)
+            if panel_distance is not None:
+                cv2.putText(canvas, f'panel distance: {panel_distance:.3f}m',
+                            (10, 50), 0, 0.6,
+                            (0, 200, 255), 2, cv2.LINE_AA)
 
         for ka in knob_angles:
             for target_id, det in matched:

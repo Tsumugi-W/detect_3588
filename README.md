@@ -17,6 +17,7 @@ Orbbec 官方驱动 (独立 launch)
 面板检测节点 (话题订阅模式)
     ├── /panel/targets       (带编号的检测结果)
     ├── /panel/knob_angles   (旋钮角度)
+    ├── /panel/distance      (相机到面板平面的垂直距离)
     ├── /panel/status        (注册状态)
     └── /panel/buttons, /panel/knobs ...  (兼容旧话题)
 ```
@@ -194,6 +195,19 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 角度以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。
 
+### /panel/distance (String, JSON) — 相机到面板平面的垂直距离
+
+```json
+{
+  "stamp": 1716192000.123,
+  "distance_m": 0.8123,
+  "normal": [0.01, -0.02, -0.9997],
+  "centroid": [0.02, -0.01, 0.812]
+}
+```
+
+`distance_m` 单位为米，表示相机坐标系原点到操作面板拟合平面的垂直距离。
+
 ### /panel/status (String) — 注册状态
 
 - `"registering"` — 注册中
@@ -218,6 +232,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 ros2 topic list
 ros2 topic echo /panel/targets
 ros2 topic echo /panel/knob_angles
+ros2 topic echo /panel/distance
 ros2 topic echo /panel/status
 ```
 

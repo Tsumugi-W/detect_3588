@@ -144,6 +144,57 @@ def get_robust_depth(depth_image, ux, uy, sample_radius=3, depth_scale=0.001):
     return float(np.median(valid)) * depth_scale
 
 
+def get_bbox_robust_depth(depth_image, bbox, depth_scale=0.001,
+                          center_ratio=0.45, min_valid=6,
+                          quantile=0.5):
+    """
+    从检测框中心区域估计目标表面深度。
+
+    比单点 3x3 更稳：按钮/旋钮表面常有深度空洞、反光和边缘混入；
+    只取 bbox 中央区域并用分位数统计，可减少跳变和背景污染。
+
+    Args:
+        depth_image: 深度图 numpy 数组
+        bbox: (x1, y1, x2, y2)
+        depth_scale: 深度缩放因子
+        center_ratio: 采样区域占 bbox 宽高比例
+        min_valid: 最少有效深度点数量
+        quantile: 分位数，0.5 为中位数；更小更偏向近处表面
+
+    Returns:
+        深度值（米），无有效深度返回 0.0
+    """
+    h, w = depth_image.shape
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    half_w = max(2.0, bw * center_ratio * 0.5)
+    half_h = max(2.0, bh * center_ratio * 0.5)
+
+    sx1 = max(0, int(round(cx - half_w)))
+    sx2 = min(w, int(round(cx + half_w + 1)))
+    sy1 = max(0, int(round(cy - half_h)))
+    sy2 = min(h, int(round(cy + half_h + 1)))
+    if sx1 >= sx2 or sy1 >= sy2:
+        return 0.0
+
+    patch = depth_image[sy1:sy2, sx1:sx2]
+    valid = patch[patch > 0].astype(np.float64)
+    if valid.size < min_valid:
+        return get_robust_depth(depth_image, int(round(cx)), int(round(cy)),
+                                sample_radius=3, depth_scale=depth_scale)
+
+    lo, hi = np.percentile(valid, [10, 90])
+    trimmed = valid[(valid >= lo) & (valid <= hi)]
+    if trimmed.size >= min_valid:
+        valid = trimmed
+
+    q = float(np.clip(quantile, 0.05, 0.95))
+    return float(np.percentile(valid, q * 100.0)) * depth_scale
+
+
 def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100, ransac_thresh=0.005):
     """
     RANSAC + SVD 平面拟合
