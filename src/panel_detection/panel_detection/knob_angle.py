@@ -33,7 +33,8 @@ def estimate_knob_angle(
         max_pointer_area_ratio: 指针最大面积占圆形区域的比例
         circle_mask_ratio: 圆形 mask 半径比例
         angle_range: (min_angle, max_angle) 物理角度范围
-        pointer_color: 'dark'=暗色指针, 'bright'=亮色把手, 'auto'=自动
+        pointer_color: 'red_handle'=红色长柄, 'dark'=暗色指针,
+                       'bright'=亮色把手, 'auto'=自动
         debug: 是否返回调试中间结果
 
     Returns:
@@ -54,28 +55,27 @@ def estimate_knob_angle(
     cv2.circle(circle_mask, (cx, cy), radius, 255, -1)
     circle_area = math.pi * radius * radius
 
-    # 根据指针颜色选择策略
-    if pointer_color == 'dark':
-        # 先尝试暗色指针，失败则 fallback 到白色指针
+    if pointer_color == 'red_handle':
+        angle, pointer_contour, binary = _try_red_handle_pointer(
+            color_roi, radius, circle_area,
+            min_pointer_area_ratio, max_pointer_area_ratio, cx, cy,
+            angle_range=angle_range)
+    else:
+        # 当前黑色旋钮的稳定特征是“深色圆形底座 + 亮色径向指示条”。
+        # 优先检测亮色细长结构，避免旧的暗色外轮廓法把底座边缘当成指针。
+        angle, pointer_contour, binary = _try_bright_radial_pointer(
+            color_roi, circle_mask, radius, circle_area,
+            binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+
+    if angle is None and pointer_color in ('dark', 'auto'):
         angle, pointer_contour, binary = _try_dark_pointer(
             color_roi, circle_mask, radius, circle_area,
             min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
-        if angle is None:
-            angle, pointer_contour, binary = _try_white_pointer(
-                color_roi, circle_mask, radius, circle_area,
-                binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
-    elif pointer_color == 'bright':
-        # 亮色把手：径向扫描
-        angle, pointer_contour, binary = None, None, None
-    else:
-        # auto: 先尝试白色指针，再尝试暗色指针
+
+    if angle is None:
         angle, pointer_contour, binary = _try_white_pointer(
             color_roi, circle_mask, radius, circle_area,
             binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
-        if angle is None:
-            angle, pointer_contour, binary = _try_dark_pointer(
-                color_roi, circle_mask, radius, circle_area,
-                min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
 
     if angle is not None:
         angle = _constrain_angle(angle, angle_range)
@@ -83,7 +83,7 @@ def estimate_knob_angle(
             gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
             dbg = _build_debug(gray, circle_mask, binary, pointer_contour)
             dbg['angle'] = angle
-            dbg['method'] = 'white_pointer'
+            dbg['method'] = 'red_handle_pointer' if pointer_color == 'red_handle' else 'bright_radial_pointer'
             return angle, dbg
         return angle
 
@@ -108,6 +108,213 @@ def estimate_knob_angle(
                                   binary if binary is not None else np.zeros_like(circle_mask),
                                   None)
     return None
+
+
+def _try_red_handle_pointer(color_roi, radius, circle_area,
+                            min_area_ratio, max_area_ratio, cx, cy,
+                            angle_range=None):
+    """
+    红色大旋钮专用：根据红色本体中相对中心最突出的区域估计长柄方向。
+
+    红色旋钮的手柄本身是暗红/红色，不是亮色指针；bbox 又包含黄色底座。
+    因此先用 HSV 只保留红色像素，排除黄色底座和叠加标注，再按角度
+    扇区寻找红色像素的最大径向长度峰值。
+    """
+    hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
+    h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    red_mask = (((h_ch <= 12) | (h_ch >= 165)) & (s_ch >= 45) & (v_ch >= 25))
+    binary = red_mask.astype(np.uint8) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None, binary
+
+    min_area = max(20.0, circle_area * min_area_ratio * 0.5)
+    max_area = circle_area * max_area_ratio * 3.0
+    red_contours = [
+        cnt for cnt in contours
+        if min_area <= cv2.contourArea(cnt) <= max_area
+    ]
+    if not red_contours:
+        red_contours = [max(contours, key=cv2.contourArea)]
+
+    pts = np.vstack(red_contours).reshape(-1, 2).astype(np.float64)
+    if len(pts) < 20:
+        return None, None, binary
+
+    angle_deg = _red_handle_angle_from_radial_profile(
+        pts, cx, cy, radius, angle_range)
+    if angle_deg is None:
+        return None, None, binary
+
+    contour = max(red_contours, key=cv2.contourArea)
+    return angle_deg, contour, binary
+
+
+def _red_handle_angle_from_radial_profile(points, cx, cy, radius, angle_range=None):
+    """
+    在红色像素的极坐标径向长度图上找峰值。
+
+    圆环会在许多方向产生相近半径；真实长柄会在少数相邻方向产生
+    更大的 95 分位径向长度。若给定物理范围，则只在该范围附近搜索。
+    """
+    dx = points[:, 0] - cx
+    dy = points[:, 1] - cy
+    dists = np.sqrt(dx ** 2 + dy ** 2)
+    if np.max(dists) < radius * 0.35:
+        return None
+
+    angles = np.degrees(np.arctan2(dx, -dy)) % 360.0
+    min_count = max(8, int(len(points) * 0.004))
+    sector_width = 6.0
+    candidates = []
+
+    for angle in np.arange(0.0, 360.0, 2.0):
+        if angle_range is not None and not _angle_in_range(
+                angle, angle_range, margin=25.0):
+            continue
+        diff = np.abs(((angles - angle + 180.0) % 360.0) - 180.0)
+        sector_dists = dists[diff <= sector_width]
+        if len(sector_dists) < min_count:
+            continue
+        p95 = float(np.percentile(sector_dists, 95))
+        if p95 < radius * 0.45:
+            continue
+        count_bonus = min(len(sector_dists), 300) * 0.01
+        protrusion_bonus = max(0.0, p95 - radius * 0.75) * 1.5
+        candidates.append((p95 + protrusion_bonus + count_bonus, angle, p95))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True)
+    best_score, best_angle, best_radius = candidates[0]
+    if best_radius < radius * 0.55:
+        return None
+    return float(best_angle % 360.0)
+
+
+def _angle_in_range(angle, angle_range, margin=0.0):
+    lo, hi = angle_range
+    lo -= margin
+    hi += margin
+    angle = angle % 360.0
+    lo = lo % 360.0
+    hi = hi % 360.0
+    if lo <= hi:
+        return lo <= angle <= hi
+    return angle >= lo or angle <= hi
+
+
+def _try_bright_radial_pointer(color_roi, circle_mask, radius, circle_area,
+                               binary_thresh, min_area_ratio, max_area_ratio,
+                               cx, cy):
+    """
+    检测亮色径向指示条/拨杆。
+
+    旋钮底座通常是红色或黑色，指示条明显更亮。这里先用亮度分割提取
+    细长亮色连通域，再用长轴端点到旋钮中心的距离消除 180° 歧义；
+    如果连通域被反光切碎，则退回到按亮度加权的径向向量。
+    """
+    gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+
+    ys, xs = np.mgrid[0:h, 0:w]
+    dx = xs - cx
+    dy = ys - cy
+    dist = np.sqrt(dx ** 2 + dy ** 2)
+    pointer_region = (dist >= radius * 0.08) & (dist <= radius * 0.95)
+    valid_mask = ((circle_mask > 0) & pointer_region).astype(np.uint8) * 255
+
+    valid_pixels = gray[valid_mask > 0]
+    if valid_pixels.size < 20:
+        return None, None, np.zeros_like(gray)
+
+    # 用分位数阈值适应红/黑两种底座；固定阈值作为下限，防止暗噪声入选。
+    percentile_thresh = float(np.percentile(valid_pixels, 88))
+    thresh = max(float(binary_thresh), percentile_thresh)
+    _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
+    binary = cv2.bitwise_and(binary, valid_mask)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    min_area = max(8.0, circle_area * min_area_ratio * 0.25)
+    max_area = circle_area * max_area_ratio
+
+    best_contour = None
+    best_score = -1.0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+
+        rect = cv2.minAreaRect(cnt)
+        rw, rh = rect[1]
+        short_side = min(rw, rh)
+        long_side = max(rw, rh)
+        if short_side < 1 or long_side < radius * 0.18:
+            continue
+
+        aspect = long_side / short_side
+        moments = cv2.moments(cnt)
+        if moments['m00'] == 0:
+            continue
+        mx = moments['m10'] / moments['m00']
+        my = moments['m01'] / moments['m00']
+        radial = math.hypot(mx - cx, my - cy)
+
+        # 指示条可以穿过中心，不强制质心离中心很远；长、细、亮面积更可信。
+        score = aspect * 2.0 + long_side / max(radius, 1) + radial / max(radius, 1)
+        if score > best_score:
+            best_score = score
+            best_contour = cnt
+
+    if best_contour is not None:
+        return _compute_angle_from_contour(best_contour, cx, cy), best_contour, binary
+
+    angle = _weighted_radial_angle(gray, valid_mask, cx, cy, radius)
+    return angle, None, binary
+
+
+def _weighted_radial_angle(gray, valid_mask, cx, cy, radius):
+    """用高亮像素的径向质心兜底估计方向。"""
+    h, w = gray.shape
+    ys, xs = np.mgrid[0:h, 0:w]
+    dx = xs.astype(np.float64) - cx
+    dy = ys.astype(np.float64) - cy
+    dist = np.sqrt(dx ** 2 + dy ** 2)
+
+    pixels = gray[valid_mask > 0].astype(np.float64)
+    if pixels.size < 20:
+        return None
+
+    base = np.percentile(pixels, 75)
+    weights = np.maximum(gray.astype(np.float64) - base, 0.0)
+    weights[(valid_mask == 0) | (dist < radius * 0.12)] = 0.0
+
+    total = float(np.sum(weights))
+    if total < 1e-6:
+        return None
+
+    vx = float(np.sum(weights * dx) / total)
+    vy = float(np.sum(weights * dy) / total)
+    if math.hypot(vx, vy) < radius * 0.08:
+        return None
+
+    angle_rad = math.atan2(vx, -vy)
+    angle_deg = math.degrees(angle_rad)
+    if angle_deg < 0:
+        angle_deg += 360.0
+    return angle_deg
 
 
 def _try_dark_pointer(color_roi, circle_mask, radius, circle_area,

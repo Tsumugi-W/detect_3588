@@ -15,6 +15,7 @@ import math
 import json
 import time
 import threading
+from collections import defaultdict, deque
 
 import yaml
 import numpy as np
@@ -51,6 +52,13 @@ DEFAULT_CONFIG = {
     'knob_angle': {'enable': True, 'binary_thresh': 180,
                    'circle_mask_ratio': 0.85, 'knob_class': 'knob',
                    'use_constraint': True},
+    'position_stabilizer': {'enable': True, 'still_time': 3.0,
+                            'pixel_thresh': 5.0, 'window_size': 45,
+                            'ema_alpha': 0.25},
+    'panel_line': {'initial_dist_ratio': 1.1, 'dist_ratio': 0.85,
+                   'min_dist': 45.0, 'max_dist': 110.0,
+                   'proj_margin_ratio': 3.0,
+                   'min_proj_margin': 450.0},
     'panel_normal_interval': 10,
 }
 
@@ -110,6 +118,103 @@ def _normal_to_quaternion(normal):
     angle = math.acos(np.clip(np.dot(ref, n), -1.0, 1.0))
     s = math.sin(angle / 2)
     return [axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2)]
+
+
+def _is_button_like_detection(det):
+    """允许被当作按钮的几何形状：近似方形/圆形，排除细长指示灯。"""
+    w = max(1.0, det.bbox[2] - det.bbox[0])
+    h = max(1.0, det.bbox[3] - det.bbox[1])
+    aspect = w / h
+    return 0.55 <= aspect <= 1.8
+
+
+def _fit_axis_from_points(points, fallback_axis):
+    """用 PCA 拟合目标行方向，并固定为从左到右。"""
+    pts = np.array(points, dtype=np.float64)
+    if len(pts) < 2:
+        axis = np.array(fallback_axis, dtype=np.float64)
+    else:
+        centered = pts - np.mean(pts, axis=0)
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        axis = vt[0]
+
+    norm = np.linalg.norm(axis)
+    if norm < 1e-6:
+        axis = np.array(fallback_axis, dtype=np.float64)
+        norm = np.linalg.norm(axis)
+    axis = axis / max(norm, 1e-6)
+    if axis[0] < 0:
+        axis = -axis
+    return axis
+
+
+class PositionStabilizer:
+    """画面静止后对 3D 坐标做时序滤波，降低 topic 输出跳变。"""
+
+    def __init__(self, enabled=True, still_time=3.0,
+                 pixel_thresh=5.0, window_size=45, ema_alpha=0.25):
+        self.enabled = enabled
+        self.still_time = float(still_time)
+        self.pixel_thresh = float(pixel_thresh)
+        self.window_size = int(window_size)
+        self.ema_alpha = float(ema_alpha)
+        self._last_pixels = None
+        self._still_since = None
+        self._histories = defaultdict(lambda: deque(maxlen=self.window_size))
+        self._stable_xyz = {}
+
+    def update(self, measurements, now):
+        """
+        Args:
+            measurements: [(target_id, pixel_xy, xyz), ...]
+            now: time.time() 秒
+
+        Returns:
+            {target_id: filtered_xyz}
+        """
+        raw = {tid: np.array(xyz, dtype=np.float64)
+               for tid, _, xyz in measurements}
+        if not self.enabled or not measurements:
+            return {tid: xyz.tolist() for tid, xyz in raw.items()}
+
+        pixels = {tid: np.array(pixel_xy, dtype=np.float64)
+                  for tid, pixel_xy, _ in measurements}
+
+        is_still = False
+        if self._last_pixels is not None and set(pixels) == set(self._last_pixels):
+            deltas = [np.linalg.norm(pixels[tid] - self._last_pixels[tid])
+                      for tid in pixels]
+            is_still = bool(deltas) and max(deltas) <= self.pixel_thresh
+
+        if is_still:
+            if self._still_since is None:
+                self._still_since = now
+            for tid, xyz in raw.items():
+                self._histories[tid].append(xyz)
+        else:
+            self._still_since = None
+            self._histories.clear()
+            self._stable_xyz.clear()
+
+        self._last_pixels = pixels
+
+        filtered = {}
+        static_ready = (
+            self._still_since is not None and
+            now - self._still_since >= self.still_time
+        )
+        for tid, xyz in raw.items():
+            if static_ready:
+                median_xyz = np.median(np.vstack(self._histories[tid]), axis=0)
+                prev = self._stable_xyz.get(tid)
+                stable = median_xyz if prev is None else (
+                    (1.0 - self.ema_alpha) * prev + self.ema_alpha * median_xyz)
+                self._stable_xyz[tid] = stable
+                filtered[tid] = stable.tolist()
+            else:
+                filtered[tid] = xyz.tolist()
+
+        return filtered
 
 
 class PanelDetectionNode(Node):
@@ -190,7 +295,20 @@ class PanelDetectionNode(Node):
         self._angle_binary_thresh = angle_cfg.get('binary_thresh', 180)
         self._angle_circle_mask = angle_cfg.get('circle_mask_ratio', 0.85)
         self._angle_knob_class = angle_cfg.get('knob_class', 'knob')
-        self._angle_use_constraint = angle_cfg.get('use_constraint', True)
+        self.declare_parameter('use_constraint', angle_cfg.get('use_constraint', True))
+        self._angle_use_constraint = (
+            self.get_parameter('use_constraint').get_parameter_value().bool_value)
+        self.get_logger().info(f'旋钮角度约束: {self._angle_use_constraint}')
+
+        pos_cfg = self.cfg.get('position_stabilizer', {})
+        self._position_stabilizer = PositionStabilizer(
+            enabled=pos_cfg.get('enable', True),
+            still_time=pos_cfg.get('still_time', 3.0),
+            pixel_thresh=pos_cfg.get('pixel_thresh', 5.0),
+            window_size=pos_cfg.get('window_size', 45),
+            ema_alpha=pos_cfg.get('ema_alpha', 0.25),
+        )
+        self._panel_line_cfg = self.cfg.get('panel_line', {})
 
         # 面板法向量
         self._panel_normal_cache = None
@@ -484,22 +602,95 @@ class PanelDetectionNode(Node):
             ))
 
         # 检测到两个 knob 时：
-        # 1. 将连线附近的 light 强制改为 button
-        # 2. 只有连线上的 button/knob 参与编号（过滤掉不在面板行的目标）
+        # 1. 用两枚 knob 连线粗定位目标行
+        # 2. 用目标行附近的 button/knob/button-like light 重新拟合整排轴线
+        # 3. 只有最终轴线附近的 button/knob 参与编号；细长 light 不参与，避免编号贴到灯上
         knobs = [d for d in frame_detections if d.class_name == 'knob']
         panel_detections = []  # 只有在面板行上的目标才参与编号
+        panel_axis_origin = None
+        panel_axis_vector = None
 
         if len(knobs) >= 2:
-            k1, k2 = knobs[0], knobs[1]
+            k1, k2 = sorted(knobs, key=lambda d: d.center_x)[:2]
             line_vec = np.array([k2.center_x - k1.center_x, k2.center_y - k1.center_y])
             line_len = np.linalg.norm(line_vec)
             if line_len > 1:
                 line_unit = line_vec / line_len
                 line_normal = np.array([-line_unit[1], line_unit[0]])
+
+                size_candidates = [d for d in frame_detections
+                                   if d.class_name in ('button', 'knob')]
+                median_h = np.median([max(1.0, d.bbox[3] - d.bbox[1])
+                                      for d in size_candidates]) if size_candidates else 80.0
+                initial_thresh = float(np.clip(
+                    median_h * self._panel_line_cfg.get('initial_dist_ratio', 1.1),
+                    self._panel_line_cfg.get('min_dist', 45.0),
+                    self._panel_line_cfg.get('max_dist', 110.0)))
+                proj_margin = max(
+                    self._panel_line_cfg.get('min_proj_margin', 450.0),
+                    line_len * self._panel_line_cfg.get('proj_margin_ratio', 3.0))
+
+                rough_row = []
                 for d in frame_detections:
+                    can_join_row = (
+                        d.class_name in ('button', 'knob') or
+                        (d.class_name == 'light' and _is_button_like_detection(d))
+                    )
+                    if not can_join_row:
+                        continue
                     pt = np.array([d.center_x - k1.center_x, d.center_y - k1.center_y])
                     dist = abs(np.dot(pt, line_normal))
-                    on_line = dist < 80
+                    proj = float(np.dot(pt, line_unit))
+                    if dist <= initial_thresh and -proj_margin <= proj <= line_len + proj_margin:
+                        rough_row.append(d)
+
+                if len(rough_row) >= 3:
+                    fitted_axis = _fit_axis_from_points(
+                        [(d.center_x, d.center_y) for d in rough_row],
+                        line_unit)
+                    axis_origin_arr = np.mean(
+                        np.array([(d.center_x, d.center_y) for d in rough_row],
+                                 dtype=np.float64),
+                        axis=0)
+                else:
+                    fitted_axis = line_unit
+                    axis_origin_arr = np.array([k1.center_x, k1.center_y], dtype=np.float64)
+
+                fitted_normal = np.array([-fitted_axis[1], fitted_axis[0]])
+                projections = [
+                    float(np.dot(
+                        np.array([d.center_x, d.center_y], dtype=np.float64) - axis_origin_arr,
+                        fitted_axis))
+                    for d in rough_row
+                ]
+                if projections:
+                    proj_min = min(projections) - self._panel_line_cfg.get('min_proj_margin', 450.0)
+                    proj_max = max(projections) + self._panel_line_cfg.get('min_proj_margin', 450.0)
+                else:
+                    proj_min = -proj_margin
+                    proj_max = line_len + proj_margin
+
+                line_dist_thresh = float(np.clip(
+                    median_h * self._panel_line_cfg.get('dist_ratio', 0.85),
+                    self._panel_line_cfg.get('min_dist', 45.0),
+                    self._panel_line_cfg.get('max_dist', 110.0)))
+                panel_axis_origin = (float(axis_origin_arr[0]), float(axis_origin_arr[1]))
+                panel_axis_vector = (float(fitted_axis[0]), float(fitted_axis[1]))
+
+                for d in frame_detections:
+                    can_join_row = (
+                        d.class_name in ('button', 'knob') or
+                        (d.class_name == 'light' and _is_button_like_detection(d))
+                    )
+                    if not can_join_row:
+                        continue
+                    pt = np.array([d.center_x, d.center_y], dtype=np.float64) - axis_origin_arr
+                    dist = abs(np.dot(pt, fitted_normal))
+                    proj = float(np.dot(pt, fitted_axis))
+                    on_line = (
+                        dist <= line_dist_thresh and
+                        proj_min <= proj <= proj_max
+                    )
                     if d.class_name == 'light' and on_line:
                         d.class_name = 'button'
                         x1, y1 = int(d.bbox[0]), int(d.bbox[1])
@@ -519,11 +710,15 @@ class PanelDetectionNode(Node):
                                 if d.class_name in ('button', 'knob')]
 
         # ─── 每帧独立识别绝对编号（只对面板行上的目标）───
-        matched = self._registry.identify(panel_detections, color_image)
+        matched = self._registry.identify(
+            panel_detections, color_image,
+            axis_origin=panel_axis_origin,
+            axis_vector=panel_axis_vector)
 
         targets_output = []
         knob_angles = []
         matched_xyz = {}  # 缓存 3D 坐标避免重复计算
+        position_measurements = []
 
         for target_id, det in matched:
             ux = int(det.center_x)
@@ -533,6 +728,13 @@ class PanelDetectionNode(Node):
             dis = get_robust_depth(filtered_depth, ux_u, uy_u,
                                    sample_radius=3, depth_scale=self._depth_scale)
             xyz = deproject_pixel_to_point(depth_intrin, (ux_u, uy_u), dis)
+            matched_xyz[target_id] = xyz
+            position_measurements.append((target_id, (ux, uy), xyz))
+
+        stable_xyz = self._position_stabilizer.update(position_measurements, time.time())
+
+        for target_id, det in matched:
+            xyz = stable_xyz.get(target_id, matched_xyz[target_id])
             matched_xyz[target_id] = xyz
 
             target_info = {
@@ -567,8 +769,8 @@ class PanelDetectionNode(Node):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
                 x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
-                # 红色旋钮(#4): 亮色把手, 黑色旋钮(#5): 暗色指针
-                ptr_color = 'bright' if target_id == 4 else 'dark'
+                # 红色旋钮(#4): 红色长柄；黑色旋钮(#5): 亮色指针/暗色兜底
+                ptr_color = 'red_handle' if target_id == 4 else 'dark'
                 knob_range = None
                 if self._angle_use_constraint:
                     knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)

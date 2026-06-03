@@ -256,7 +256,9 @@ class TargetRegistry:
         return True
 
     def identify(self, detections: List[FrameDetection],
-                 color_image: np.ndarray) -> List[Tuple[int, FrameDetection]]:
+                 color_image: np.ndarray,
+                 axis_origin: Tuple[float, float] | None = None,
+                 axis_vector: Tuple[float, float] | None = None) -> List[Tuple[int, FrameDetection]]:
         """
         每帧独立识别：根据检测结果的类别和颜色确定绝对编号
 
@@ -270,8 +272,22 @@ class TargetRegistry:
         if not detections:
             return []
 
-        # 按 x 坐标排序
-        sorted_dets = sorted(detections, key=lambda d: d.center_x)
+        # 按面板轴线排序。没有轴线时退回按 x 坐标排序，兼容旧调用。
+        if axis_origin is not None and axis_vector is not None:
+            origin = np.array(axis_origin, dtype=np.float64)
+            axis = np.array(axis_vector, dtype=np.float64)
+            axis_norm = np.linalg.norm(axis)
+            if axis_norm > 1e-6:
+                axis = axis / axis_norm
+                sorted_dets = sorted(
+                    detections,
+                    key=lambda d: float(np.dot(
+                        np.array([d.center_x, d.center_y], dtype=np.float64) - origin,
+                        axis)))
+            else:
+                sorted_dets = sorted(detections, key=lambda d: d.center_x)
+        else:
+            sorted_dets = sorted(detections, key=lambda d: d.center_x)
 
         # 提取每个检测的颜色特征
         observed = []
