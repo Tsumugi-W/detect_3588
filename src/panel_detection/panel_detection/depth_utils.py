@@ -195,6 +195,35 @@ def get_bbox_robust_depth(depth_image, bbox, depth_scale=0.001,
     return float(np.percentile(valid, q * 100.0)) * depth_scale
 
 
+def get_masked_robust_depth(depth_image, mask, depth_scale=0.001,
+                            min_valid=12, trim_percentiles=(10, 90),
+                            quantile=0.5):
+    """
+    Estimate depth from pixels selected by a binary mask.
+
+    This is used for nuts so depth comes from the outer hex ring instead of
+    the central screw/shaft surface.
+    """
+    if depth_image is None or mask is None:
+        return 0.0
+    if depth_image.shape[:2] != mask.shape[:2]:
+        return 0.0
+
+    valid_mask = (mask > 0) & (depth_image > 0)
+    valid = depth_image[valid_mask].astype(np.float64)
+    if valid.size < min_valid:
+        return 0.0
+
+    lo_p, hi_p = trim_percentiles
+    lo, hi = np.percentile(valid, [lo_p, hi_p])
+    trimmed = valid[(valid >= lo) & (valid <= hi)]
+    if trimmed.size >= min_valid:
+        valid = trimmed
+
+    q = float(np.clip(quantile, 0.05, 0.95))
+    return float(np.percentile(valid, q * 100.0)) * depth_scale
+
+
 def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100,
                      ransac_thresh=0.005, random_seed=0):
     """

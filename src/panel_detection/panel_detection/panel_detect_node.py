@@ -31,9 +31,11 @@ from .camera import create_backend
 from .camera.base import CameraIntrinsics
 from .depth_utils import (
     deproject_pixel_to_point,
-    filter_depth, get_robust_depth, get_bbox_robust_depth, compute_panel_normal,
+    filter_depth, get_robust_depth, get_bbox_robust_depth, get_masked_robust_depth,
+    compute_panel_normal,
 )
 from .knob_angle import estimate_knob_angle, draw_knob_angle, estimate_hex_angle, draw_hex_angle
+from .nut_localizer import localize_nut
 from .target_registry import TargetRegistry, FrameDetection
 
 
@@ -153,6 +155,18 @@ def _estimate_detection_point(det, depth_image, intrin, depth_scale):
     else:
         depth = get_robust_depth(
             depth_image, ux, uy, sample_radius=3, depth_scale=depth_scale)
+    xyz = deproject_pixel_to_point(intrin, (ux, uy), depth)
+    return ux, uy, xyz
+
+
+def _estimate_nut_detection_point(localization, depth_image, intrin, depth_scale):
+    ux = int(round(localization.center[0]))
+    uy = int(round(localization.center[1]))
+    depth = get_masked_robust_depth(
+        depth_image, localization.depth_mask,
+        depth_scale=depth_scale, min_valid=12, quantile=0.5)
+    if depth <= 0.0:
+        return ux, uy, None
     xyz = deproject_pixel_to_point(intrin, (ux, uy), depth)
     return ux, uy, xyz
 
@@ -771,6 +785,11 @@ class PanelDetectionNode(Node):
                 confidence=float(conf_list[i]),
             ))
 
+        nut_localizations = {}
+        for i, det in enumerate(frame_detections):
+            if det.class_name == 'nut':
+                nut_localizations[i] = localize_nut(color_image, det.bbox)
+
         # 检测到两个 knob 时：
         # 1. 用两枚 knob 连线粗定位目标行
         # 2. 用目标行附近的 button/knob/button-like light 重新拟合整排轴线
@@ -957,32 +976,86 @@ class PanelDetectionNode(Node):
                     })
 
 
-        # 对所有非编号目标计算 3D 坐标并标注
-        for det in frame_detections:
+        # 对所有非编号目标计算 3D 坐标并标注。nut 只发布 refined 可靠点。
+        for det_idx, det in enumerate(frame_detections):
             if det.class_name in ('button', 'knob'):
                 continue  # 已在 matched 中处理
-            ux, uy, xyz = _estimate_detection_point(
-                det, filtered_depth, deproj_intrin, self._depth_scale)
+
+            if det.class_name == 'nut':
+                loc = nut_localizations.get(det_idx)
+                bbox_cx = int(round(det.center_x))
+                bbox_cy = int(round(det.center_y))
+                cv2.circle(canvas, (bbox_cx, bbox_cy), 3, (160, 160, 160), -1)
+
+                if loc is None or loc.confidence < 0.45:
+                    x1, y1 = int(det.bbox[0]), int(det.bbox[1])
+                    conf_text = 0.0 if loc is None else loc.confidence
+                    cv2.putText(canvas, f'nut refine fail {conf_text:.2f}',
+                                (x1, max(15, y1 - 8)), 0, 0.4,
+                                (0, 0, 255), 1, cv2.LINE_AA)
+                    continue
+
+                ux, uy, xyz = _estimate_nut_detection_point(
+                    loc, filtered_depth, deproj_intrin, self._depth_scale)
+                cv2.drawContours(canvas, [loc.contour], -1, (0, 255, 255), 2)
+                cv2.drawMarker(canvas, (ux, uy), (0, 255, 255),
+                               markerType=cv2.MARKER_CROSS, markerSize=14,
+                               thickness=2)
+                angle_text = 'na' if loc.angle is None else f'{loc.angle:.1f}'
+                cv2.putText(canvas, f'nut_refined_conf={loc.confidence:.2f} angle={angle_text}',
+                            (ux + 10, uy - 8), 0, 0.4,
+                            (0, 255, 255), 1, cv2.LINE_AA)
+
+                if xyz is None:
+                    cv2.putText(canvas, 'nut depth fail',
+                                (ux + 10, uy + 18), 0, 0.4,
+                                (0, 0, 255), 1, cv2.LINE_AA)
+                    continue
+
+                pub = self._pose_pubs.get('nut')
+                if pub is not None:
+                    msg = PoseStamped()
+                    msg.header.stamp = stamp
+                    msg.header.frame_id = 'camera_color_optical_frame'
+                    msg.pose.position.x = float(xyz[0])
+                    msg.pose.position.y = float(xyz[1])
+                    msg.pose.position.z = float(xyz[2])
+                    msg.pose.orientation.x = quat[0]
+                    msg.pose.orientation.y = quat[1]
+                    msg.pose.orientation.z = quat[2]
+                    msg.pose.orientation.w = quat[3]
+                    pub.publish(msg)
+            else:
+                ux, uy, xyz = _estimate_detection_point(
+                    det, filtered_depth, deproj_intrin, self._depth_scale)
+
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
 
         # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
         hex_angles = []
-        for det in frame_detections:
+        for det_idx, det in enumerate(frame_detections):
             if det.class_name in ('nut', 'bolt', 'valve'):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
                 x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
                 n_sides = 8 if det.class_name == 'valve' else 6
-                hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
+                loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
+                reliable_nut = loc is not None and loc.confidence >= 0.45
+                hex_angle = loc.angle if reliable_nut and loc.angle is not None else None
+                if hex_angle is None:
+                    hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
                 if hex_angle is not None:
                     hex_angles.append({
                         'class': det.class_name,
                         'bbox': det.bbox,
                         'hex_angle': round(hex_angle, 1),
+                        **({'nut_refined_conf': round(loc.confidence, 3)}
+                           if reliable_nut else {}),
                     })
-                    draw_hex_angle(canvas, det.bbox, hex_angle)
+                    if det.class_name != 'nut' or not reliable_nut:
+                        draw_hex_angle(canvas, det.bbox, hex_angle)
 
         # 发布带编号的检测结果
         if targets_output:
