@@ -33,8 +33,8 @@ def estimate_knob_angle(
         max_pointer_area_ratio: 指针最大面积占圆形区域的比例
         circle_mask_ratio: 圆形 mask 半径比例
         angle_range: (min_angle, max_angle) 物理角度范围
-        pointer_color: 'red_handle'=红色长柄, 'dark'=暗色指针,
-                       'bright'=亮色把手, 'auto'=自动
+        pointer_color: 'white_tape'=白色胶带, 'red_handle'=红色长柄,
+                       'dark'=暗色指针, 'bright'=亮色把手, 'auto'=自动
         debug: 是否返回调试中间结果
 
     Returns:
@@ -55,27 +55,46 @@ def estimate_knob_angle(
     cv2.circle(circle_mask, (cx, cy), radius, 255, -1)
     circle_area = math.pi * radius * radius
 
-    if pointer_color == 'red_handle':
+    angle = None
+    pointer_contour = None
+    binary = None
+    method = None
+    if pointer_color in ('white_tape', 'red_handle'):
+        angle, pointer_contour, binary = _try_white_tape_pointer(
+            color_roi, circle_mask, radius, circle_area,
+            min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+        if angle is not None:
+            method = 'white_tape_pointer'
+
+    if angle is None and pointer_color == 'red_handle':
         angle, pointer_contour, binary = _try_red_handle_pointer(
             color_roi, radius, circle_area,
             min_pointer_area_ratio, max_pointer_area_ratio, cx, cy,
             angle_range=angle_range)
-    else:
+        if angle is not None:
+            method = 'red_handle_pointer'
+    elif angle is None:
         # 当前黑色旋钮的稳定特征是“深色圆形底座 + 亮色径向指示条”。
         # 优先检测亮色细长结构，避免旧的暗色外轮廓法把底座边缘当成指针。
         angle, pointer_contour, binary = _try_bright_radial_pointer(
             color_roi, circle_mask, radius, circle_area,
             binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+        if angle is not None:
+            method = 'bright_radial_pointer'
 
     if angle is None and pointer_color in ('dark', 'auto'):
         angle, pointer_contour, binary = _try_dark_pointer(
             color_roi, circle_mask, radius, circle_area,
             min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+        if angle is not None:
+            method = 'dark_pointer'
 
     if angle is None:
         angle, pointer_contour, binary = _try_white_pointer(
             color_roi, circle_mask, radius, circle_area,
             binary_thresh, min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+        if angle is not None:
+            method = 'white_pointer'
 
     if angle is not None:
         angle = _constrain_angle(angle, angle_range)
@@ -83,7 +102,7 @@ def estimate_knob_angle(
             gray = cv2.cvtColor(color_roi, cv2.COLOR_BGR2GRAY)
             dbg = _build_debug(gray, circle_mask, binary, pointer_contour)
             dbg['angle'] = angle
-            dbg['method'] = 'red_handle_pointer' if pointer_color == 'red_handle' else 'bright_radial_pointer'
+            dbg['method'] = method
             return angle, dbg
         return angle
 
@@ -108,6 +127,105 @@ def estimate_knob_angle(
                                   binary if binary is not None else np.zeros_like(circle_mask),
                                   None)
     return None
+
+
+def _try_white_tape_pointer(color_roi, circle_mask, radius, circle_area,
+                            min_area_ratio, max_area_ratio, cx, cy):
+    """
+    红色旋钮贴白色条形胶带后的专用检测。
+
+    白胶带相对红色手柄具有低饱和、高亮度、细长三个稳定特征。该方法
+    只在旋钮圆形区域内找细长白色连通域，并用长轴两端到旋钮中心的
+    距离消除 180° 歧义。
+    """
+    hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
+    h, w = color_roi.shape[:2]
+    s_ch = hsv[:, :, 1]
+    v_ch = hsv[:, :, 2]
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    valid = (
+        (circle_mask > 0) &
+        (dist >= radius * 0.08) &
+        (dist <= radius * 0.98)
+    )
+    valid_v = v_ch[valid]
+    if valid_v.size < 30:
+        return None, None, np.zeros((h, w), dtype=np.uint8)
+
+    # 白胶带在不同曝光下亮度会变化；用相对分位数作主阈值，固定值作下限。
+    value_thresh = max(120.0, float(np.percentile(valid_v, 82)))
+    sat_thresh = 95
+    tape_mask = valid & (v_ch >= value_thresh) & (s_ch <= sat_thresh)
+    binary = tape_mask.astype(np.uint8) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None, binary
+
+    min_area = max(12.0, circle_area * min_area_ratio * 0.25)
+    max_area = circle_area * max_area_ratio * 1.4
+    center = np.array([cx, cy], dtype=np.float64)
+    best = None
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+
+        pts = cnt.reshape(-1, 2).astype(np.float64)
+        if len(pts) < 8:
+            continue
+        mean = np.mean(pts, axis=0)
+        centered = pts - mean
+        try:
+            _, s_vals, vt = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        if len(s_vals) < 2 or s_vals[1] < 1e-6:
+            continue
+
+        elongation = float(s_vals[0] / s_vals[1])
+        if elongation < 2.0:
+            continue
+
+        axis = vt[0]
+        projections = centered @ axis
+        p05 = float(np.percentile(projections, 5))
+        p95 = float(np.percentile(projections, 95))
+        end_a = mean + axis * p05
+        end_b = mean + axis * p95
+        length = float(np.linalg.norm(end_b - end_a))
+        if length < radius * 0.22:
+            continue
+
+        end = end_a if np.linalg.norm(end_a - center) > np.linalg.norm(end_b - center) else end_b
+        radial_len = float(np.linalg.norm(end - center))
+        if radial_len < radius * 0.25:
+            continue
+
+        # 胶带可能贴在手柄中线附近；质心离中心太远或太近都可接受，但
+        # 长度、细长度、端点径向长度越大越可信。
+        score = (
+            elongation * 2.5 +
+            length / max(radius, 1) * 5.0 +
+            radial_len / max(radius, 1) * 3.0 +
+            min(area / max(circle_area * 0.04, 1.0), 2.0)
+        )
+        if best is None or score > best[0]:
+            vx, vy = float(end[0] - cx), float(end[1] - cy)
+            angle = math.degrees(math.atan2(vx, -vy)) % 360.0
+            best = (score, angle, cnt)
+
+    if best is None:
+        return None, None, binary
+    return float(best[1]), best[2], binary
 
 
 def _try_red_handle_pointer(color_roi, radius, circle_area,

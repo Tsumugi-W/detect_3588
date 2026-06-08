@@ -55,12 +55,13 @@ DEFAULT_CONFIG = {
                    'use_constraint': True},
     'position_stabilizer': {'enable': True, 'still_time': 3.0,
                             'pixel_thresh': 5.0, 'window_size': 45,
-                            'ema_alpha': 0.25},
+                            'ema_alpha': 0.25, 'depth_std_thresh': 0.01},
     'panel_line': {'initial_dist_ratio': 1.1, 'dist_ratio': 0.85,
                    'min_dist': 45.0, 'max_dist': 110.0,
                    'proj_margin_ratio': 3.0,
                    'min_proj_margin': 450.0},
     'panel_normal_interval': 10,
+    'topic_sync': {'max_dt': 0.05, 'registered_depth': True},
 }
 
 CLASS_TOPIC_MAP = {
@@ -132,6 +133,10 @@ def _panel_plane_distance(normal, centroid):
     return float(abs(np.dot(n, p)))
 
 
+def _stamp_to_sec(stamp):
+    return float(stamp.sec) + float(stamp.nanosec) * 1e-9
+
+
 def _estimate_detection_point(det, depth_image, intrin, depth_scale):
     """
     估计检测目标中心 3D 点。
@@ -184,14 +189,16 @@ class PositionStabilizer:
     """画面静止后对 3D 坐标做时序滤波，降低 topic 输出跳变。"""
 
     def __init__(self, enabled=True, still_time=3.0,
-                 pixel_thresh=5.0, window_size=45, ema_alpha=0.25):
+                 pixel_thresh=5.0, window_size=45, ema_alpha=0.25,
+                 depth_std_thresh=0.01):
         self.enabled = enabled
         self.still_time = float(still_time)
         self.pixel_thresh = float(pixel_thresh)
         self.window_size = int(window_size)
         self.ema_alpha = float(ema_alpha)
-        self._last_pixels = None
-        self._still_since = None
+        self.depth_std_thresh = float(depth_std_thresh)
+        self._last_pixels = {}
+        self._still_since = {}
         self._histories = defaultdict(lambda: deque(maxlen=self.window_size))
         self._stable_xyz = {}
 
@@ -211,42 +218,79 @@ class PositionStabilizer:
 
         pixels = {tid: np.array(pixel_xy, dtype=np.float64)
                   for tid, pixel_xy, _ in measurements}
+        current_ids = set(raw)
 
-        is_still = False
-        if self._last_pixels is not None and set(pixels) == set(self._last_pixels):
-            deltas = [np.linalg.norm(pixels[tid] - self._last_pixels[tid])
-                      for tid in pixels]
-            is_still = bool(deltas) and max(deltas) <= self.pixel_thresh
-
-        if is_still:
-            if self._still_since is None:
-                self._still_since = now
-            for tid, xyz in raw.items():
-                self._histories[tid].append(xyz)
-        else:
-            self._still_since = None
-            self._histories.clear()
-            self._stable_xyz.clear()
-
-        self._last_pixels = pixels
+        for tid in list(self._last_pixels):
+            if tid not in current_ids:
+                self._last_pixels.pop(tid, None)
+                self._still_since.pop(tid, None)
 
         filtered = {}
-        static_ready = (
-            self._still_since is not None and
-            now - self._still_since >= self.still_time
-        )
         for tid, xyz in raw.items():
-            if static_ready:
-                median_xyz = np.median(np.vstack(self._histories[tid]), axis=0)
-                prev = self._stable_xyz.get(tid)
-                stable = median_xyz if prev is None else (
-                    (1.0 - self.ema_alpha) * prev + self.ema_alpha * median_xyz)
-                self._stable_xyz[tid] = stable
-                filtered[tid] = stable.tolist()
+            last_pixel = self._last_pixels.get(tid)
+            is_still = (
+                last_pixel is not None and
+                np.linalg.norm(pixels[tid] - last_pixel) <= self.pixel_thresh
+            )
+            if is_still:
+                self._still_since.setdefault(tid, now)
+                self._histories[tid].append(xyz)
             else:
-                filtered[tid] = xyz.tolist()
+                self._still_since[tid] = now
+                self._histories[tid].clear()
+                self._histories[tid].append(xyz)
+                self._stable_xyz.pop(tid, None)
+
+            self._last_pixels[tid] = pixels[tid]
+            history = self._histories[tid]
+            static_ready = (
+                now - self._still_since.get(tid, now) >= self.still_time and
+                len(history) >= 3
+            )
+
+            if static_ready:
+                stacked = np.vstack(history)
+                depth_stable = float(np.std(stacked[:, 2])) <= self.depth_std_thresh
+                if depth_stable:
+                    median_xyz = np.median(stacked, axis=0)
+                    prev = self._stable_xyz.get(tid)
+                    stable = median_xyz if prev is None else (
+                        (1.0 - self.ema_alpha) * prev + self.ema_alpha * median_xyz)
+                    self._stable_xyz[tid] = stable
+                    filtered[tid] = stable.tolist()
+                    continue
+
+            filtered[tid] = self._stable_xyz.get(tid, xyz).tolist()
 
         return filtered
+
+
+class PlaneStabilizer:
+    """对面板平面结果做确定性时序平滑，减少 /panel/distance 抖动。"""
+
+    def __init__(self, alpha=0.25):
+        self.alpha = float(alpha)
+        self._normal = None
+        self._centroid = None
+
+    def update(self, normal, centroid):
+        normal = np.array(normal, dtype=np.float64)
+        centroid = np.array(centroid, dtype=np.float64)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-10:
+            return None
+        normal = normal / norm
+
+        if self._normal is None:
+            self._normal = normal
+            self._centroid = centroid
+        else:
+            if np.dot(normal, self._normal) < 0:
+                normal = -normal
+            self._normal = (1.0 - self.alpha) * self._normal + self.alpha * normal
+            self._normal = self._normal / max(np.linalg.norm(self._normal), 1e-10)
+            self._centroid = (1.0 - self.alpha) * self._centroid + self.alpha * centroid
+        return self._normal.copy(), self._centroid.copy()
 
 
 class PanelDetectionNode(Node):
@@ -295,8 +339,17 @@ class PanelDetectionNode(Node):
         # 话题订阅模式的缓存
         self._topic_color = None
         self._topic_depth = None
+        self._topic_color_stamp = None
+        self._topic_depth_stamp = None
         self._topic_color_intrin = None
         self._topic_depth_intrin = None
+        self._topic_frame_lock = threading.Lock()
+        sync_cfg = self.cfg.get('topic_sync', {})
+        self.declare_parameter('registered_depth', sync_cfg.get('registered_depth', True))
+        self._registered_depth = (
+            self.get_parameter('registered_depth').get_parameter_value().bool_value)
+        self._topic_sync_max_dt = float(sync_cfg.get('max_dt', 0.05))
+        self._last_sync_warn = 0.0
         self._intrinsics_checked = False
 
         # 直连模式下转发图像话题，供其他节点使用
@@ -341,13 +394,17 @@ class PanelDetectionNode(Node):
             pixel_thresh=pos_cfg.get('pixel_thresh', 5.0),
             window_size=pos_cfg.get('window_size', 45),
             ema_alpha=pos_cfg.get('ema_alpha', 0.25),
+            depth_std_thresh=pos_cfg.get('depth_std_thresh', 0.01),
         )
         self._panel_line_cfg = self.cfg.get('panel_line', {})
 
         # 面板法向量
         self._panel_normal_cache = None
+        self._panel_plane_stabilizer = PlaneStabilizer(
+            alpha=self.cfg.get('panel_normal_alpha', 0.25))
         self._frame_count = 0
         self._normal_interval = self.cfg.get('panel_normal_interval', 10)
+        self._last_status_publish_time = 0.0
 
         # 重连
         self._reconnect_interval = 5.0
@@ -366,7 +423,7 @@ class PanelDetectionNode(Node):
         self.get_logger().info(f'面板检测节点已启动 ({status})')
 
     def _init_subscribers(self):
-        """订阅相机话题（独立订阅，不依赖时间同步）"""
+        """订阅相机话题，检测循环按 header stamp 取近似同步帧。"""
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
         # 只保留最新1帧，避免推理跟不上时帧堆积导致 OOM
         img_qos = QoSProfile(
@@ -388,27 +445,91 @@ class PanelDetectionNode(Node):
         # OrbbecSDK_ROS2 发布 rgb8，转换为 BGR 供 OpenCV/YOLO 使用
         if msg.encoding == 'rgb8':
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        self._topic_color = image
+        with self._topic_frame_lock:
+            self._topic_color = image
+            self._topic_color_stamp = _stamp_to_sec(msg.header.stamp)
 
     def _depth_callback(self, msg):
-        self._topic_depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(
-            msg.height, msg.width)
+        if msg.encoding in ('16UC1', 'mono16'):
+            depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+        elif msg.encoding == '32FC1':
+            depth_m = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+            depth = np.nan_to_num(depth_m / max(self._depth_scale, 1e-9)).astype(np.uint16)
+        else:
+            self.get_logger().warn(f'不支持的深度图编码: {msg.encoding}')
+            return
+        with self._topic_frame_lock:
+            self._topic_depth = depth
+            self._topic_depth_stamp = _stamp_to_sec(msg.header.stamp)
 
     def _color_info_callback(self, msg):
-        self._topic_color_intrin = CameraIntrinsics(
+        intrin = CameraIntrinsics(
             fx=msg.k[0], fy=msg.k[4],
             cx=msg.k[2], cy=msg.k[5],
             width=msg.width, height=msg.height,
             coeffs=list(msg.d) if msg.d else [0.0]*5,
         )
+        with self._topic_frame_lock:
+            self._topic_color_intrin = intrin
 
     def _depth_info_callback(self, msg):
-        self._topic_depth_intrin = CameraIntrinsics(
+        intrin = CameraIntrinsics(
             fx=msg.k[0], fy=msg.k[4],
             cx=msg.k[2], cy=msg.k[5],
             width=msg.width, height=msg.height,
             coeffs=list(msg.d) if msg.d else [0.0]*5,
         )
+        with self._topic_frame_lock:
+            self._topic_depth_intrin = intrin
+
+    def _get_synced_topic_frames(self):
+        with self._topic_frame_lock:
+            if (self._topic_color is None or self._topic_depth is None or
+                    self._topic_color_intrin is None or self._topic_depth_intrin is None or
+                    self._topic_color_stamp is None or self._topic_depth_stamp is None):
+                return None
+            dt = abs(self._topic_color_stamp - self._topic_depth_stamp)
+            if dt > self._topic_sync_max_dt:
+                now = time.time()
+                if now - self._last_sync_warn > 1.0:
+                    self._last_sync_warn = now
+                    self.get_logger().warn(
+                        f'彩色/深度帧时间差 {dt:.3f}s 超过阈值 '
+                        f'{self._topic_sync_max_dt:.3f}s，跳过本轮检测')
+                return None
+            return (
+                self._topic_color_intrin,
+                self._topic_depth_intrin,
+                self._topic_color.copy(),
+                self._topic_depth.copy(),
+                self._topic_color_stamp,
+                self._topic_depth_stamp,
+            )
+
+    def _select_deprojection_intrin(self, color_intrin, depth_intrin,
+                                    color_shape, depth_shape):
+        if not self._use_topic:
+            return depth_intrin
+        same_size = color_shape[:2] == depth_shape[:2]
+        intrin_diff = (
+            abs(color_intrin.fx - depth_intrin.fx) > 1.0 or
+            abs(color_intrin.fy - depth_intrin.fy) > 1.0 or
+            abs(color_intrin.cx - depth_intrin.cx) > 1.0 or
+            abs(color_intrin.cy - depth_intrin.cy) > 1.0
+        )
+        if not self._intrinsics_checked:
+            self._intrinsics_checked = True
+            if same_size and intrin_diff and self._registered_depth:
+                self.get_logger().warn(
+                    '深度图和彩色图尺寸相同但内参不同；registered_depth=true，'
+                    '将使用彩色内参反投影注册后的深度图。')
+            elif same_size and intrin_diff:
+                self.get_logger().warn(
+                    '深度图和彩色图尺寸相同但内参不同；registered_depth=false，'
+                    '仍使用深度内参反投影，请确认话题配置。')
+        if same_size and self._registered_depth:
+            return color_intrin
+        return depth_intrin
 
     def _init_camera(self):
         backend_type = self.cfg.get('camera_backend', 'orbbec')
@@ -556,34 +677,35 @@ class PanelDetectionNode(Node):
         depth_info_msg.d = depth_intrin.coeffs
         self._depth_info_pub.publish(depth_info_msg)
 
+    def _publish_status(self, status, force=False):
+        now = time.time()
+        if not force and now - self._last_status_publish_time < 1.0:
+            return
+        self._last_status_publish_time = now
+        msg = String()
+        msg.data = status
+        self._status_pub.publish(msg)
+
     def _detection_callback(self):
         if not self._camera_ready:
+            self._publish_status('waiting_camera')
             self._try_reconnect_camera()
             return
 
         if self._use_topic:
-            color_intrin = self._topic_color_intrin
-            depth_intrin = self._topic_depth_intrin
-            color_image = self._topic_color
-            depth_image = self._topic_depth
-            if color_intrin is None or color_image is None or depth_image is None or depth_intrin is None:
+            topic_frames = self._get_synced_topic_frames()
+            if topic_frames is None:
+                self._publish_status('waiting_topic_frames')
                 return
-            if not self._intrinsics_checked:
-                self._intrinsics_checked = True
-                if (color_image.shape[:2] == depth_image.shape[:2] and
-                        (abs(color_intrin.fx - depth_intrin.fx) > 1.0 or
-                         abs(color_intrin.fy - depth_intrin.fy) > 1.0 or
-                         abs(color_intrin.cx - depth_intrin.cx) > 1.0 or
-                         abs(color_intrin.cy - depth_intrin.cy) > 1.0)):
-                    self.get_logger().warn(
-                        '深度图和彩色图尺寸相同但内参不同。若相机已开启 depth_registration，'
-                        '请确认 /camera/depth/camera_info 是否为注册后深度图内参；'
-                        '否则 3D 坐标会有系统性偏差。')
+            color_intrin, depth_intrin, color_image, depth_image, _, _ = topic_frames
+            deproj_intrin = self._select_deprojection_intrin(
+                color_intrin, depth_intrin, color_image.shape, depth_image.shape)
         else:
             color_intrin, depth_intrin, color_image, depth_image = \
                 self._camera.get_aligned_frames()
             if color_intrin is None:
                 return
+            deproj_intrin = depth_intrin
 
         if color_image.size == 0 or depth_image.size == 0:
             return
@@ -599,6 +721,7 @@ class PanelDetectionNode(Node):
         t1 = time.time()
         if not xyxy_list:
             self.display_frame = canvas
+            self._publish_status('no_detection')
             return
 
         filtered_depth = filter_depth(depth_image, method='bilateral', kernel_size=5)
@@ -611,10 +734,12 @@ class PanelDetectionNode(Node):
         if (self._panel_normal_cache is None or
                 self._frame_count % self._normal_interval == 0):
             result = compute_panel_normal(
-                color_image, filtered_depth, depth_intrin, xyxy_list,
+                color_image, filtered_depth, deproj_intrin, xyxy_list,
                 depth_scale=self._depth_scale)
             if result is not None:
-                self._panel_normal_cache = result
+                stable_plane = self._panel_plane_stabilizer.update(*result)
+                if stable_plane is not None:
+                    self._panel_normal_cache = stable_plane
         t3 = time.time()
 
         # 每 30 帧打印一次耗时
@@ -767,7 +892,7 @@ class PanelDetectionNode(Node):
 
         for target_id, det in matched:
             ux, uy, xyz = _estimate_detection_point(
-                det, filtered_depth, depth_intrin, self._depth_scale)
+                det, filtered_depth, deproj_intrin, self._depth_scale)
             matched_xyz[target_id] = xyz
             position_measurements.append((target_id, (ux, uy), xyz))
 
@@ -809,8 +934,8 @@ class PanelDetectionNode(Node):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
                 x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
-                # 红色旋钮(#4): 红色长柄；黑色旋钮(#5): 亮色指针/暗色兜底
-                ptr_color = 'red_handle' if target_id == 4 else 'dark'
+                # 红色旋钮(#4): 优先白色胶带，失败后兜底红色长柄；黑色旋钮(#5): 优先白色胶带
+                ptr_color = 'red_handle' if target_id == 4 else 'white_tape'
                 knob_range = None
                 if self._angle_use_constraint:
                     knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)
@@ -837,7 +962,7 @@ class PanelDetectionNode(Node):
             if det.class_name in ('button', 'knob'):
                 continue  # 已在 matched 中处理
             ux, uy, xyz = _estimate_detection_point(
-                det, filtered_depth, depth_intrin, self._depth_scale)
+                det, filtered_depth, deproj_intrin, self._depth_scale)
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
@@ -895,6 +1020,8 @@ class PanelDetectionNode(Node):
                 self._distance_pub.publish(msg)
 
         # ─── 可视化 ───
+        self._publish_status('registered' if targets_output else 'no_targets')
+
         for target_id, det in matched:
             ux = int(det.center_x)
             uy = int(det.center_y)

@@ -52,7 +52,8 @@ def _nms(boxes, scores, iou_thresh):
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
         inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+        union = areas[i] + areas[order[1:]] - inter
+        ovr = inter / np.maximum(union, 1e-9)
         order = order[np.where(ovr <= iou_thresh)[0] + 1]
     return np.array(keep)
 

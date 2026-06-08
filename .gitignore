@@ -8,3 +8,12 @@ Log/
 panel_test_bag/
 panel_test_bag_1/
 panel_test_bag_2/
+panel_test_bag_*/
+*.tar
+ref*.png
+Screenshot*.png
+*_report.png
+*.pt
+.claude/
+src/panel_detection/panel_detection/weights_archive/
+verify_3d_accuracy.py

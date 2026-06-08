@@ -195,7 +195,8 @@ def get_bbox_robust_depth(depth_image, bbox, depth_scale=0.001,
     return float(np.percentile(valid, q * 100.0)) * depth_scale
 
 
-def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100, ransac_thresh=0.005):
+def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100,
+                     ransac_thresh=0.005, random_seed=0):
     """
     RANSAC + SVD 平面拟合
 
@@ -204,6 +205,7 @@ def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100, ransac_thresh=0.
         min_points: 最少内点数
         ransac_iter: RANSAC 迭代次数
         ransac_thresh: 内点距离阈值（米）
+        random_seed: 固定随机种子，避免同一帧点云多次拟合结果抖动
 
     Returns:
         (normal, centroid) 或 None
@@ -215,8 +217,9 @@ def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100, ransac_thresh=0.
     best_inliers = 0
     best_inlier_mask = None
 
+    rng = np.random.default_rng(random_seed)
     for _ in range(ransac_iter):
-        idx = np.random.choice(len(points_3d), 3, replace=False)
+        idx = rng.choice(len(points_3d), 3, replace=False)
         p0, p1, p2 = points_3d[idx]
         v1, v2 = p1 - p0, p2 - p0
         normal = np.cross(v1, v2)
@@ -327,4 +330,5 @@ def compute_panel_normal(color_image, depth_image, depth_intrin,
     points_3d = deproject_pixels_to_points(depth_intrin, pixels, depths)
 
     return fit_plane_ransac(points_3d, min_points=50,
-                            ransac_iter=100, ransac_thresh=0.008)
+                            ransac_iter=100, ransac_thresh=0.008,
+                            random_seed=0)
