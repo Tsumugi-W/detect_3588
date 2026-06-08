@@ -9,6 +9,8 @@
   ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constraint:=false
   # topic 深度图已注册到彩色图时（默认）:
   ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered_depth:=true
+  # 指定配置文件:
+  ros2 launch panel_detection panel_detection.launch.py config_path:=/path/to/config.yaml
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -30,6 +32,10 @@ def generate_launch_description():
         'registered_depth', default_value='true',
         description='topic 模式下深度图是否已注册到彩色图'
     )
+    config_path_arg = DeclareLaunchArgument(
+        'config_path', default_value='',
+        description='检测节点 YAML 配置文件路径；为空时使用默认配置'
+    )
 
     detect_node = Node(
         package='panel_detection',
@@ -43,8 +49,10 @@ def generate_launch_description():
                 LaunchConfiguration('use_constraint'), value_type=bool),
             'registered_depth': ParameterValue(
                 LaunchConfiguration('registered_depth'), value_type=bool),
+            'config_path': LaunchConfiguration('config_path'),
         }],
     )
 
     return LaunchDescription([
-        use_topic_arg, use_constraint_arg, registered_depth_arg, detect_node])
+        use_topic_arg, use_constraint_arg, registered_depth_arg,
+        config_path_arg, detect_node])

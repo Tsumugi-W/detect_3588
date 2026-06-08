@@ -119,14 +119,90 @@ source install/setup.bash
 ### 第七步：运行
 
 ```bash
-# 终端1：启动相机
+# 终端1：启动相机（发布 /camera/color 与 /camera/depth 话题）
 ros2 launch panel_detection camera.launch.py
 
-# 终端2：启动检测节点
-ros2 launch panel_detection panel_detection.launch.py
+# 终端2：启动检测节点（推荐：订阅相机话题）
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered_depth:=true
 ```
 
 启动后检测节点会弹出可视化窗口。启动后先进入**注册阶段**（积累稳定帧为目标分配编号），注册完成后进入**跟踪阶段**（发布带编号的检测结果）。按 `q` 或 `ESC` 退出。
+
+## 启动方式与参数配置
+
+### 常用启动命令
+
+**推荐方式：相机节点 + 检测节点分开启动**
+
+```bash
+# 终端1：启动 Orbbec Gemini 336，相机话题深度已注册到彩色图
+ros2 launch panel_detection camera.launch.py
+
+# 终端2：检测节点订阅相机话题
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered_depth:=true
+```
+
+**直连模式：检测节点直接打开相机**
+
+```bash
+ros2 launch panel_detection panel_detection.launch.py
+```
+
+直连模式会由检测节点自己连接相机，并转发 `/camera/color/image_raw`、`/camera/depth/image_raw` 等话题。现场调试更推荐使用 `use_topic:=true`，相机和检测解耦，bag 回放也使用同一条路径。
+
+**Bag 回放验证**
+
+```bash
+# 终端1：启动检测节点
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered_depth:=true
+
+# 终端2：回放已录制的相机话题
+ros2 bag play panel_test_bag_2 \
+  --topics /camera/color/image_raw /camera/depth/image_raw /camera/color/camera_info /camera/depth/camera_info \
+  --start-offset 20 \
+  -r 0.5
+```
+
+**关闭旋钮角度约束**
+
+```bash
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constraint:=false
+```
+
+### Launch 参数
+
+| 参数 | 默认值 | 作用 | 何时修改 |
+|------|--------|------|----------|
+| `use_topic` | `false` | `true` 时订阅 `/camera/*` 话题；`false` 时检测节点直连相机 | 使用 `camera.launch.py` 或 bag 回放时设为 `true` |
+| `registered_depth` | `true` | topic 模式下深度图是否已对齐到彩色图 | Orbbec `camera.launch.py` 已设置 `depth_registration=true`，保持 `true` |
+| `use_constraint` | `true` | 是否启用旋钮角度物理范围约束 | 角度调试或未知旋钮范围时可设为 `false` |
+| `config_path` | 空字符串 | 外部 YAML 配置文件路径；为空使用默认配置 | 需要换模型、阈值、相机后端、推理后端时使用 |
+
+### 指定配置文件
+
+```bash
+ros2 launch panel_detection panel_detection.launch.py \
+  use_topic:=true \
+  registered_depth:=true \
+  config_path:=/home/ztl/project/panel_ws/my_panel_config.yaml
+```
+
+注意：`config_path` 是检测节点配置，不是 launch 文件配置。配置文件中未写的字段不会自动和默认配置递归合并，因此建议从下面示例复制完整配置后修改。
+
+### 相机启动参数
+
+`camera.launch.py` 固定使用 Orbbec 官方 `gemini_330_series.launch.py`，并传入：
+
+| 参数 | 当前值 | 说明 |
+|------|--------|------|
+| `depth_registration` | `true` | 深度图注册到彩色图坐标系 |
+| `color_width` / `color_height` | `1280` / `720` | 彩色图分辨率 |
+| `depth_width` / `depth_height` | `1280` / `720` | 深度图分辨率 |
+| `color_fps` / `depth_fps` | `30` / `30` | 帧率 |
+| `color_format` | `ANY` | 由驱动选择彩色格式 |
+| `interleave_ae_mode` | `none` | 关闭交替曝光模式 |
+
+如果要改相机分辨率或帧率，优先修改 `src/panel_detection/launch/camera.launch.py` 中的这些参数，并保持 `registered_depth:=true`。
 
 ### 可选：写入 bashrc 简化日常使用
 
@@ -225,6 +301,8 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 | `/panel/valves` | 阀门 |
 | `/panel/pumps` | 泵 |
 
+`/panel/nuts` 发布的是 refined 后的螺母操作点：像素中心来自六角螺母外轮廓拟合，深度来自外圈 mask 采样并排除中心螺丝/螺杆。refined 失败或外圈深度无效时不会发布 `/panel/nuts`，避免机械臂拿到错误点。
+
 ## 验证话题
 
 ```bash
@@ -264,12 +342,12 @@ class PanelSubscriber(Node):
             self.get_logger().info(f"ID={k['id']} 角度: {k['angle']:.1f}°")
 ```
 
-## 配置说明
+## 配置文件说明
 
-创建 yaml 文件通过参数传入：
+创建 YAML 文件后通过 `config_path` 参数传入：
 
 ```bash
-ros2 launch panel_detection panel_detection.launch.py config_path:=/path/to/config.yaml
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true config_path:=/path/to/config.yaml
 ```
 
 配置示例：
@@ -284,8 +362,9 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0520.onnx'
-onnx_threads: 4
+onnx_model: '0601.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_threads: 8
+# rknn_model: '0601.rknn'      # inference_backend='rknn' 时使用
 
 class_num: 7
 class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button']
@@ -295,13 +374,34 @@ threshold:
 
 knob_angle:
   enable: true
+  binary_thresh: 180
+  circle_mask_ratio: 0.85
+  knob_class: 'knob'
+  use_constraint: true
 
 depth_scale: 0.001             # 深度图原始值 × depth_scale = 米
 
-registry:
-  stable_frames: 15            # 注册需要的连续稳定帧数
-  green_hue_range: [35, 85]    # 绿色按钮 HSV 色调范围
-  match_distance_thresh: 80    # 匹配最大像素距离
+topic_sync:
+  max_dt: 0.05                 # color/depth 时间戳最大允许差值，秒
+  registered_depth: true       # 深度图是否已注册到彩色图
+
+position_stabilizer:
+  enable: true
+  still_time: 3.0
+  pixel_thresh: 5.0
+  window_size: 45
+  ema_alpha: 0.25
+  depth_std_thresh: 0.01
+
+panel_line:
+  initial_dist_ratio: 1.1
+  dist_ratio: 0.85
+  min_dist: 45.0
+  max_dist: 110.0
+  proj_margin_ratio: 3.0
+  min_proj_margin: 450.0
+
+panel_normal_interval: 10
 ```
 
 ## 目录结构
@@ -322,6 +422,7 @@ ros2_ws/
             ├── __init__.py
             ├── panel_detect_node.py       ← 检测主节点
             ├── target_registry.py         ← 目标注册与跟踪
+            ├── nut_localizer.py           ← nut 外六角 refined 定位
             ├── camera/
             │   ├── base.py
             │   ├── orbbec.py
@@ -330,8 +431,8 @@ ros2_ws/
             ├── detector_onnx.py
             ├── detector_rknn.py
             ├── knob_angle.py
-            ├── 0520.onnx
-            └── 0520.pt
+            ├── 0601.onnx
+            └── 0601.pt
 ```
 
 ## 常见问题
