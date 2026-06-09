@@ -36,7 +36,7 @@ from .depth_utils import (
 )
 from .knob_angle import estimate_knob_angle, draw_knob_angle, estimate_hex_angle, draw_hex_angle
 from .nut_localizer import localize_nut
-from .target_registry import TargetRegistry, FrameDetection
+from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
 
 # ─── 配置 ─────────────────────────────────────────────────────────────────────
@@ -411,6 +411,12 @@ class PanelDetectionNode(Node):
             depth_std_thresh=pos_cfg.get('depth_std_thresh', 0.01),
         )
         self._panel_line_cfg = self.cfg.get('panel_line', {})
+        self._persistent_panel_axis = PersistentPanelAxis(
+            dist_ratio=self._panel_line_cfg.get('dist_ratio', 0.85),
+            min_dist=self._panel_line_cfg.get('min_dist', 45.0),
+            max_dist=self._panel_line_cfg.get('max_dist', 110.0),
+            min_proj_margin=self._panel_line_cfg.get('min_proj_margin', 450.0),
+        )
 
         # 面板法向量
         self._panel_normal_cache = None
@@ -865,6 +871,7 @@ class PanelDetectionNode(Node):
                     self._panel_line_cfg.get('max_dist', 110.0)))
                 panel_axis_origin = (float(axis_origin_arr[0]), float(axis_origin_arr[1]))
                 panel_axis_vector = (float(fitted_axis[0]), float(fitted_axis[1]))
+                self._persistent_panel_axis.update(panel_axis_origin, panel_axis_vector)
 
                 for d in frame_detections:
                     can_join_row = (
@@ -891,12 +898,20 @@ class PanelDetectionNode(Node):
                         panel_detections.append(d)
             else:
                 # knob 重叠退化，取所有 button/knob
-                panel_detections = [d for d in frame_detections
-                                    if d.class_name in ('button', 'knob')]
+                cached_axis_result = self._persistent_panel_axis.select(frame_detections)
+                if cached_axis_result is not None:
+                    panel_detections, panel_axis_origin, panel_axis_vector = cached_axis_result
+                else:
+                    panel_detections = [d for d in frame_detections
+                                        if d.class_name in ('button', 'knob')]
         else:
             # 没有两个 knob 可见，取所有 button/knob
-            panel_detections = [d for d in frame_detections
-                                if d.class_name in ('button', 'knob')]
+            cached_axis_result = self._persistent_panel_axis.select(frame_detections)
+            if cached_axis_result is not None:
+                panel_detections, panel_axis_origin, panel_axis_vector = cached_axis_result
+            else:
+                panel_detections = [d for d in frame_detections
+                                    if d.class_name in ('button', 'knob')]
 
         # ─── 每帧独立识别绝对编号（只对面板行上的目标）───
         matched = self._registry.identify(

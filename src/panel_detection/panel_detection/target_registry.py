@@ -22,6 +22,7 @@
 import numpy as np
 import cv2
 from dataclasses import dataclass
+from itertools import combinations
 from typing import List, Tuple
 
 
@@ -44,6 +45,107 @@ class FrameDetection:
     center_y: float
     bbox: Tuple[float, float, float, float]  # x1, y1, x2, y2
     confidence: float
+
+
+def _is_button_like_detection(det: FrameDetection) -> bool:
+    """允许被当作按钮的几何形状：近似方形/圆形，排除细长指示灯。"""
+    w = max(1.0, det.bbox[2] - det.bbox[0])
+    h = max(1.0, det.bbox[3] - det.bbox[1])
+    aspect = w / h
+    return 0.55 <= aspect <= 1.8
+
+
+def _normalize_axis(axis: Tuple[float, float]) -> np.ndarray | None:
+    axis_arr = np.array(axis, dtype=np.float64)
+    norm = np.linalg.norm(axis_arr)
+    if norm < 1e-6:
+        return None
+    axis_arr = axis_arr / norm
+    if axis_arr[0] < 0:
+        axis_arr = -axis_arr
+    return axis_arr
+
+
+class PersistentPanelAxis:
+    """长期保存面板行方向，用当前可见目标重定位同方向平行线。"""
+
+    def __init__(self, dist_ratio=0.85, min_dist=45.0,
+                 max_dist=110.0, min_proj_margin=450.0):
+        self.dist_ratio = float(dist_ratio)
+        self.min_dist = float(min_dist)
+        self.max_dist = float(max_dist)
+        self.min_proj_margin = float(min_proj_margin)
+        self._axis = None
+
+    @property
+    def has_axis(self) -> bool:
+        return self._axis is not None
+
+    def update(self, origin: Tuple[float, float], vector: Tuple[float, float]) -> None:
+        axis = _normalize_axis(vector)
+        if axis is not None:
+            self._axis = axis
+
+    def select(self, detections: List[FrameDetection]):
+        if self._axis is None:
+            return None
+
+        candidates = [
+            d for d in detections
+            if d.class_name in ('button', 'knob') or
+            (d.class_name == 'light' and _is_button_like_detection(d))
+        ]
+        if not candidates:
+            return None
+
+        centers = np.array(
+            [(d.center_x, d.center_y) for d in candidates], dtype=np.float64)
+        axis = self._axis
+        normal = np.array([-axis[1], axis[0]], dtype=np.float64)
+
+        median_h = np.median([
+            max(1.0, d.bbox[3] - d.bbox[1])
+            for d in candidates if d.class_name in ('button', 'knob')
+        ]) if any(d.class_name in ('button', 'knob') for d in candidates) else 80.0
+        dist_thresh = float(np.clip(
+            median_h * self.dist_ratio, self.min_dist, self.max_dist))
+
+        # 相机平移时，缓存方向仍有效，但图像中的线位置会移动。
+        # 沿法向做一维聚类，选择候选最多的平行线，避免离群检测把线拉偏。
+        normal_coords = centers @ normal
+        best_index = max(
+            range(len(candidates)),
+            key=lambda i: int(np.sum(np.abs(normal_coords - normal_coords[i]) <= dist_thresh)))
+        best_normal_coord = normal_coords[best_index]
+        row_mask = np.abs(normal_coords - best_normal_coord) <= dist_thresh
+        row_centers = centers[row_mask]
+        origin = np.mean(row_centers, axis=0)
+
+        projections = [
+            float(np.dot(
+                np.array([d.center_x, d.center_y], dtype=np.float64) - origin,
+                axis))
+            for d in candidates
+        ]
+        proj_min = min(projections) - self.min_proj_margin
+        proj_max = max(projections) + self.min_proj_margin
+
+        selected = []
+        for i, d in enumerate(candidates):
+            if not row_mask[i]:
+                continue
+            pt = np.array([d.center_x, d.center_y], dtype=np.float64) - origin
+            dist = abs(float(np.dot(pt, normal)))
+            proj = float(np.dot(pt, axis))
+            if dist <= dist_thresh and proj_min <= proj <= proj_max:
+                if d.class_name == 'light':
+                    d.class_name = 'button'
+                selected.append(d)
+
+        if not selected:
+            return None
+        return selected, (float(origin[0]), float(origin[1])), (
+            float(axis[0]), float(axis[1]))
 
 
 # 完整面板布局：(类别, 颜色)
@@ -179,6 +281,62 @@ def _match_subsequence_scored(observed: List[Tuple[str, str]]) -> Tuple[List[int
     return [best_offset + i + 1 for i in range(n_obs)], best_score, True
 
 
+def _match_anchored_subsequence_scored(
+        observed: List[Tuple[str, str]]) -> Tuple[List[int], int, bool]:
+    """
+    匹配允许漏检目标的有序布局子序列。
+
+    只在观测序列里存在颜色明确的 knob 锚点时启用。这样单个旋钮可用于跨过
+    另一个漏检旋钮继续给右侧/左侧按钮编号，同时避免纯按钮场景被过度猜测。
+    """
+    n_obs = len(observed)
+    n_layout = len(PANEL_LAYOUT)
+    if n_obs == 0 or n_obs > n_layout:
+        return [], -10_000, False
+
+    best_score = -10_000
+    best_ids = []
+
+    for layout_indexes in combinations(range(n_layout), n_obs):
+        score = 20
+        valid = True
+        has_knob_anchor = False
+        previous_index = None
+
+        for obs_index, layout_index in enumerate(layout_indexes):
+            layout_cls, layout_color = PANEL_LAYOUT[layout_index]
+            obs_cls, obs_color = observed[obs_index]
+
+            if obs_cls != layout_cls:
+                valid = False
+                break
+
+            if previous_index is not None:
+                score -= layout_index - previous_index - 1
+            previous_index = layout_index
+
+            if obs_color == layout_color:
+                score += 4
+                if obs_cls == 'knob' and obs_color in ('red', 'black'):
+                    has_knob_anchor = True
+                    score += 8
+            elif obs_color == 'unknown':
+                score += 0
+            else:
+                score -= 5
+
+        if not valid or not has_knob_anchor:
+            continue
+
+        if score > best_score:
+            best_score = score
+            best_ids = [index + 1 for index in layout_indexes]
+
+    if not best_ids:
+        return [], -10_000, False
+    return best_ids, best_score, True
+
+
 def _match_best_direction(
         sorted_dets: List[FrameDetection],
         color_image: np.ndarray) -> List[Tuple[int, FrameDetection]]:
@@ -195,6 +353,10 @@ def _match_best_direction(
             ids = _match_individual(observed)
             score = _score_individual_match(observed, ids)
         candidates.append((score, ids, dets))
+
+        anchored_ids, anchored_score, anchored = _match_anchored_subsequence_scored(observed)
+        if anchored:
+            candidates.append((anchored_score, anchored_ids, dets))
 
     score, ids, dets = max(candidates, key=lambda item: item[0])
     results = []
