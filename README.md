@@ -163,11 +163,13 @@ ros2 bag play panel_test_bag_2 \
   -r 0.5
 ```
 
-**关闭旋钮角度约束**
+**旋钮角度模式**
 
 ```bash
-ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constraint:=false
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constraint:=1
 ```
+
+`use_constraint:=1` 为默认模式：只根据旋钮白色手柄线与竖直线的夹角，稳定输出 `0` 或 `90`。旧写法仍兼容：`true` 等价于 `2`，`false` 等价于 `3`。
 
 ### Launch 参数
 
@@ -175,7 +177,7 @@ ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constr
 |------|--------|------|----------|
 | `use_topic` | `false` | `true` 时订阅 `/camera/*` 话题；`false` 时检测节点直连相机 | 使用 `camera.launch.py` 或 bag 回放时设为 `true` |
 | `registered_depth` | `true` | topic 模式下深度图是否已对齐到彩色图 | Orbbec `camera.launch.py` 已设置 `depth_registration=true`，保持 `true` |
-| `use_constraint` | `true` | 是否启用旋钮角度物理范围约束 | 角度调试或未知旋钮范围时可设为 `false` |
+| `use_constraint` | `1` | 旋钮角度模式：`1`=0/90 稳定输出，`2`=旧物理范围约束，`3`=旧无约束；`use_constrain` 也可作为别名 | 默认保持 `1`；需要旧行为时设为 `2` 或 `3` |
 | `config_path` | 空字符串 | 外部 YAML 配置文件路径；为空使用默认配置 | 需要换模型、阈值、相机后端、推理后端时使用 |
 
 ### 指定配置文件
@@ -377,7 +379,7 @@ knob_angle:
   binary_thresh: 180
   circle_mask_ratio: 0.85
   knob_class: 'knob'
-  use_constraint: true
+  use_constraint: 1
 
 depth_scale: 0.001             # 深度图原始值 × depth_scale = 米
 

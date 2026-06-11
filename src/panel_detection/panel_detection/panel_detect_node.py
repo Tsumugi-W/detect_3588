@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
     'threshold': {'iou': 0.01, 'confidence': 0.3},
     'knob_angle': {'enable': True, 'binary_thresh': 180,
                    'circle_mask_ratio': 0.85, 'knob_class': 'knob',
-                   'use_constraint': True},
+                   'use_constraint': 1},
     'position_stabilizer': {'enable': True, 'still_time': 3.0,
                             'pixel_thresh': 5.0, 'window_size': 45,
                             'ema_alpha': 0.25, 'depth_std_thresh': 0.01},
@@ -307,6 +307,93 @@ class PlaneStabilizer:
         return self._normal.copy(), self._centroid.copy()
 
 
+def _parse_angle_constraint_mode(value):
+    """
+    use_constraint 三档模式:
+      1: 默认，白色手柄线方向离散输出 0/90，并做时序稳定
+      2: 兼容旧 true，启用原物理范围约束
+      3: 兼容旧 false，不启用原物理范围约束
+    """
+    if isinstance(value, bool):
+        return 2 if value else 3
+    if isinstance(value, (int, float)):
+        mode = int(value)
+    else:
+        text = str(value).strip().lower()
+        if text in ('true', 'yes', 'on'):
+            return 2
+        if text in ('false', 'no', 'off'):
+            return 3
+        try:
+            mode = int(text)
+        except ValueError:
+            mode = 1
+    return mode if mode in (1, 2, 3) else 1
+
+
+class KnobDiscreteAngleStabilizer:
+    """将白色手柄线方向稳定为 0/90，避免临界帧抖动。"""
+
+    def __init__(self, switch_margin=8.0, confirm_frames=3):
+        self.switch_margin = float(switch_margin)
+        self.confirm_frames = int(confirm_frames)
+        self._stable = {}
+        self._pending = {}
+        self._pending_count = defaultdict(int)
+
+    def update(self, target_id, raw_angle):
+        if raw_angle is None:
+            return self._stable.get(target_id)
+
+        line_angle = float(raw_angle) % 180.0
+        vertical_diff = min(line_angle, 180.0 - line_angle)
+        candidate = 0.0 if vertical_diff <= 45.0 else 90.0
+
+        stable = self._stable.get(target_id)
+        if stable is None:
+            self._stable[target_id] = candidate
+            self._clear_pending(target_id)
+            return candidate
+
+        if candidate == stable:
+            self._clear_pending(target_id)
+            return stable
+
+        if not self._beyond_hysteresis(vertical_diff, stable, candidate):
+            self._clear_pending(target_id)
+            return stable
+
+        if self._pending.get(target_id) != candidate:
+            self._pending[target_id] = candidate
+            self._pending_count[target_id] = 1
+        else:
+            self._pending_count[target_id] += 1
+
+        if self._pending_count[target_id] >= self.confirm_frames:
+            self._stable[target_id] = candidate
+            self._clear_pending(target_id)
+
+        return self._stable[target_id]
+
+    def prune(self, active_ids):
+        active_ids = set(active_ids)
+        for target_id in list(self._stable):
+            if target_id not in active_ids:
+                self._stable.pop(target_id, None)
+                self._clear_pending(target_id)
+
+    def _clear_pending(self, target_id):
+        self._pending.pop(target_id, None)
+        self._pending_count.pop(target_id, None)
+
+    def _beyond_hysteresis(self, vertical_diff, stable, candidate):
+        if stable == 0.0 and candidate == 90.0:
+            return vertical_diff >= 45.0 + self.switch_margin
+        if stable == 90.0 and candidate == 0.0:
+            return vertical_diff <= 45.0 - self.switch_margin
+        return True
+
+
 class PanelDetectionNode(Node):
     def __init__(self):
         super().__init__('panel_detection_node')
@@ -396,10 +483,18 @@ class PanelDetectionNode(Node):
         self._angle_binary_thresh = angle_cfg.get('binary_thresh', 180)
         self._angle_circle_mask = angle_cfg.get('circle_mask_ratio', 0.85)
         self._angle_knob_class = angle_cfg.get('knob_class', 'knob')
-        self.declare_parameter('use_constraint', angle_cfg.get('use_constraint', True))
-        self._angle_use_constraint = (
-            self.get_parameter('use_constraint').get_parameter_value().bool_value)
-        self.get_logger().info(f'旋钮角度约束: {self._angle_use_constraint}')
+        self.declare_parameter('use_constraint', str(angle_cfg.get('use_constraint', 1)))
+        self.declare_parameter('use_constrain', '')
+        constraint_alias = self.get_parameter('use_constrain').value
+        constraint_param = constraint_alias or self.get_parameter('use_constraint').value
+        self._angle_constraint_mode = _parse_angle_constraint_mode(constraint_param)
+        self._knob_angle_stabilizer = KnobDiscreteAngleStabilizer(
+            switch_margin=angle_cfg.get('discrete_switch_margin', 8.0),
+            confirm_frames=angle_cfg.get('discrete_confirm_frames', 3),
+        )
+        self.get_logger().info(
+            f'旋钮角度模式: {self._angle_constraint_mode} '
+            '(1=0/90稳定输出, 2=旧约束, 3=旧无约束)')
 
         pos_cfg = self.cfg.get('position_stabilizer', {})
         self._position_stabilizer = PositionStabilizer(
@@ -931,6 +1026,11 @@ class PanelDetectionNode(Node):
             position_measurements.append((target_id, (ux, uy), xyz))
 
         stable_xyz = self._position_stabilizer.update(position_measurements, time.time())
+        active_knob_ids = [
+            target_id for target_id, det in matched
+            if det.class_name == self._angle_knob_class
+        ]
+        self._knob_angle_stabilizer.prune(active_knob_ids)
 
         for target_id, det in matched:
             xyz = stable_xyz.get(target_id, matched_xyz[target_id])
@@ -968,10 +1068,13 @@ class PanelDetectionNode(Node):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
                 x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
-                # 红色旋钮(#4): 优先白色胶带，失败后兜底红色长柄；黑色旋钮(#5): 优先白色胶带
-                ptr_color = 'red_handle' if target_id == 4 else 'white_tape'
+                # 模式 1 只根据白色手柄线相对竖直线的夹角输出 0/90。
+                # 模式 2/3 保留旧逻辑：红色旋钮可回退到红色长柄，黑色旋钮用白色胶带。
+                mode_0_90 = self._angle_constraint_mode == 1
+                ptr_color = 'white_line' if mode_0_90 else (
+                    'red_handle' if target_id == 4 else 'white_tape')
                 knob_range = None
-                if self._angle_use_constraint:
+                if self._angle_constraint_mode == 2:
                     knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)
                 angle = estimate_knob_angle(
                     roi,
@@ -980,13 +1083,16 @@ class PanelDetectionNode(Node):
                     angle_range=knob_range,
                     pointer_color=ptr_color,
                 )
+                if mode_0_90:
+                    angle = self._knob_angle_stabilizer.update(target_id, angle)
                 if angle is not None:
+                    output_angle = int(angle) if mode_0_90 else round(angle, 1)
                     knob_angles.append({
                         'id': target_id,
                         'position': {'x': round(xyz[0], 4),
                                      'y': round(xyz[1], 4),
                                      'z': round(xyz[2], 4)},
-                        'angle': round(angle, 1),
+                        'angle': output_angle,
                         'confidence': round(det.confidence, 3),
                     })
 

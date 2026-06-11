@@ -33,8 +33,9 @@ def estimate_knob_angle(
         max_pointer_area_ratio: 指针最大面积占圆形区域的比例
         circle_mask_ratio: 圆形 mask 半径比例
         angle_range: (min_angle, max_angle) 物理角度范围
-        pointer_color: 'white_tape'=白色胶带, 'red_handle'=红色长柄,
-                       'dark'=暗色指针, 'bright'=亮色把手, 'auto'=自动
+        pointer_color: 'white_line'=白色无向线条, 'white_tape'=白色胶带,
+                       'red_handle'=红色长柄, 'dark'=暗色指针,
+                       'bright'=亮色把手, 'auto'=自动
         debug: 是否返回调试中间结果
 
     Returns:
@@ -59,6 +60,13 @@ def estimate_knob_angle(
     pointer_contour = None
     binary = None
     method = None
+    if pointer_color == 'white_line':
+        angle, pointer_contour, binary = _try_white_line_axis(
+            color_roi, circle_mask, radius, circle_area,
+            min_pointer_area_ratio, max_pointer_area_ratio, cx, cy)
+        if angle is not None:
+            method = 'white_line_axis'
+
     if pointer_color in ('white_tape', 'red_handle'):
         angle, pointer_contour, binary = _try_white_tape_pointer(
             color_roi, circle_mask, radius, circle_area,
@@ -129,15 +137,7 @@ def estimate_knob_angle(
     return None
 
 
-def _try_white_tape_pointer(color_roi, circle_mask, radius, circle_area,
-                            min_area_ratio, max_area_ratio, cx, cy):
-    """
-    红色旋钮贴白色条形胶带后的专用检测。
-
-    白胶带相对红色手柄具有低饱和、高亮度、细长三个稳定特征。该方法
-    只在旋钮圆形区域内找细长白色连通域，并用长轴两端到旋钮中心的
-    距离消除 180° 歧义。
-    """
+def _white_tape_binary(color_roi, circle_mask, radius, cx, cy):
     hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
     h, w = color_roi.shape[:2]
     s_ch = hsv[:, :, 1]
@@ -152,13 +152,114 @@ def _try_white_tape_pointer(color_roi, circle_mask, radius, circle_area,
     )
     valid_v = v_ch[valid]
     if valid_v.size < 30:
-        return None, None, np.zeros((h, w), dtype=np.uint8)
+        return np.zeros((h, w), dtype=np.uint8)
 
-    # 白胶带在不同曝光下亮度会变化；用相对分位数作主阈值，固定值作下限。
     value_thresh = max(120.0, float(np.percentile(valid_v, 82)))
     sat_thresh = 95
     tape_mask = valid & (v_ch >= value_thresh) & (s_ch <= sat_thresh)
-    binary = tape_mask.astype(np.uint8) * 255
+    return tape_mask.astype(np.uint8) * 255
+
+
+def _fit_axis_to_points(pts):
+    if len(pts) < 8:
+        return None
+    mean = np.mean(pts, axis=0)
+    centered = pts - mean
+    try:
+        _, s_vals, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if len(s_vals) < 2 or s_vals[1] < 1e-6:
+        return None
+    axis = vt[0]
+    projections = centered @ axis
+    p05 = float(np.percentile(projections, 5))
+    p95 = float(np.percentile(projections, 95))
+    length = p95 - p05
+    elongation = float(s_vals[0] / s_vals[1])
+    return mean, axis, length, elongation
+
+
+def _line_distance_to_point(mean, axis, point):
+    normal = np.array([-axis[1], axis[0]], dtype=np.float64)
+    return float(abs(np.dot(np.array(point, dtype=np.float64) - mean, normal)))
+
+
+def _axis_angle_from_vector(axis):
+    return math.degrees(math.atan2(float(axis[0]), float(-axis[1]))) % 180.0
+
+
+def _try_white_line_axis(color_roi, circle_mask, radius, circle_area,
+                         min_area_ratio, max_area_ratio, cx, cy):
+    """
+    模式 1 专用：拟合白色手柄所在的无向直线。
+
+    只关心白色线条和竖直线的夹角，因此不做端点消歧。白色标记可能
+    贴在手柄侧面而不穿过 bbox 中心，所以中心距离只作为弱评分项。
+    """
+    h, w = color_roi.shape[:2]
+    binary = _white_tape_binary(color_roi, circle_mask, radius, cx, cy)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None, None, binary
+
+    min_area = max(10.0, circle_area * min_area_ratio * 0.15)
+    max_area = circle_area * max_area_ratio * 1.6
+    center = np.array([cx, cy], dtype=np.float64)
+    best = None
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+
+        pts = cnt.reshape(-1, 2).astype(np.float64)
+        fit = _fit_axis_to_points(pts)
+        if fit is None:
+            continue
+
+        mean, axis, length, elongation = fit
+        if elongation < 1.8 or length < radius * 0.22:
+            continue
+
+        center_dist = _line_distance_to_point(mean, axis, center)
+        radial_dist = float(np.linalg.norm(mean - center))
+        if radial_dist > radius * 1.05:
+            continue
+
+        score = (
+            elongation * 3.0 +
+            length / max(radius, 1) * 7.0 +
+            min(area / max(circle_area * 0.035, 1.0), 2.0) -
+            center_dist / max(radius, 1) * 0.6 -
+            radial_dist / max(radius, 1) * 0.2
+        )
+        if best is None or score > best[0]:
+            angle = _axis_angle_from_vector(axis)
+            best = (score, angle, cnt)
+
+    if best is None:
+        return None, None, binary
+    return float(best[1]), best[2], binary
+
+
+def _try_white_tape_pointer(color_roi, circle_mask, radius, circle_area,
+                            min_area_ratio, max_area_ratio, cx, cy):
+    """
+    红色旋钮贴白色条形胶带后的专用检测。
+
+    白胶带相对红色手柄具有低饱和、高亮度、细长三个稳定特征。该方法
+    只在旋钮圆形区域内找细长白色连通域，并用长轴两端到旋钮中心的
+    距离消除 180° 歧义。
+    """
+    h, w = color_roi.shape[:2]
+    binary = _white_tape_binary(color_roi, circle_mask, radius, cx, cy)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
