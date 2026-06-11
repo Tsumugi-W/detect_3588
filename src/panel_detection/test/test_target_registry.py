@@ -21,7 +21,8 @@ def _detection(class_name, x1, color_bgr):
 
 
 def _image_with_detections(draws):
-    image = np.zeros((80, 220, 3), dtype=np.uint8)
+    max_x = max((x2 for _, _, x2, _, _ in draws), default=220)
+    image = np.zeros((80, max(220, max_x + 20), 3), dtype=np.uint8)
     for x1, y1, x2, y2, color_bgr in draws:
         cv2.rectangle(image, (x1, y1), (x2, y2), color_bgr, -1)
     return image
@@ -87,3 +88,31 @@ def test_persistent_axis_converts_button_like_light_on_cached_row():
     selected, _, _ = result
     assert selected == [light]
     assert light.class_name == 'button'
+
+
+def test_complete_reference_keeps_single_knob_id_by_nearest_neighbor():
+    layout = [
+        ('button', 10, (0, 255, 0)),
+        ('button', 50, (0, 0, 255)),
+        ('button', 90, (0, 0, 255)),
+        ('knob', 130, (0, 0, 255)),
+        ('knob', 170, (0, 0, 0)),
+        ('button', 210, (0, 0, 255)),
+        ('button', 250, (0, 255, 0)),
+    ]
+    initial_dets = []
+    initial_draws = []
+    for class_name, x1, color in layout:
+        det, draw = _detection(class_name, x1, color)
+        initial_dets.append(det)
+        initial_draws.append(draw)
+
+    registry = TargetRegistry(match_distance_thresh=80)
+    initial = registry.identify(initial_dets, _image_with_detections(initial_draws))
+    assert [target_id for target_id, _ in initial] == [1, 2, 3, 4, 5, 6, 7]
+
+    # 只剩原 #5 附近的一个旋钮，即使颜色误判成红色，也应沿用最近邻编号 #5。
+    moved_knob, moved_draw = _detection('knob', 178, (0, 0, 255))
+    matched = registry.identify([moved_knob], _image_with_detections([moved_draw]))
+
+    assert [target_id for target_id, _ in matched] == [5]

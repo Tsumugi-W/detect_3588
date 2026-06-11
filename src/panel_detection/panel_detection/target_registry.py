@@ -23,7 +23,7 @@ import numpy as np
 import cv2
 from dataclasses import dataclass
 from itertools import combinations
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 
 @dataclass
@@ -448,7 +448,10 @@ def _match_individual(observed: List[Tuple[str, str]]) -> List[int]:
 
 class TargetRegistry:
     """
-    目标识别器（每帧独立识别，无注册阶段）
+    目标识别器。
+
+    完整视野中先用布局规则建立 1-7 参考；后续视野变窄时，用上一帧同类目标
+    的最近邻匹配保持编号稳定，避免单个旋钮/按钮被每帧独立规则重新猜号。
     """
 
     def __init__(self, stable_frames=15, green_hue_range=(35, 85),
@@ -458,6 +461,9 @@ class TargetRegistry:
         self._registered: List[RegisteredTarget] = []
         self._stable_frames = stable_frames
         self._stable_count = 0
+        self._match_distance_thresh = float(match_distance_thresh)
+        self._has_complete_reference = False
+        self._last_by_id: Dict[int, RegisteredTarget] = {}
 
     @property
     def is_registered(self) -> bool:
@@ -468,7 +474,10 @@ class TargetRegistry:
         return self._registered
 
     def reset(self):
-        pass
+        self._registered = []
+        self._stable_count = 0
+        self._has_complete_reference = False
+        self._last_by_id.clear()
 
     def update(self, detections: List[FrameDetection],
                color_image: np.ndarray) -> bool:
@@ -509,8 +518,88 @@ class TargetRegistry:
         else:
             sorted_dets = sorted(detections, key=lambda d: d.center_x)
 
-        return _match_best_direction(sorted_dets, color_image)
+        raw_matches = _match_best_direction(sorted_dets, color_image)
+        matched = self._stabilize_with_recent_neighbors(raw_matches)
+        self._update_recent_reference(matched)
+        return matched
 
     def match(self, detections: List[FrameDetection]) -> List[Tuple[int, FrameDetection]]:
         """兼容旧接口 — 不应该再被调用"""
         return []
+
+    def _stabilize_with_recent_neighbors(
+            self,
+            raw_matches: List[Tuple[int, FrameDetection]]) -> List[Tuple[int, FrameDetection]]:
+        if not raw_matches:
+            return []
+
+        # 冷启动必须先相信布局/颜色规则。用户保证开始能看到完整操作区，
+        # 因此只有完整 1-7 出现后才启用最近邻编号覆盖。
+        if not self._has_complete_reference:
+            return raw_matches
+
+        pair_candidates = []
+        for det_index, (_, det) in enumerate(raw_matches):
+            dynamic_thresh = self._dynamic_match_threshold(det)
+            det_xy = np.array([det.center_x, det.center_y], dtype=np.float64)
+            for previous_id, previous in self._last_by_id.items():
+                if previous.class_name != det.class_name:
+                    continue
+                previous_xy = np.array(
+                    [previous.center_x, previous.center_y], dtype=np.float64)
+                distance = float(np.linalg.norm(det_xy - previous_xy))
+                if distance <= dynamic_thresh:
+                    pair_candidates.append((distance, det_index, previous_id))
+
+        assigned_det_indexes = set()
+        assigned_ids = set()
+        nearest_ids: Dict[int, int] = {}
+        for _, det_index, previous_id in sorted(pair_candidates, key=lambda item: item[0]):
+            if det_index in assigned_det_indexes or previous_id in assigned_ids:
+                continue
+            assigned_det_indexes.add(det_index)
+            assigned_ids.add(previous_id)
+            nearest_ids[det_index] = previous_id
+
+        stable_matches = []
+        for det_index, (raw_id, det) in enumerate(raw_matches):
+            target_id = nearest_ids.get(det_index)
+            if target_id is None:
+                target_id = raw_id if raw_id not in assigned_ids else 0
+            if target_id <= 0:
+                continue
+            assigned_ids.add(target_id)
+            stable_matches.append((target_id, det))
+        return stable_matches
+
+    def _dynamic_match_threshold(self, det: FrameDetection) -> float:
+        width = max(1.0, det.bbox[2] - det.bbox[0])
+        height = max(1.0, det.bbox[3] - det.bbox[1])
+        return max(self._match_distance_thresh, 2.5 * max(width, height))
+
+    def _update_recent_reference(
+            self,
+            matches: List[Tuple[int, FrameDetection]]) -> None:
+        if not matches:
+            return
+
+        current_ids = {target_id for target_id, _ in matches}
+        if set(range(1, len(PANEL_LAYOUT) + 1)).issubset(current_ids):
+            self._has_complete_reference = True
+
+        if not self._has_complete_reference:
+            return
+
+        for target_id, det in matches:
+            self._last_by_id[target_id] = RegisteredTarget(
+                target_id=target_id,
+                class_name=det.class_name,
+                center_x=float(det.center_x),
+                center_y=float(det.center_y),
+                bbox_w=float(det.bbox[2] - det.bbox[0]),
+                bbox_h=float(det.bbox[3] - det.bbox[1]),
+            )
+        self._registered = [
+            self._last_by_id[target_id]
+            for target_id in sorted(self._last_by_id)
+        ]
