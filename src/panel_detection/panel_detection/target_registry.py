@@ -22,7 +22,6 @@
 import numpy as np
 import cv2
 from dataclasses import dataclass
-from itertools import combinations
 from typing import Dict, List, Tuple
 
 
@@ -281,86 +280,19 @@ def _match_subsequence_scored(observed: List[Tuple[str, str]]) -> Tuple[List[int
     return [best_offset + i + 1 for i in range(n_obs)], best_score, True
 
 
-def _match_anchored_subsequence_scored(
-        observed: List[Tuple[str, str]]) -> Tuple[List[int], int, bool]:
-    """
-    匹配允许漏检目标的有序布局子序列。
-
-    只在观测序列里存在颜色明确的 knob 锚点时启用。这样单个旋钮可用于跨过
-    另一个漏检旋钮继续给右侧/左侧按钮编号，同时避免纯按钮场景被过度猜测。
-    """
-    n_obs = len(observed)
-    n_layout = len(PANEL_LAYOUT)
-    if n_obs == 0 or n_obs > n_layout:
-        return [], -10_000, False
-
-    best_score = -10_000
-    best_ids = []
-
-    for layout_indexes in combinations(range(n_layout), n_obs):
-        score = 20
-        valid = True
-        has_knob_anchor = False
-        previous_index = None
-
-        for obs_index, layout_index in enumerate(layout_indexes):
-            layout_cls, layout_color = PANEL_LAYOUT[layout_index]
-            obs_cls, obs_color = observed[obs_index]
-
-            if obs_cls != layout_cls:
-                valid = False
-                break
-
-            if previous_index is not None:
-                score -= layout_index - previous_index - 1
-            previous_index = layout_index
-
-            if obs_color == layout_color:
-                score += 4
-                if obs_cls == 'knob' and obs_color in ('red', 'black'):
-                    has_knob_anchor = True
-                    score += 8
-            elif obs_color == 'unknown':
-                score += 0
-            else:
-                score -= 5
-
-        if not valid or not has_knob_anchor:
-            continue
-
-        if score > best_score:
-            best_score = score
-            best_ids = [index + 1 for index in layout_indexes]
-
-    if not best_ids:
-        return [], -10_000, False
-    return best_ids, best_score, True
-
-
 def _match_best_direction(
         sorted_dets: List[FrameDetection],
         color_image: np.ndarray) -> List[Tuple[int, FrameDetection]]:
-    """同时评估轴线正反两个方向，选择更符合完整布局的一边。"""
-    candidates = []
-    for dets in (sorted_dets, list(reversed(sorted_dets))):
-        observed = []
-        for det in dets:
-            color = _classify_color(color_image, det.bbox)
-            observed.append((det.class_name, color))
-
-        ids, score, contiguous = _match_subsequence_scored(observed)
-        if not contiguous:
-            ids = _match_individual(observed)
-            score = _score_individual_match(observed, ids)
-        candidates.append((score, ids, dets))
-
-        anchored_ids, anchored_score, anchored = _match_anchored_subsequence_scored(observed)
-        if anchored:
-            candidates.append((anchored_score, anchored_ids, dets))
-
-    score, ids, dets = max(candidates, key=lambda item: item[0])
+    """按左到右连续布局窗口匹配。"""
+    observed = [
+        (det.class_name, _classify_color(color_image, det.bbox))
+        for det in sorted_dets
+    ]
+    ids, _, contiguous = _match_subsequence_scored(observed)
+    if not contiguous:
+        ids = _match_individual(observed)
     results = []
-    for i, det in enumerate(dets):
+    for i, det in enumerate(sorted_dets):
         if i < len(ids):
             results.append((ids[i], det))
     return results
@@ -518,8 +450,16 @@ class TargetRegistry:
         else:
             sorted_dets = sorted(detections, key=lambda d: d.center_x)
 
-        raw_matches = _match_best_direction(sorted_dets, color_image)
-        matched = self._stabilize_with_recent_neighbors(raw_matches)
+        observed = [
+            (det.class_name, _classify_color(color_image, det.bbox))
+            for det in sorted_dets
+        ]
+        ids = self._match_contiguous_ids(sorted_dets, observed)
+        matched = [
+            (target_id, det)
+            for target_id, det in zip(ids, sorted_dets)
+            if target_id > 0
+        ]
         self._update_recent_reference(matched)
         return matched
 
@@ -527,50 +467,79 @@ class TargetRegistry:
         """兼容旧接口 — 不应该再被调用"""
         return []
 
-    def _stabilize_with_recent_neighbors(
+    def _match_contiguous_ids(
             self,
-            raw_matches: List[Tuple[int, FrameDetection]]) -> List[Tuple[int, FrameDetection]]:
-        if not raw_matches:
+            sorted_dets: List[FrameDetection],
+            observed: List[Tuple[str, str]]) -> List[int]:
+        if not sorted_dets:
             return []
 
-        # 冷启动必须先相信布局/颜色规则。用户保证开始能看到完整操作区，
-        # 因此只有完整 1-7 出现后才启用最近邻编号覆盖。
+        # 冷启动必须先相信布局/颜色规则。这里严格使用连续子序列，
+        # 不允许锚点跨过中间目标产生 #4/#6/#7 这类漏号。
         if not self._has_complete_reference:
-            return raw_matches
+            ids, _, contiguous = _match_subsequence_scored(observed)
+            return ids if contiguous else _match_individual(observed)
 
-        pair_candidates = []
-        for det_index, (_, det) in enumerate(raw_matches):
-            dynamic_thresh = self._dynamic_match_threshold(det)
-            det_xy = np.array([det.center_x, det.center_y], dtype=np.float64)
-            for previous_id, previous in self._last_by_id.items():
-                if previous.class_name != det.class_name:
+        ids, _, contiguous = self._match_reference_window_scored(
+            sorted_dets, observed)
+        if contiguous:
+            return ids
+
+        ids, _, contiguous = _match_subsequence_scored(observed)
+        return ids if contiguous else _match_individual(observed)
+
+    def _match_reference_window_scored(
+            self,
+            sorted_dets: List[FrameDetection],
+            observed: List[Tuple[str, str]]) -> Tuple[List[int], int, bool]:
+        n_obs = len(observed)
+        n_layout = len(PANEL_LAYOUT)
+        if n_obs == 0 or n_obs > n_layout:
+            return [], -10_000, False
+
+        best_score = -10_000
+        best_offset = -1
+
+        for offset in range(n_layout - n_obs + 1):
+            score = 20
+            valid = True
+
+            for obs_index, (obs_cls, obs_color) in enumerate(observed):
+                layout_index = offset + obs_index
+                target_id = layout_index + 1
+                layout_cls, layout_color = PANEL_LAYOUT[layout_index]
+                if obs_cls != layout_cls:
+                    valid = False
+                    break
+
+                if obs_color == layout_color:
+                    score += 3
+                elif obs_color != 'unknown':
+                    score -= 2
+
+                previous = self._last_by_id.get(target_id)
+                if previous is None or previous.class_name != obs_cls:
                     continue
+
+                det = sorted_dets[obs_index]
+                det_xy = np.array([det.center_x, det.center_y], dtype=np.float64)
                 previous_xy = np.array(
                     [previous.center_x, previous.center_y], dtype=np.float64)
                 distance = float(np.linalg.norm(det_xy - previous_xy))
-                if distance <= dynamic_thresh:
-                    pair_candidates.append((distance, det_index, previous_id))
+                threshold = self._dynamic_match_threshold(det)
+                if distance <= threshold:
+                    score += int(round(30.0 * (1.0 - distance / threshold)))
+                else:
+                    score -= int(round(min(30.0, 10.0 * distance / threshold)))
 
-        assigned_det_indexes = set()
-        assigned_ids = set()
-        nearest_ids: Dict[int, int] = {}
-        for _, det_index, previous_id in sorted(pair_candidates, key=lambda item: item[0]):
-            if det_index in assigned_det_indexes or previous_id in assigned_ids:
-                continue
-            assigned_det_indexes.add(det_index)
-            assigned_ids.add(previous_id)
-            nearest_ids[det_index] = previous_id
+            if valid and score > best_score:
+                best_score = score
+                best_offset = offset
 
-        stable_matches = []
-        for det_index, (raw_id, det) in enumerate(raw_matches):
-            target_id = nearest_ids.get(det_index)
-            if target_id is None:
-                target_id = raw_id if raw_id not in assigned_ids else 0
-            if target_id <= 0:
-                continue
-            assigned_ids.add(target_id)
-            stable_matches.append((target_id, det))
-        return stable_matches
+        if best_offset < 0:
+            return [], -10_000, False
+
+        return [best_offset + i + 1 for i in range(n_obs)], best_score, True
 
     def _dynamic_match_threshold(self, det: FrameDetection) -> float:
         width = max(1.0, det.bbox[2] - det.bbox[0])

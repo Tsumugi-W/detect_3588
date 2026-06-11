@@ -28,7 +28,7 @@ def _image_with_detections(draws):
     return image
 
 
-def test_single_red_knob_anchors_right_side_buttons_when_other_knob_missing():
+def test_partial_view_uses_contiguous_ids_without_skipping_layout_positions():
     knob, knob_draw = _detection('knob', 20, (0, 0, 255))
     red_button, red_draw = _detection('button', 70, (0, 0, 255))
     green_button, green_draw = _detection('button', 120, (0, 255, 0))
@@ -36,10 +36,10 @@ def test_single_red_knob_anchors_right_side_buttons_when_other_knob_missing():
 
     matched = TargetRegistry().identify([knob, red_button, green_button], image)
 
-    assert [target_id for target_id, _ in matched] == [4, 6, 7]
+    assert [target_id for target_id, _ in matched] == [5, 6, 7]
 
 
-def test_single_black_knob_anchors_left_side_buttons_when_other_knob_missing():
+def test_partial_view_keeps_ids_contiguous_even_when_knob_color_disagrees():
     green_button, green_draw = _detection('button', 20, (0, 255, 0))
     red_button_a, red_draw_a = _detection('button', 70, (0, 0, 255))
     red_button_b, red_draw_b = _detection('button', 120, (0, 0, 255))
@@ -52,7 +52,7 @@ def test_single_black_knob_anchors_left_side_buttons_when_other_knob_missing():
         green_button, red_button_a, red_button_b, knob,
     ], image)
 
-    assert [target_id for target_id, _ in matched] == [1, 2, 3, 5]
+    assert [target_id for target_id, _ in matched] == [1, 2, 3, 4]
 
 
 def test_persistent_axis_relocates_parallel_line_after_camera_translation():
@@ -116,3 +116,32 @@ def test_complete_reference_keeps_single_knob_id_by_nearest_neighbor():
     matched = registry.identify([moved_knob], _image_with_detections([moved_draw]))
 
     assert [target_id for target_id, _ in matched] == [5]
+
+
+def test_complete_reference_selects_contiguous_right_button_window_by_position():
+    layout = [
+        ('button', 10, (0, 255, 0)),
+        ('button', 50, (0, 0, 255)),
+        ('button', 90, (0, 0, 255)),
+        ('knob', 130, (0, 0, 255)),
+        ('knob', 170, (0, 0, 0)),
+        ('button', 210, (0, 0, 255)),
+        ('button', 250, (0, 255, 0)),
+    ]
+    initial_dets = []
+    initial_draws = []
+    for class_name, x1, color in layout:
+        det, draw = _detection(class_name, x1, color)
+        initial_dets.append(det)
+        initial_draws.append(draw)
+
+    registry = TargetRegistry(match_distance_thresh=80)
+    registry.identify(initial_dets, _image_with_detections(initial_draws))
+
+    red_button, red_draw = _detection('button', 214, (0, 0, 255))
+    green_button, green_draw = _detection('button', 254, (0, 255, 0))
+    matched = registry.identify(
+        [red_button, green_button],
+        _image_with_detections([red_draw, green_draw]))
+
+    assert [target_id for target_id, _ in matched] == [6, 7]
