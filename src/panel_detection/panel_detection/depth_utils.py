@@ -277,6 +277,372 @@ def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100,
     return normal, centroid
 
 
+def fit_plane_svd(points_3d, min_points=3):
+    """
+    Fit a plane with SVD for a small deterministic set of points.
+
+    This is useful for a local fastener group where only 3-4 visible
+    nut/bolt centers may be available.
+    """
+    points = np.asarray(points_3d, dtype=np.float64)
+    if len(points) < min_points:
+        return None
+    centroid = np.mean(points, axis=0)
+    centered = points - centroid
+    try:
+        _, s_vals, vt = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if len(s_vals) < 3 or s_vals[1] < 1e-6:
+        return None
+    normal = vt[2]
+    if normal[2] > 0:
+        normal = -normal
+    return normal, centroid
+
+
+def estimate_fastener_group_axis_direction(target_xy, candidates,
+                                           max_distance_px=360.0,
+                                           min_points=3,
+                                           max_points=6,
+                                           merge_distance_px=12.0,
+                                           min_abs_z=0.45):
+    """
+    Estimate axis direction from nearby fastener/valve 3D points.
+
+    Args:
+        target_xy: (x, y) center of the target in image pixels.
+        candidates: iterable of dicts with keys:
+            center_xy: (x, y), point_3d: (x, y, z), class_name: str
+        max_distance_px: candidate neighborhood radius in the image.
+        min_points: minimum visible neighboring objects required.
+        max_points: use nearest N points to avoid crossing to another plane.
+
+    Returns:
+        (normal, centroid, point_count) or None.
+    """
+    tx, ty = [float(v) for v in target_xy]
+    usable = []
+    for cand in candidates:
+        point = cand.get('point_3d')
+        if point is None:
+            continue
+        point = np.asarray(point, dtype=np.float64)
+        if point.shape != (3,) or not np.all(np.isfinite(point)) or point[2] <= 0:
+            continue
+        cx, cy = cand.get('center_xy', (None, None))
+        if cx is None or cy is None:
+            continue
+        cx = float(cx)
+        cy = float(cy)
+        dist = float(np.hypot(cx - tx, cy - ty))
+        if dist <= max_distance_px:
+            frame = int(cand.get('frame', 0))
+            usable.append((dist, -frame, (cx, cy), point))
+
+    if len(usable) < min_points:
+        return None
+
+    usable.sort(key=lambda item: (item[0], item[1]))
+    merged = []
+    merged_centers = []
+    for _, _, center_xy, point in usable:
+        if any(np.hypot(center_xy[0] - existing[0],
+                        center_xy[1] - existing[1]) < merge_distance_px
+               for existing in merged_centers):
+            continue
+        merged_centers.append(center_xy)
+        merged.append(point)
+        if len(merged) >= max_points:
+            break
+
+    if len(merged) < min_points:
+        return None
+
+    points = np.array(merged, dtype=np.float64)
+    result = fit_plane_svd(points, min_points=min_points)
+    if result is None:
+        return None
+    normal, centroid = result
+    if abs(float(normal[2])) < float(min_abs_z):
+        return None
+    return normal, centroid, int(len(points))
+
+
+def estimate_fastener_line_constrained_axis(target_xy, candidates, base_normal,
+                                            max_distance_px=360.0,
+                                            merge_distance_px=12.0,
+                                            min_abs_z=0.45):
+    """
+    Use two nearby fastener points to constrain a candidate axis normal.
+
+    With only two visible coplanar objects, a plane is underdetermined.  The
+    line through those two object points still lies in the mounting plane, so
+    the mounting-plane normal must be perpendicular to that line.  This helper
+    projects an existing normal estimate onto the subspace perpendicular to the
+    fastener line.
+    """
+    if base_normal is None:
+        return None
+
+    tx, ty = [float(v) for v in target_xy]
+    usable = []
+    for cand in candidates:
+        point = cand.get('point_3d')
+        if point is None:
+            continue
+        point = np.asarray(point, dtype=np.float64)
+        if point.shape != (3,) or not np.all(np.isfinite(point)) or point[2] <= 0:
+            continue
+        cx, cy = cand.get('center_xy', (None, None))
+        if cx is None or cy is None:
+            continue
+        cx = float(cx)
+        cy = float(cy)
+        dist = float(np.hypot(cx - tx, cy - ty))
+        if dist <= max_distance_px:
+            frame = int(cand.get('frame', 0))
+            usable.append((dist, -frame, (cx, cy), point))
+
+    if len(usable) < 2:
+        return None
+
+    usable.sort(key=lambda item: (item[0], item[1]))
+    merged_points = []
+    merged_centers = []
+    for _, _, center_xy, point in usable:
+        if any(np.hypot(center_xy[0] - existing[0],
+                        center_xy[1] - existing[1]) < merge_distance_px
+               for existing in merged_centers):
+            continue
+        merged_centers.append(center_xy)
+        merged_points.append(point)
+        if len(merged_points) >= 2:
+            break
+
+    if len(merged_points) < 2:
+        return None
+
+    line = merged_points[1] - merged_points[0]
+    line_norm = np.linalg.norm(line)
+    if line_norm < 1e-6:
+        return None
+    line = line / line_norm
+
+    normal = np.asarray(base_normal, dtype=np.float64)
+    normal = normal - np.dot(normal, line) * line
+    normal_norm = np.linalg.norm(normal)
+    if normal_norm < 1e-6:
+        return None
+    normal = normal / normal_norm
+    if normal[2] > 0:
+        normal = -normal
+    if abs(float(normal[2])) < float(min_abs_z):
+        return None
+
+    centroid = np.mean(np.asarray(merged_points, dtype=np.float64), axis=0)
+    return normal, centroid, int(len(merged_points))
+
+
+def _bbox_mask(shape, bbox, shrink_ratio=0.08):
+    h, w = shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    sx1 = max(0, int(round(x1 + bw * shrink_ratio)))
+    sy1 = max(0, int(round(y1 + bh * shrink_ratio)))
+    sx2 = min(w, int(round(x2 - bw * shrink_ratio)))
+    sy2 = min(h, int(round(y2 - bh * shrink_ratio)))
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if sx1 < sx2 and sy1 < sy2:
+        mask[sy1:sy2, sx1:sx2] = 255
+    return mask
+
+
+def _valve_annulus_mask(shape, bbox):
+    """
+    Build a depth mask for hollow valve-like parts.
+
+    The center of a valve bbox often sees through to the panel/background, so
+    the mask keeps an elliptical outer ring and removes the central hole.
+    """
+    h, w = shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    cx = int(round((x1 + x2) * 0.5))
+    cy = int(round((y1 + y2) * 0.5))
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    outer_axes = (max(2, int(round(bw * 0.46))),
+                  max(2, int(round(bh * 0.46))))
+    inner_axes = (max(1, int(round(bw * 0.22))),
+                  max(1, int(round(bh * 0.22))))
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(mask, (cx, cy), outer_axes, 0, 0, 360, 255, -1)
+    cv2.ellipse(mask, (cx, cy), inner_axes, 0, 0, 360, 0, -1)
+    return mask
+
+
+def estimate_object_axis_direction(depth_image, depth_intrin, bbox,
+                                   depth_scale=0.001, mask=None,
+                                   object_class='',
+                                   sample_stride=2,
+                                   min_points=24):
+    """
+    Estimate a target axis direction from local depth points.
+
+    For bolt/nut/valve, the mechanical axis is approximated by the normal of
+    the visible front face.  Hollow valves need special treatment: the center
+    of the bbox may contain background depth, so only an annular mask is used
+    and deeper outliers are trimmed away.
+
+    Returns:
+        (normal, centroid, inlier_count) or None.
+        normal points toward the camera (negative z in the camera optical frame).
+    """
+    if depth_image is None or depth_intrin is None:
+        return None
+
+    h, w = depth_image.shape[:2]
+    if mask is None:
+        if object_class == 'valve':
+            mask = _valve_annulus_mask((h, w), bbox)
+        else:
+            mask = _bbox_mask((h, w), bbox)
+    elif mask.shape[:2] != depth_image.shape[:2]:
+        return None
+
+    valid = (mask > 0) & (depth_image > 0)
+    raw_depths = depth_image[valid].astype(np.float64)
+    if raw_depths.size < min_points:
+        return None
+
+    if object_class == 'valve':
+        # Keep the nearer depth cluster.  The center opening and far panel
+        # pixels otherwise pull the fitted plane away from the valve face.
+        lo, hi = np.percentile(raw_depths, [3, 70])
+    else:
+        lo, hi = np.percentile(raw_depths, [5, 95])
+    depth_band = valid & (depth_image >= lo) & (depth_image <= hi)
+
+    ys, xs = np.where(depth_band)
+    if len(xs) < min_points:
+        ys, xs = np.where(valid)
+    if len(xs) < min_points:
+        return None
+
+    step = max(1, int(sample_stride))
+    ys = ys[::step]
+    xs = xs[::step]
+    if len(xs) < min_points:
+        ys, xs = np.where(depth_band)
+    if len(xs) < min_points:
+        return None
+
+    depths = depth_image[ys, xs].astype(np.float64) * depth_scale
+    pixels = np.column_stack([xs, ys])
+    points_3d = deproject_pixels_to_points(depth_intrin, pixels, depths)
+
+    result = fit_plane_ransac(
+        points_3d,
+        min_points=min(min_points, len(points_3d)),
+        ransac_iter=80,
+        ransac_thresh=0.006,
+        random_seed=0,
+    )
+    if result is None:
+        return None
+    normal, centroid = result
+    return normal, centroid, int(len(points_3d))
+
+
+def estimate_mounting_plane_axis_direction(depth_image, depth_intrin, bbox,
+                                           all_bboxes=None,
+                                           depth_scale=0.001,
+                                           expand_ratio=1.4,
+                                           object_margin_ratio=0.12,
+                                           sample_stride=3,
+                                           min_points=45):
+    """
+    Estimate an object's axis from its local mounting plane.
+
+    Bolts, nuts, and valves are assumed to be mounted perpendicular to a local
+    support plane.  A scene may contain multiple support planes, so this samples
+    only an expanded region around one target, removes all detected object boxes
+    from that region, and fits the remaining local surface.
+
+    Returns:
+        (normal, centroid, point_count) or None.
+    """
+    if depth_image is None or depth_intrin is None:
+        return None
+
+    h, w = depth_image.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    pad = max(bw, bh) * float(expand_ratio)
+
+    rx1 = max(0, int(round(x1 - pad)))
+    ry1 = max(0, int(round(y1 - pad)))
+    rx2 = min(w, int(round(x2 + pad)))
+    ry2 = min(h, int(round(y2 + pad)))
+    if rx2 - rx1 < 8 or ry2 - ry1 < 8:
+        return None
+
+    mask = np.zeros((h, w), dtype=bool)
+    mask[ry1:ry2, rx1:rx2] = True
+
+    boxes = all_bboxes or [bbox]
+    for b in boxes:
+        bx1, by1, bx2, by2 = [float(v) for v in b]
+        bbw = max(1.0, bx2 - bx1)
+        bbh = max(1.0, by2 - by1)
+        margin = max(bbw, bbh) * float(object_margin_ratio)
+        ex1 = max(0, int(round(bx1 - margin)))
+        ey1 = max(0, int(round(by1 - margin)))
+        ex2 = min(w, int(round(bx2 + margin)))
+        ey2 = min(h, int(round(by2 + margin)))
+        mask[ey1:ey2, ex1:ex2] = False
+
+    valid = mask & (depth_image > 0)
+    raw_depths = depth_image[valid].astype(np.float64)
+    if raw_depths.size < min_points:
+        return None
+
+    lo, hi = np.percentile(raw_depths, [4, 96])
+    depth_band = valid & (depth_image >= lo) & (depth_image <= hi)
+    ys, xs = np.where(depth_band)
+    if len(xs) < min_points:
+        ys, xs = np.where(valid)
+    if len(xs) < min_points:
+        return None
+
+    step = max(1, int(sample_stride))
+    ys = ys[::step]
+    xs = xs[::step]
+    if len(xs) < min_points:
+        ys, xs = np.where(depth_band)
+    if len(xs) < min_points:
+        return None
+
+    depths = depth_image[ys, xs].astype(np.float64) * depth_scale
+    pixels = np.column_stack([xs, ys])
+    points_3d = deproject_pixels_to_points(depth_intrin, pixels, depths)
+
+    result = fit_plane_ransac(
+        points_3d,
+        min_points=min(min_points, len(points_3d)),
+        ransac_iter=120,
+        ransac_thresh=0.008,
+        random_seed=0,
+    )
+    if result is None:
+        return None
+    normal, centroid = result
+    return normal, centroid, int(len(points_3d))
+
+
 def compute_panel_normal(color_image, depth_image, depth_intrin,
                          all_bboxes, panel_color_thresh=40,
                          depth_scale=0.001, sample_stride=4):

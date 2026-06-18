@@ -2,7 +2,7 @@
 
 基于 YOLOv5 + 深度相机的操作面板实时 3D 检测系统，封装为标准 ROS2 Humble 功能包。
 
-检测 7 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)。支持目标注册编号和旋钮角度估计。
+检测 8 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)。支持目标注册编号、旋钮角度估计和螺栓/螺母/阀门轴线方向估计。
 
 ## 系统架构
 
@@ -255,7 +255,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 位置单位：**米 (m)**，相机坐标系。
 
-### /panel/knob_angles (String, JSON) — 旋钮角度
+### /panel/knob_angles (String, JSON) — 旋钮角度、六边形角度、轴线方向
 
 ```json
 {
@@ -267,11 +267,29 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
       "angle": 171.5,
       "confidence": 0.92
     }
+  ],
+  "hex_angles": [
+    {
+      "class": "nut",
+      "bbox": [510.0, 260.0, 560.0, 310.0],
+      "hex_angle": 28.4,
+      "nut_refined_conf": 0.81
+    }
+  ],
+  "axis_directions": [
+    {
+      "class": "valve",
+      "bbox": [620.0, 240.0, 700.0, 320.0],
+      "source": "fastener_current",
+      "axis_direction": [0.012, -0.034, -0.999],
+      "centroid": [0.18, -0.03, 0.82],
+      "point_count": 742
+    }
   ]
 }
 ```
 
-角度以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。
+角度以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。`axis_direction` 是相机坐标系下的单位方向向量，指向相机方向时 z 为负。螺栓、螺母、阀门优先使用当前帧附近同平面器件的 3D 点拟合安装平面，`source` 为 `fastener_current`；如果只有两个邻近点，则用两点连线约束局部安装面法向量，`source` 为 `fastener_line`；再往后依次回退到目标周边局部安装面 `local_mount_plane`、全局面板平面 `panel_plane` 和局部目标深度 `local_depth`。
 
 ### /panel/distance (String, JSON) — 相机到面板平面的垂直距离
 
@@ -364,12 +382,12 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0601.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_model: '0612.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
 onnx_threads: 8
-# rknn_model: '0601.rknn'      # inference_backend='rknn' 时使用
+# rknn_model: '0612.rknn'      # inference_backend='rknn' 时使用
 
-class_num: 7
-class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button']
+class_num: 8
+class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button', 'door_button']
 threshold:
   confidence: 0.3
   iou: 0.01
@@ -433,8 +451,8 @@ ros2_ws/
             ├── detector_onnx.py
             ├── detector_rknn.py
             ├── knob_angle.py
-            ├── 0601.onnx
-            └── 0601.pt
+            ├── 0612.onnx
+            └── 0612.pt
 ```
 
 ## 常见问题

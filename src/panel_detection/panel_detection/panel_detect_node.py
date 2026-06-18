@@ -32,7 +32,10 @@ from .camera.base import CameraIntrinsics
 from .depth_utils import (
     deproject_pixel_to_point,
     filter_depth, get_robust_depth, get_bbox_robust_depth, get_masked_robust_depth,
-    compute_panel_normal,
+    compute_panel_normal, estimate_fastener_group_axis_direction,
+    estimate_fastener_line_constrained_axis,
+    estimate_mounting_plane_axis_direction,
+    estimate_object_axis_direction,
 )
 from .knob_angle import estimate_knob_angle, draw_knob_angle, estimate_hex_angle, draw_hex_angle
 from .nut_localizer import localize_nut
@@ -45,12 +48,13 @@ DEFAULT_CONFIG = {
     'camera': {'color_width': 1280, 'color_height': 720,
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
-    'onnx_model': '0601.onnx',
+    'onnx_model': '0612.onnx',
     'onnx_threads': 8,
-    'weight': '0601.pt',
+    'weight': '0612.pt',
     'input_size': 640,
-    'class_num': 7,
-    'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button'],
+    'class_num': 8,
+    'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump',
+                   'button', 'door_button'],
     'threshold': {'iou': 0.01, 'confidence': 0.3},
     'knob_angle': {'enable': True, 'binary_thresh': 180,
                    'circle_mask_ratio': 0.85, 'knob_class': 'knob',
@@ -74,6 +78,7 @@ CLASS_TOPIC_MAP = {
     'valve': '/panel/valves',
     'pump': '/panel/pumps',
     'button': '/panel/buttons',
+    'door_button': '/panel/door_buttons',
 }
 
 
@@ -148,7 +153,7 @@ def _estimate_detection_point(det, depth_image, intrin, depth_scale):
     """
     ux = int(round(det.center_x))
     uy = int(round(det.center_y))
-    if det.class_name in ('button', 'knob'):
+    if det.class_name in ('button', 'door_button', 'knob'):
         depth = get_bbox_robust_depth(
             depth_image, det.bbox, depth_scale=depth_scale,
             center_ratio=0.45, min_valid=8, quantile=0.5)
@@ -177,6 +182,72 @@ def _is_button_like_detection(det):
     h = max(1.0, det.bbox[3] - det.bbox[1])
     aspect = w / h
     return 0.55 <= aspect <= 1.8
+
+
+def _publish_pose(pub, stamp, xyz, quat):
+    if pub is None or xyz is None:
+        return
+    msg = PoseStamped()
+    msg.header.stamp = stamp
+    msg.header.frame_id = 'camera_color_optical_frame'
+    msg.pose.position.x = float(xyz[0])
+    msg.pose.position.y = float(xyz[1])
+    msg.pose.position.z = float(xyz[2])
+    msg.pose.orientation.x = quat[0]
+    msg.pose.orientation.y = quat[1]
+    msg.pose.orientation.z = quat[2]
+    msg.pose.orientation.w = quat[3]
+    pub.publish(msg)
+
+
+def _draw_axis_direction(canvas, bbox, normal, label='axis',
+                         color=(255, 255, 0)):
+    x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+    cx = int(round((x1 + x2) * 0.5))
+    cy = int(round((y1 + y2) * 0.5))
+    nx, ny, nz = [float(v) for v in normal]
+
+    scale = max(24.0, min(x2 - x1, y2 - y1) * 0.45)
+    xy_norm = math.hypot(nx, ny)
+    if xy_norm >= 0.03:
+        ex = int(round(cx + nx / xy_norm * scale))
+        ey = int(round(cy + ny / xy_norm * scale))
+        cv2.arrowedLine(canvas, (cx, cy), (ex, ey), color, 2,
+                        cv2.LINE_AA, tipLength=0.25)
+    else:
+        cv2.drawMarker(canvas, (cx, cy), color,
+                       markerType=cv2.MARKER_CROSS, markerSize=16,
+                       thickness=2)
+
+    text = f'{label} n=({nx:.2f},{ny:.2f},{nz:.2f})'
+    text_y = max(15, y1 - 24)
+    cv2.putText(canvas, text, (x1, text_y), 0, 0.42,
+                color, 1, cv2.LINE_AA)
+
+
+def _regular_polygon_points(bbox, n_sides, edge_angle_deg=0.0):
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    radius = max(2.0, min(x2 - x1, y2 - y1) * 0.47)
+    # Offset by half a sector so the fitted angle follows the detected edge
+    # orientation rather than a vertex orientation.
+    start = math.radians(edge_angle_deg + 180.0 / max(3, n_sides))
+    angles = start + np.arange(n_sides, dtype=np.float64) * (2.0 * math.pi / n_sides)
+    pts = np.column_stack([
+        cx + radius * np.cos(angles),
+        cy + radius * np.sin(angles),
+    ])
+    return np.round(pts).astype(np.int32)
+
+
+def _draw_regular_polygon(canvas, bbox, n_sides, angle, color=(0, 255, 255)):
+    pts = _regular_polygon_points(bbox, n_sides, angle)
+    cv2.polylines(canvas, [pts], True, color, 2, cv2.LINE_AA)
+    x1, y1 = int(round(bbox[0])), int(round(bbox[1]))
+    cv2.putText(canvas, f'{n_sides}-gon {angle:.1f}deg',
+                (x1, max(15, y1 - 8)), 0, 0.42,
+                color, 1, cv2.LINE_AA)
 
 
 def _fit_axis_from_points(points, fallback_axis):
@@ -1049,19 +1120,7 @@ class PanelDetectionNode(Node):
             targets_output.append(target_info)
 
             # 兼容旧话题
-            pub = self._pose_pubs.get(det.class_name)
-            if pub is not None:
-                msg = PoseStamped()
-                msg.header.stamp = stamp
-                msg.header.frame_id = 'camera_color_optical_frame'
-                msg.pose.position.x = float(xyz[0])
-                msg.pose.position.y = float(xyz[1])
-                msg.pose.position.z = float(xyz[2])
-                msg.pose.orientation.x = quat[0]
-                msg.pose.orientation.y = quat[1]
-                msg.pose.orientation.z = quat[2]
-                msg.pose.orientation.w = quat[3]
-                pub.publish(msg)
+            _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
             # 旋钮角度
             if det.class_name == self._angle_knob_class and self._angle_enable:
@@ -1133,22 +1192,11 @@ class PanelDetectionNode(Node):
                                 (0, 0, 255), 1, cv2.LINE_AA)
                     continue
 
-                pub = self._pose_pubs.get('nut')
-                if pub is not None:
-                    msg = PoseStamped()
-                    msg.header.stamp = stamp
-                    msg.header.frame_id = 'camera_color_optical_frame'
-                    msg.pose.position.x = float(xyz[0])
-                    msg.pose.position.y = float(xyz[1])
-                    msg.pose.position.z = float(xyz[2])
-                    msg.pose.orientation.x = quat[0]
-                    msg.pose.orientation.y = quat[1]
-                    msg.pose.orientation.z = quat[2]
-                    msg.pose.orientation.w = quat[3]
-                    pub.publish(msg)
+                _publish_pose(self._pose_pubs.get('nut'), stamp, xyz, quat)
             else:
                 ux, uy, xyz = _estimate_detection_point(
                     det, filtered_depth, deproj_intrin, self._depth_scale)
+                _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
@@ -1156,6 +1204,30 @@ class PanelDetectionNode(Node):
 
         # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
         hex_angles = []
+        axis_directions = []
+        axis_candidate_points = []
+        axis_target_classes = {'nut', 'bolt', 'valve'}
+        for det_idx, det in enumerate(frame_detections):
+            if det.class_name not in axis_target_classes:
+                continue
+            loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
+            reliable_nut = loc is not None and loc.confidence >= 0.45
+            if reliable_nut:
+                ux, uy, xyz = _estimate_nut_detection_point(
+                    loc, filtered_depth, deproj_intrin, self._depth_scale)
+            else:
+                ux, uy, xyz = _estimate_detection_point(
+                    det, filtered_depth, deproj_intrin, self._depth_scale)
+            if xyz is None or xyz[2] <= 0:
+                continue
+            axis_candidate_points.append({
+                'det_idx': det_idx,
+                'class_name': det.class_name,
+                'center_xy': (ux, uy),
+                'point_3d': xyz,
+                'frame': self._frame_count,
+            })
+
         for det_idx, det in enumerate(frame_detections):
             if det.class_name in ('nut', 'bolt', 'valve'):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
@@ -1164,6 +1236,77 @@ class PanelDetectionNode(Node):
                 n_sides = 8 if det.class_name == 'valve' else 6
                 loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
                 reliable_nut = loc is not None and loc.confidence >= 0.45
+
+                axis_source = 'fastener_current'
+                axis_result = estimate_fastener_group_axis_direction(
+                    (det.center_x, det.center_y),
+                    axis_candidate_points,
+                    max_distance_px=max(140.0, 3.5 * max(det.bbox[2] - det.bbox[0],
+                                                         det.bbox[3] - det.bbox[1])),
+                    min_points=3,
+                    max_points=6,
+                )
+                if axis_result is None:
+                    axis_source = 'local_mount_plane'
+                    axis_result = estimate_mounting_plane_axis_direction(
+                        filtered_depth,
+                        deproj_intrin,
+                        det.bbox,
+                        all_bboxes=xyxy_list,
+                        depth_scale=self._depth_scale,
+                    )
+                    if axis_result is not None:
+                        constrained = estimate_fastener_line_constrained_axis(
+                            (det.center_x, det.center_y),
+                            axis_candidate_points,
+                            axis_result[0],
+                            max_distance_px=max(
+                                140.0,
+                                3.5 * max(det.bbox[2] - det.bbox[0],
+                                          det.bbox[3] - det.bbox[1])),
+                        )
+                        if constrained is not None:
+                            axis_result = constrained
+                            axis_source = 'fastener_line'
+                if axis_result is None and self._panel_normal_cache is not None:
+                    axis_normal, axis_centroid = self._panel_normal_cache
+                    axis_points = 0
+                    axis_result = (axis_normal, axis_centroid, axis_points)
+                    axis_source = 'panel_plane'
+                if axis_result is None:
+                    axis_result = estimate_object_axis_direction(
+                        filtered_depth,
+                        deproj_intrin,
+                        det.bbox,
+                        depth_scale=self._depth_scale,
+                        mask=loc.depth_mask if reliable_nut else None,
+                        object_class=det.class_name,
+                    )
+                    axis_source = 'local_depth'
+                if axis_result is not None:
+                    axis_normal, axis_centroid, axis_points = axis_result
+                    axis_directions.append({
+                        'class': det.class_name,
+                        'bbox': det.bbox,
+                        'source': axis_source,
+                        'axis_direction': [
+                            round(float(axis_normal[0]), 6),
+                            round(float(axis_normal[1]), 6),
+                            round(float(axis_normal[2]), 6),
+                        ],
+                        'centroid': [
+                            round(float(axis_centroid[0]), 4),
+                            round(float(axis_centroid[1]), 4),
+                            round(float(axis_centroid[2]), 4),
+                        ],
+                        'point_count': axis_points,
+                    })
+                    axis_color = (255, 255, 0) if det.class_name == 'valve' else (255, 0, 255)
+                    _draw_axis_direction(
+                        canvas, det.bbox, axis_normal,
+                        label=f'{det.class_name}_axis[{axis_source}]',
+                        color=axis_color)
+
                 hex_angle = loc.angle if reliable_nut and loc.angle is not None else None
                 if hex_angle is None:
                     hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
@@ -1175,7 +1318,11 @@ class PanelDetectionNode(Node):
                         **({'nut_refined_conf': round(loc.confidence, 3)}
                            if reliable_nut else {}),
                     })
-                    if det.class_name != 'nut' or not reliable_nut:
+                    if det.class_name == 'valve':
+                        _draw_regular_polygon(
+                            canvas, det.bbox, 8, hex_angle,
+                            color=(0, 255, 255))
+                    elif det.class_name != 'nut' or not reliable_nut:
                         draw_hex_angle(canvas, det.bbox, hex_angle)
 
         # 发布带编号的检测结果
@@ -1187,14 +1334,15 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._targets_pub.publish(msg)
 
-        # 发布旋钮角度 + 六边形角度
-        all_angles = knob_angles + hex_angles
+        # 发布旋钮角度 + 六边形角度 + 目标轴线方向
+        all_angles = knob_angles + hex_angles + axis_directions
         if all_angles:
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp.sec + stamp.nanosec * 1e-9,
                 'knob_angles': knob_angles,
                 'hex_angles': hex_angles,
+                'axis_directions': axis_directions,
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 

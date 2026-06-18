@@ -17,6 +17,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch',
             [path for path in glob('launch/*') if os.path.isfile(path)]),
+        ('share/' + package_name + '/scripts',
+            [path for path in glob('scripts/*') if os.path.isfile(path)]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
