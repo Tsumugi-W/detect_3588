@@ -250,6 +250,79 @@ def _draw_regular_polygon(canvas, bbox, n_sides, angle, color=(0, 255, 255)):
                 color, 1, cv2.LINE_AA)
 
 
+def _draw_axis_3d_view(canvas, axis_directions):
+    if not axis_directions:
+        return
+
+    panel_w = 330
+    panel_h = min(235, max(155, 72 + 24 * min(len(axis_directions), 5)))
+    margin = 10
+    x1 = max(0, canvas.shape[1] - panel_w - margin)
+    y1 = margin
+    x2 = min(canvas.shape[1] - margin, x1 + panel_w)
+    y2 = min(canvas.shape[0] - margin, y1 + panel_h)
+
+    overlay = canvas.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
+    cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0, canvas)
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), (180, 180, 180), 1)
+    cv2.putText(canvas, 'Camera-facing axis view', (x1 + 10, y1 + 20),
+                0, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+
+    origin = (x1 + 76, y1 + 92)
+    radius = 54
+    cv2.circle(canvas, origin, radius, (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.circle(canvas, origin, int(radius * 0.5), (65, 65, 65), 1, cv2.LINE_AA)
+    cv2.line(canvas, (origin[0] - radius, origin[1]),
+             (origin[0] + radius, origin[1]), (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.line(canvas, (origin[0], origin[1] - radius),
+             (origin[0], origin[1] + radius), (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.putText(canvas, '+X', (origin[0] + radius + 4, origin[1] + 4),
+                0, 0.36, (80, 180, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, '+Y', (origin[0] + 4, origin[1] + radius + 14),
+                0, 0.36, (80, 255, 120), 1, cv2.LINE_AA)
+    cv2.putText(canvas, '-Z to camera', (origin[0] - 43, origin[1] - radius - 8),
+                0, 0.36, (255, 180, 80), 1, cv2.LINE_AA)
+    cv2.drawMarker(canvas, origin, (255, 180, 80),
+                   markerType=cv2.MARKER_CROSS, markerSize=12,
+                   thickness=1)
+
+    shown = axis_directions[:5]
+    for idx, item in enumerate(shown):
+        normal = item.get('axis_direction')
+        if normal is None:
+            continue
+        cls_name = item.get('class', 'axis')
+        source = item.get('source', '')
+        nx, ny, nz = [float(v) for v in normal]
+        align = float(np.clip(-nz, 0.0, 1.0))
+        if align >= 0.9:
+            color = (80, 255, 80)
+        elif align >= 0.65:
+            color = (0, 220, 255)
+        else:
+            color = (0, 80, 255)
+
+        px = int(round(origin[0] + np.clip(nx, -1.0, 1.0) * radius))
+        py = int(round(origin[1] + np.clip(ny, -1.0, 1.0) * radius))
+        cv2.arrowedLine(canvas, origin, (px, py), color, 2,
+                        cv2.LINE_AA, tipLength=0.22)
+        dot_radius = int(round(4 + 7 * align))
+        cv2.circle(canvas, (px, py), dot_radius, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (px, py), dot_radius, (20, 20, 20), 1, cv2.LINE_AA)
+
+        tx = x1 + 145
+        ty = y1 + 48 + idx * 24
+        label = f'{cls_name}[{source}] ({nx:.2f},{ny:.2f},{nz:.2f})'
+        cv2.putText(canvas, label, (tx, ty),
+                    0, 0.38, color, 1, cv2.LINE_AA)
+
+    if len(axis_directions) > len(shown):
+        cv2.putText(canvas, f'+{len(axis_directions) - len(shown)} more',
+                    (x1 + 145, y2 - 12), 0, 0.38,
+                    (210, 210, 210), 1, cv2.LINE_AA)
+
+
 def _fit_axis_from_points(points, fallback_axis):
     """用 PCA 拟合目标行方向，并固定为从左到右。"""
     pts = np.array(points, dtype=np.float64)
@@ -1324,6 +1397,8 @@ class PanelDetectionNode(Node):
                             color=(0, 255, 255))
                     elif det.class_name != 'nut' or not reliable_nut:
                         draw_hex_angle(canvas, det.bbox, hex_angle)
+
+        _draw_axis_3d_view(canvas, axis_directions)
 
         # 发布带编号的检测结果
         if targets_output:
