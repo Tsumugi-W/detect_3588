@@ -224,8 +224,8 @@ def get_masked_robust_depth(depth_image, mask, depth_scale=0.001,
     return float(np.percentile(valid, q * 100.0)) * depth_scale
 
 
-def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100,
-                     ransac_thresh=0.005, random_seed=0):
+def fit_plane_ransac_quality(points_3d, min_points=50, ransac_iter=100,
+                             ransac_thresh=0.005, random_seed=0):
     """
     RANSAC + SVD 平面拟合
 
@@ -237,7 +237,7 @@ def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100,
         random_seed: 固定随机种子，避免同一帧点云多次拟合结果抖动
 
     Returns:
-        (normal, centroid) 或 None
+        (normal, centroid, inlier_count, inlier_ratio, rms_error) 或 None
     """
     if len(points_3d) < min_points:
         return None
@@ -274,6 +274,37 @@ def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100,
     normal = Vt[2]
     if normal[2] > 0:
         normal = -normal
+    residuals = np.abs((inlier_pts - centroid) @ normal)
+    rms_error = float(np.sqrt(np.mean(residuals ** 2))) if len(residuals) else 0.0
+    inlier_ratio = float(best_inliers) / float(len(points_3d))
+    return normal, centroid, int(best_inliers), inlier_ratio, rms_error
+
+
+def fit_plane_ransac(points_3d, min_points=50, ransac_iter=100,
+                     ransac_thresh=0.005, random_seed=0):
+    """
+    RANSAC + SVD 平面拟合
+
+    Args:
+        points_3d: (N, 3) 点云数组
+        min_points: 最少内点数
+        ransac_iter: RANSAC 迭代次数
+        ransac_thresh: 内点距离阈值（米）
+        random_seed: 固定随机种子，避免同一帧点云多次拟合结果抖动
+
+    Returns:
+        (normal, centroid) 或 None
+    """
+    result = fit_plane_ransac_quality(
+        points_3d,
+        min_points=min_points,
+        ransac_iter=ransac_iter,
+        ransac_thresh=ransac_thresh,
+        random_seed=random_seed,
+    )
+    if result is None:
+        return None
+    normal, centroid, _, _, _ = result
     return normal, centroid
 
 
@@ -556,6 +587,65 @@ def estimate_object_axis_direction(depth_image, depth_intrin, bbox,
     return normal, centroid, int(len(points_3d))
 
 
+def estimate_valve_wheel_axis_direction(depth_image, depth_intrin, bbox,
+                                        depth_scale=0.001,
+                                        sample_stride=1,
+                                        min_points=36,
+                                        min_abs_z=0.55):
+    """
+    Estimate a hollow valve wheel axis from the wheel itself.
+
+    Valve wheels are hollow, so surrounding-plane fitting is unreliable.  This
+    samples only the wheel's annular region inside the detection bbox, removes
+    the central opening, keeps the near depth cluster, and fits the wheel plane.
+    """
+    if depth_image is None or depth_intrin is None:
+        return None
+
+    h, w = depth_image.shape[:2]
+    mask = _valve_annulus_mask((h, w), bbox)
+    valid = (mask > 0) & (depth_image > 0)
+    raw_depths = depth_image[valid].astype(np.float64)
+    if raw_depths.size < min_points:
+        return None
+
+    lo, hi = np.percentile(raw_depths, [2, 55])
+    depth_band = valid & (depth_image >= lo) & (depth_image <= hi)
+    ys, xs = np.where(depth_band)
+    if len(xs) < min_points:
+        lo, hi = np.percentile(raw_depths, [2, 70])
+        depth_band = valid & (depth_image >= lo) & (depth_image <= hi)
+        ys, xs = np.where(depth_band)
+    if len(xs) < min_points:
+        return None
+
+    step = max(1, int(sample_stride))
+    ys = ys[::step]
+    xs = xs[::step]
+    if len(xs) < min_points:
+        ys, xs = np.where(depth_band)
+    if len(xs) < min_points:
+        return None
+
+    depths = depth_image[ys, xs].astype(np.float64) * depth_scale
+    pixels = np.column_stack([xs, ys])
+    points_3d = deproject_pixels_to_points(depth_intrin, pixels, depths)
+
+    result = fit_plane_ransac(
+        points_3d,
+        min_points=min(min_points, len(points_3d)),
+        ransac_iter=120,
+        ransac_thresh=0.006,
+        random_seed=0,
+    )
+    if result is None:
+        return None
+    normal, centroid = result
+    if abs(float(normal[2])) < float(min_abs_z):
+        return None
+    return normal, centroid, int(len(points_3d))
+
+
 def estimate_mounting_plane_axis_direction(depth_image, depth_intrin, bbox,
                                            all_bboxes=None,
                                            depth_scale=0.001,
@@ -641,6 +731,152 @@ def estimate_mounting_plane_axis_direction(depth_image, depth_intrin, bbox,
         return None
     normal, centroid = result
     return normal, centroid, int(len(points_3d))
+
+
+def estimate_fastener_patch_axis_direction(depth_image, depth_intrin, bbox,
+                                           all_bboxes=None,
+                                           depth_scale=0.001,
+                                           expand_ratio=1.8,
+                                           object_margin_ratio=0.10,
+                                           seed_ring_ratio=0.22,
+                                           depth_window_m=0.08,
+                                           sample_stride=2,
+                                           min_points=45,
+                                           min_inlier_ratio=0.55,
+                                           max_rms_m=0.010,
+                                           min_abs_z=0.45):
+    """
+    Estimate bolt/nut axis from a depth-continuous local mounting patch.
+
+    This is stricter than estimate_mounting_plane_axis_direction: it seeds from
+    a thin ring just outside the target bbox, keeps only a depth-continuous
+    connected component, and rejects low-quality plane fits.
+    """
+    if depth_image is None or depth_intrin is None:
+        return None
+
+    h, w = depth_image.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    pad = max(bw, bh) * float(expand_ratio)
+
+    rx1 = max(0, int(round(x1 - pad)))
+    ry1 = max(0, int(round(y1 - pad)))
+    rx2 = min(w, int(round(x2 + pad)))
+    ry2 = min(h, int(round(y2 + pad)))
+    if rx2 - rx1 < 8 or ry2 - ry1 < 8:
+        return None
+
+    candidate = np.zeros((h, w), dtype=np.uint8)
+    candidate[ry1:ry2, rx1:rx2] = 1
+
+    boxes = all_bboxes or [bbox]
+    for b in boxes:
+        bx1, by1, bx2, by2 = [float(v) for v in b]
+        bbw = max(1.0, bx2 - bx1)
+        bbh = max(1.0, by2 - by1)
+        margin = max(bbw, bbh) * float(object_margin_ratio)
+        ex1 = max(0, int(round(bx1 - margin)))
+        ey1 = max(0, int(round(by1 - margin)))
+        ex2 = min(w, int(round(bx2 + margin)))
+        ey2 = min(h, int(round(by2 + margin)))
+        candidate[ey1:ey2, ex1:ex2] = 0
+
+    ring_margin = max(2.0, max(bw, bh) * float(seed_ring_ratio))
+    ox1 = max(0, int(round(x1 - ring_margin)))
+    oy1 = max(0, int(round(y1 - ring_margin)))
+    ox2 = min(w, int(round(x2 + ring_margin)))
+    oy2 = min(h, int(round(y2 + ring_margin)))
+    ix1 = max(0, int(round(x1)))
+    iy1 = max(0, int(round(y1)))
+    ix2 = min(w, int(round(x2)))
+    iy2 = min(h, int(round(y2)))
+    seed_mask = np.zeros((h, w), dtype=bool)
+    seed_mask[oy1:oy2, ox1:ox2] = True
+    seed_mask[iy1:iy2, ix1:ix2] = False
+    seed_mask &= candidate.astype(bool)
+
+    seed_depths = depth_image[seed_mask & (depth_image > 0)].astype(np.float64)
+    if seed_depths.size < max(8, min_points // 5):
+        return None
+    lo, hi = np.percentile(seed_depths, [15, 85])
+    trimmed = seed_depths[(seed_depths >= lo) & (seed_depths <= hi)]
+    if trimmed.size >= max(8, min_points // 5):
+        seed_depths = trimmed
+    seed_depth = float(np.median(seed_depths))
+    depth_window_raw = max(1.0, float(depth_window_m) / float(depth_scale))
+
+    valid = (
+        candidate.astype(bool)
+        & (depth_image > 0)
+        & (np.abs(depth_image.astype(np.float64) - seed_depth) <= depth_window_raw)
+    )
+    valid_roi = valid[ry1:ry2, rx1:rx2].astype(np.uint8)
+    if int(np.count_nonzero(valid_roi)) < min_points:
+        return None
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        valid_roi, connectivity=8)
+    if num_labels <= 1:
+        return None
+
+    seed_roi = seed_mask[ry1:ry2, rx1:rx2]
+    best_label = 0
+    best_score = -1.0
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_points:
+            continue
+        component = labels == label
+        seed_overlap = int(np.count_nonzero(component & seed_roi))
+        if seed_overlap == 0:
+            continue
+        score = float(seed_overlap) * 4.0 + float(area)
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    if best_label == 0:
+        return None
+
+    component_roi = labels == best_label
+    ys_roi, xs_roi = np.where(component_roi)
+    if len(xs_roi) < min_points:
+        return None
+    xs = xs_roi + rx1
+    ys = ys_roi + ry1
+
+    step = max(1, int(sample_stride))
+    xs_sample = xs[::step]
+    ys_sample = ys[::step]
+    if len(xs_sample) < min_points:
+        xs_sample = xs
+        ys_sample = ys
+    if len(xs_sample) < min_points:
+        return None
+
+    depths = depth_image[ys_sample, xs_sample].astype(np.float64) * depth_scale
+    pixels = np.column_stack([xs_sample, ys_sample])
+    points_3d = deproject_pixels_to_points(depth_intrin, pixels, depths)
+
+    result = fit_plane_ransac_quality(
+        points_3d,
+        min_points=min(min_points, len(points_3d)),
+        ransac_iter=140,
+        ransac_thresh=0.007,
+        random_seed=0,
+    )
+    if result is None:
+        return None
+    normal, centroid, inlier_count, inlier_ratio, rms_error = result
+    if abs(float(normal[2])) < float(min_abs_z):
+        return None
+    if float(inlier_ratio) < float(min_inlier_ratio):
+        return None
+    if float(rms_error) > float(max_rms_m):
+        return None
+    return normal, centroid, int(inlier_count)
 
 
 def compute_panel_normal(color_image, depth_image, depth_intrin,

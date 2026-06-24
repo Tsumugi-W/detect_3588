@@ -34,8 +34,9 @@ from .depth_utils import (
     filter_depth, get_robust_depth, get_bbox_robust_depth, get_masked_robust_depth,
     compute_panel_normal, estimate_fastener_group_axis_direction,
     estimate_fastener_line_constrained_axis,
-    estimate_mounting_plane_axis_direction,
+    estimate_fastener_patch_axis_direction,
     estimate_object_axis_direction,
+    estimate_valve_wheel_axis_direction,
 )
 from .knob_angle import estimate_knob_angle, draw_knob_angle, estimate_hex_angle, draw_hex_angle
 from .nut_localizer import localize_nut
@@ -1310,52 +1311,70 @@ class PanelDetectionNode(Node):
                 loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
                 reliable_nut = loc is not None and loc.confidence >= 0.45
 
-                axis_source = 'fastener_current'
-                axis_result = estimate_fastener_group_axis_direction(
-                    (det.center_x, det.center_y),
-                    axis_candidate_points,
-                    max_distance_px=max(140.0, 3.5 * max(det.bbox[2] - det.bbox[0],
-                                                         det.bbox[3] - det.bbox[1])),
-                    min_points=3,
-                    max_points=6,
-                )
-                if axis_result is None:
-                    axis_source = 'local_mount_plane'
-                    axis_result = estimate_mounting_plane_axis_direction(
+                if det.class_name == 'valve':
+                    axis_source = 'valve_wheel'
+                    axis_result = estimate_valve_wheel_axis_direction(
                         filtered_depth,
                         deproj_intrin,
                         det.bbox,
-                        all_bboxes=xyxy_list,
                         depth_scale=self._depth_scale,
                     )
-                    if axis_result is not None:
-                        constrained = estimate_fastener_line_constrained_axis(
-                            (det.center_x, det.center_y),
-                            axis_candidate_points,
-                            axis_result[0],
-                            max_distance_px=max(
-                                140.0,
-                                3.5 * max(det.bbox[2] - det.bbox[0],
-                                          det.bbox[3] - det.bbox[1])),
+                    if axis_result is None:
+                        axis_source = 'valve_depth'
+                        axis_result = estimate_object_axis_direction(
+                            filtered_depth,
+                            deproj_intrin,
+                            det.bbox,
+                            depth_scale=self._depth_scale,
+                            object_class=det.class_name,
                         )
-                        if constrained is not None:
-                            axis_result = constrained
-                            axis_source = 'fastener_line'
-                if axis_result is None and self._panel_normal_cache is not None:
-                    axis_normal, axis_centroid = self._panel_normal_cache
-                    axis_points = 0
-                    axis_result = (axis_normal, axis_centroid, axis_points)
-                    axis_source = 'panel_plane'
-                if axis_result is None:
-                    axis_result = estimate_object_axis_direction(
-                        filtered_depth,
-                        deproj_intrin,
-                        det.bbox,
-                        depth_scale=self._depth_scale,
-                        mask=loc.depth_mask if reliable_nut else None,
-                        object_class=det.class_name,
+                else:
+                    axis_source = 'fastener_current'
+                    axis_result = estimate_fastener_group_axis_direction(
+                        (det.center_x, det.center_y),
+                        axis_candidate_points,
+                        max_distance_px=max(140.0, 3.5 * max(det.bbox[2] - det.bbox[0],
+                                                             det.bbox[3] - det.bbox[1])),
+                        min_points=3,
+                        max_points=6,
                     )
-                    axis_source = 'local_depth'
+                    if axis_result is None:
+                        axis_source = 'local_patch_plane'
+                        axis_result = estimate_fastener_patch_axis_direction(
+                            filtered_depth,
+                            deproj_intrin,
+                            det.bbox,
+                            all_bboxes=xyxy_list,
+                            depth_scale=self._depth_scale,
+                        )
+                        if axis_result is not None:
+                            constrained = estimate_fastener_line_constrained_axis(
+                                (det.center_x, det.center_y),
+                                axis_candidate_points,
+                                axis_result[0],
+                                max_distance_px=max(
+                                    140.0,
+                                    3.5 * max(det.bbox[2] - det.bbox[0],
+                                              det.bbox[3] - det.bbox[1])),
+                            )
+                            if constrained is not None:
+                                axis_result = constrained
+                                axis_source = 'fastener_line'
+                    if axis_result is None and self._panel_normal_cache is not None:
+                        axis_normal, axis_centroid = self._panel_normal_cache
+                        axis_points = 0
+                        axis_result = (axis_normal, axis_centroid, axis_points)
+                        axis_source = 'panel_plane'
+                    if axis_result is None:
+                        axis_result = estimate_object_axis_direction(
+                            filtered_depth,
+                            deproj_intrin,
+                            det.bbox,
+                            depth_scale=self._depth_scale,
+                            mask=loc.depth_mask if reliable_nut else None,
+                            object_class=det.class_name,
+                        )
+                        axis_source = 'local_depth'
                 if axis_result is not None:
                     axis_normal, axis_centroid, axis_points = axis_result
                     axis_directions.append({

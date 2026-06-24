@@ -289,7 +289,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 }
 ```
 
-角度以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。`axis_direction` 是相机坐标系下的单位方向向量，指向相机方向时 z 为负。螺栓、螺母、阀门优先使用当前帧附近同平面器件的 3D 点拟合安装平面，`source` 为 `fastener_current`；如果只有两个邻近点，则用两点连线约束局部安装面法向量，`source` 为 `fastener_line`；再往后依次回退到目标周边局部安装面 `local_mount_plane`、全局面板平面 `panel_plane` 和局部目标深度 `local_depth`。
+角度以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。`axis_direction` 是相机坐标系下的单位方向向量，指向相机方向时 z 为负。阀门优先使用手轮自身环形近深度点拟合轴线，`source` 为 `valve_wheel`；失败时只回退到阀门 bbox 内部环形深度，`source` 为 `valve_depth`，不会使用周围安装平面。螺栓、螺母优先使用当前帧附近同平面器件的 3D 点拟合安装平面，`source` 为 `fastener_current`；如果只有两个邻近点，则用两点连线约束局部安装面法向量，`source` 为 `fastener_line`；再往后使用目标外侧深度连续 patch 拟合局部安装面，`source` 为 `local_patch_plane`，该结果会按 z 分量、RANSAC 内点比例和残差做质量门控；最后才回退到全局面板平面 `panel_plane` 和局部目标深度 `local_depth`。
 
 ### /panel/distance (String, JSON) — 相机到面板平面的垂直距离
 
