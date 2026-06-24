@@ -382,9 +382,9 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0612.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_model: '0624.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
 onnx_threads: 8
-# rknn_model: '0612.rknn'      # inference_backend='rknn' 时使用
+# rknn_model: '0624.rknn'      # inference_backend='rknn' 时使用
 
 class_num: 8
 class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button', 'door_button']
@@ -451,8 +451,8 @@ ros2_ws/
             ├── detector_onnx.py
             ├── detector_rknn.py
             ├── knob_angle.py
-            ├── 0612.onnx
-            └── 0612.pt
+            ├── 0624.onnx
+            └── 0624.pt
 ```
 
 ## 常见问题
