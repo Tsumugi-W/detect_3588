@@ -13,6 +13,8 @@ panel_test_bag_*/
 ref*.png
 Screenshot*.png
 *_report.png
+axis_reference_log.jsonl
+axis_error_frames/
 *.pt
 .claude/
 src/panel_detection/panel_detection/weights_archive/

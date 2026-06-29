@@ -163,6 +163,8 @@ ros2 bag play panel_test_bag_2 \
   -r 0.5
 ```
 
+当画面中同时出现完整阀门和 AprilTag 参考板时，检测节点会把阀门轴线与参考板深度平面法向量的对比结果写入 `axis_reference_log.jsonl`。每行包含 ROS 时间戳、两组法向量、夹角误差、参考板 RANSAC 内点比例和残差，可用来回到 bag 对应时间点排查误差帧。阀门 bbox 贴近图像边缘时视为不完整，不参与轴线精度统计。
+
 **旋钮角度模式**
 
 ```bash
@@ -274,6 +276,12 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
       "bbox": [510.0, 260.0, 560.0, 310.0],
       "hex_angle": 28.4,
       "nut_refined_conf": 0.81
+    },
+    {
+      "class": "valve",
+      "bbox": [620.0, 240.0, 700.0, 320.0],
+      "hex_angle": 12.5,
+      "valve_angle": 12.5
     }
   ],
   "axis_directions": [
@@ -289,7 +297,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 }
 ```
 
-角度以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。`axis_direction` 是相机坐标系下的单位方向向量，指向相机方向时 z 为负。阀门优先使用手轮自身环形近深度点拟合轴线，`source` 为 `valve_wheel`；失败时只回退到阀门 bbox 内部环形深度，`source` 为 `valve_depth`，不会使用周围安装平面。螺栓、螺母优先使用当前帧附近同平面器件的 3D 点拟合安装平面，`source` 为 `fastener_current`；如果只有两个邻近点，则用两点连线约束局部安装面法向量，`source` 为 `fastener_line`；再往后使用目标外侧深度连续 patch 拟合局部安装面，`source` 为 `local_patch_plane`，该结果会按 z 分量、RANSAC 内点比例和残差做质量门控；最后才回退到全局面板平面 `panel_plane` 和局部目标深度 `local_depth`。
+旋钮 `angle` 以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。螺栓/螺母 `hex_angle` 是六边形相对画面水平线的对称角，范围 [0, 60)。阀门 `valve_angle` 使用红色十字/外八边形角点方向估计，是相对画面水平线的对称角，范围 [0, 45)；为兼容旧字段，同一数值也放在 `hex_angle` 中。`axis_direction` 是相机坐标系下的单位方向向量，指向相机方向时 z 为负。阀门只使用手轮自身环形深度点拟合轴线，`source` 为 `valve_wheel`；质量门控失败或阀门贴边不完整时不输出阀门轴线，不使用周围安装平面或 bbox 整体深度回退。螺栓、螺母优先使用当前帧附近同平面器件的 3D 点拟合安装平面，`source` 为 `fastener_current`；如果只有两个邻近点，则用两点连线约束局部安装面法向量，`source` 为 `fastener_line`；再往后使用目标外侧深度连续 patch 拟合局部安装面，`source` 为 `local_patch_plane`，该结果会按 z 分量、RANSAC 内点比例和残差做质量门控；最后才回退到全局面板平面 `panel_plane` 和局部目标深度 `local_depth`。调试时如果画面中有 AprilTag 板，节点会额外输出 `axis_reference`，用 tag 内部深度平面法向量和阀门轴线计算 `reference_angle_deg`，该参考只用于精度评估，不参与正式阀门轴线估计。
 
 ### /panel/distance (String, JSON) — 相机到面板平面的垂直距离
 

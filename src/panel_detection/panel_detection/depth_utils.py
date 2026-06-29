@@ -591,7 +591,9 @@ def estimate_valve_wheel_axis_direction(depth_image, depth_intrin, bbox,
                                         depth_scale=0.001,
                                         sample_stride=1,
                                         min_points=36,
-                                        min_abs_z=0.55):
+                                        min_abs_z=0.45,
+                                        min_inlier_ratio=0.45,
+                                        max_rms_m=0.012):
     """
     Estimate a hollow valve wheel axis from the wheel itself.
 
@@ -609,11 +611,14 @@ def estimate_valve_wheel_axis_direction(depth_image, depth_intrin, bbox,
     if raw_depths.size < min_points:
         return None
 
-    lo, hi = np.percentile(raw_depths, [2, 55])
+    # Keep most of the wheel depth gradient.  A tilted wheel has a real near/far
+    # depth spread; trimming to only the nearest cluster biases the normal
+    # toward -Z.  RANSAC handles the remaining hollow/background outliers.
+    lo, hi = np.percentile(raw_depths, [2, 92])
     depth_band = valid & (depth_image >= lo) & (depth_image <= hi)
     ys, xs = np.where(depth_band)
     if len(xs) < min_points:
-        lo, hi = np.percentile(raw_depths, [2, 70])
+        lo, hi = np.percentile(raw_depths, [1, 97])
         depth_band = valid & (depth_image >= lo) & (depth_image <= hi)
         ys, xs = np.where(depth_band)
     if len(xs) < min_points:
@@ -631,19 +636,23 @@ def estimate_valve_wheel_axis_direction(depth_image, depth_intrin, bbox,
     pixels = np.column_stack([xs, ys])
     points_3d = deproject_pixels_to_points(depth_intrin, pixels, depths)
 
-    result = fit_plane_ransac(
+    result = fit_plane_ransac_quality(
         points_3d,
         min_points=min(min_points, len(points_3d)),
-        ransac_iter=120,
-        ransac_thresh=0.006,
+        ransac_iter=160,
+        ransac_thresh=0.008,
         random_seed=0,
     )
     if result is None:
         return None
-    normal, centroid = result
+    normal, centroid, inlier_count, inlier_ratio, rms_error = result
     if abs(float(normal[2])) < float(min_abs_z):
         return None
-    return normal, centroid, int(len(points_3d))
+    if float(inlier_ratio) < float(min_inlier_ratio):
+        return None
+    if float(rms_error) > float(max_rms_m):
+        return None
+    return normal, centroid, int(inlier_count)
 
 
 def estimate_mounting_plane_axis_direction(depth_image, depth_intrin, bbox,

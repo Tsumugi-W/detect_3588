@@ -1006,6 +1006,120 @@ def estimate_hex_angle(color_roi: np.ndarray, circle_mask_ratio: float = 0.9,
     return mean_deg
 
 
+def _normalize_symmetric_horizontal_angle(angle_deg, sym_angle):
+    angle = float(angle_deg) % 180.0
+    angle = angle % float(sym_angle)
+    if angle < 0:
+        angle += float(sym_angle)
+    return angle
+
+
+def estimate_valve_angle(color_roi: np.ndarray,
+                         circle_mask_ratio: float = 0.92) -> float | None:
+    """
+    Estimate valve wheel rotation relative to the image horizontal axis.
+
+    Valve wheels in this panel have a red cross/spoke structure whose outer
+    connection points align with the octagon vertices.  The returned angle is
+    normalized by the octagon symmetry to [0, 45) degrees.
+    """
+    if color_roi is None or color_roi.size == 0:
+        return None
+    h, w = color_roi.shape[:2]
+    if h < 20 or w < 20:
+        return None
+
+    cx, cy = w // 2, h // 2
+    radius = int(min(cx, cy) * circle_mask_ratio)
+    hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    circle = dist <= radius
+    red = (
+        ((hue <= 12) | (hue >= 168)) &
+        (sat >= 55) &
+        (val >= 35) &
+        circle &
+        (dist >= radius * 0.12)
+    )
+    binary = red.astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    if int(np.count_nonzero(binary)) < max(40, int(math.pi * radius * radius * 0.025)):
+        return estimate_hex_angle(color_roi, circle_mask_ratio=circle_mask_ratio, n_sides=8)
+
+    edges = cv2.Canny(binary, 50, 150)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180,
+        threshold=max(12, int(radius * 0.22)),
+        minLineLength=max(10, int(radius * 0.28)),
+        maxLineGap=max(4, int(radius * 0.10)),
+    )
+
+    candidates = []
+    center = np.array([cx, cy], dtype=np.float64)
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = [float(v) for v in line[0]]
+            p1 = np.array([x1, y1], dtype=np.float64)
+            p2 = np.array([x2, y2], dtype=np.float64)
+            vec = p2 - p1
+            length = float(np.linalg.norm(vec))
+            if length < max(10.0, radius * 0.28):
+                continue
+            axis = vec / max(length, 1e-9)
+            center_dist = _line_distance_to_point((p1 + p2) * 0.5, axis, center)
+            if center_dist > radius * 0.22:
+                continue
+            midpoint_dist = float(np.linalg.norm((p1 + p2) * 0.5 - center))
+            if midpoint_dist > radius * 0.72:
+                continue
+            angle = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
+            candidates.append((angle, length))
+
+    if candidates:
+        sym_angle = 45.0
+        scale = 360.0 / sym_angle
+        sin_sum = 0.0
+        cos_sum = 0.0
+        for angle, weight in candidates:
+            angle_m = _normalize_symmetric_horizontal_angle(angle, sym_angle)
+            rad = math.radians(angle_m * scale)
+            sin_sum += math.sin(rad) * weight
+            cos_sum += math.cos(rad) * weight
+        if abs(sin_sum) > 1e-6 or abs(cos_sum) > 1e-6:
+            mean = math.degrees(math.atan2(sin_sum, cos_sum)) / scale
+            if mean < 0:
+                mean += sym_angle
+            return float(mean)
+
+    # Fallback: use red pixels near the outer wheel, where spoke endpoints and
+    # octagon vertices dominate.  This is less precise than Hough lines but
+    # still follows the valve-specific red geometry.
+    outer = red & (dist >= radius * 0.45) & (dist <= radius * 0.98)
+    ys, xs = np.where(outer)
+    if len(xs) >= 30:
+        angles = np.degrees(np.arctan2(ys - cy, xs - cx)) % 180.0
+        sym_angle = 45.0
+        scale = 360.0 / sym_angle
+        rads = np.radians((angles % sym_angle) * scale)
+        sin_sum = float(np.sum(np.sin(rads)))
+        cos_sum = float(np.sum(np.cos(rads)))
+        if abs(sin_sum) > 1e-6 or abs(cos_sum) > 1e-6:
+            mean = math.degrees(math.atan2(sin_sum, cos_sum)) / scale
+            if mean < 0:
+                mean += sym_angle
+            return float(mean)
+
+    return estimate_hex_angle(color_roi, circle_mask_ratio=circle_mask_ratio, n_sides=8)
+
+
 def draw_hex_angle(image, bbox, angle, color=(0, 0, 0), thickness=1):
     """
     在图像上绘制六边形角度标注

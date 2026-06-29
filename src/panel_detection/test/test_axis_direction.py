@@ -70,6 +70,40 @@ def test_valve_wheel_axis_uses_near_annulus_not_hollow_center():
     assert abs(centroid[2] - 1.0) < 0.02
 
 
+def test_valve_wheel_axis_keeps_tilted_ring_depth_gradient():
+    intrin = _intrinsics()
+    yy, xx = np.mgrid[0:120, 0:120]
+    cx, cy = 60, 60
+    radius = np.hypot(xx - cx, yy - cy)
+    depth = np.full((120, 120), 1800, dtype=np.uint16)
+
+    expected = np.array([0.0, 0.5, -0.8660254], dtype=np.float64)
+    x_norm = (xx - intrin.cx) / intrin.fx
+    y_norm = (yy - intrin.cy) / intrin.fy
+    z0 = 1.0
+    denom = expected[0] * x_norm + expected[1] * y_norm + expected[2]
+    plane_depth_m = expected[2] * z0 / denom
+    ring = (radius >= 16) & (radius <= 28)
+    depth[ring] = np.round(plane_depth_m[ring] / 0.001).astype(np.uint16)
+    depth[radius < 13] = 1650
+
+    result = estimate_valve_wheel_axis_direction(
+        depth,
+        intrin,
+        bbox=(30, 30, 90, 90),
+        depth_scale=0.001,
+        sample_stride=1,
+        min_points=20,
+    )
+
+    assert result is not None
+    normal, _, _ = result
+    if np.dot(normal, expected) < 0:
+        normal = -normal
+    angle = np.degrees(np.arccos(np.clip(np.dot(normal, expected), -1.0, 1.0)))
+    assert angle < 8.0
+
+
 def test_bolt_axis_estimates_front_face_normal():
     depth = np.full((100, 100), 900, dtype=np.uint16)
 

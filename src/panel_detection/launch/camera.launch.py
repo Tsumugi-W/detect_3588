@@ -32,6 +32,9 @@ def generate_launch_description():
             'depth_height': '720',
             'depth_fps': '30',
             'interleave_ae_mode': 'none',
+            # Disable Orbbec diagnostics updater to avoid unsupported
+            # OB_STRUCT_DEVICE_TEMPERATURE queries on some firmware versions.
+            'diagnostic_period': '0.0',
         }.items(),
     )
 

@@ -27,6 +27,10 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from sensor_msgs.msg import Image, CameraInfo
 
+from .apriltag_reference import (
+    angle_between_normals_deg,
+    detect_apriltag_reference_axis,
+)
 from .camera import create_backend
 from .camera.base import CameraIntrinsics
 from .depth_utils import (
@@ -38,7 +42,10 @@ from .depth_utils import (
     estimate_object_axis_direction,
     estimate_valve_wheel_axis_direction,
 )
-from .knob_angle import estimate_knob_angle, draw_knob_angle, estimate_hex_angle, draw_hex_angle
+from .knob_angle import (
+    estimate_knob_angle, draw_knob_angle, estimate_hex_angle,
+    estimate_valve_angle, draw_hex_angle,
+)
 from .nut_localizer import localize_nut
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
@@ -69,6 +76,27 @@ DEFAULT_CONFIG = {
                    'min_proj_margin': 450.0},
     'panel_normal_interval': 10,
     'topic_sync': {'max_dt': 0.05, 'registered_depth': True},
+    'valve_axis': {
+        'edge_margin_px': 4,
+    },
+    'apriltag_reference': {
+        'enable': True,
+        'dictionary': 'DICT_APRILTAG_36h11',
+        'sample_stride': 3,
+        'border_margin_ratio': 0.12,
+        'min_points': 80,
+        'ransac_thresh': 0.008,
+        'min_inlier_ratio': 0.45,
+        'max_rms_m': 0.012,
+        'min_abs_z': 0.50,
+        'fallback_enable': True,
+        'fallback_min_point_count': 2000,
+        'fallback_min_inlier_ratio': 0.75,
+        'fallback_min_white_border_ratio': 0.45,
+        'fallback_white_thresh': 150,
+        'log_enable': True,
+        'log_path': 'axis_reference_log.jsonl',
+    },
 }
 
 CLASS_TOPIC_MAP = {
@@ -185,6 +213,13 @@ def _is_button_like_detection(det):
     return 0.55 <= aspect <= 1.8
 
 
+def _bbox_inside_image(bbox, image_shape, margin_px=4):
+    h, w = image_shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    margin = float(margin_px)
+    return x1 > margin and y1 > margin and x2 < (w - margin) and y2 < (h - margin)
+
+
 def _publish_pose(pub, stamp, xyz, quat):
     if pub is None or xyz is None:
         return
@@ -224,6 +259,33 @@ def _draw_axis_direction(canvas, bbox, normal, label='axis',
     text_y = max(15, y1 - 24)
     cv2.putText(canvas, text, (x1, text_y), 0, 0.42,
                 color, 1, cv2.LINE_AA)
+
+
+def _draw_apriltag_reference(canvas, reference, valve_errors=None):
+    if reference is None:
+        return
+    pts = np.round(reference['corners']).astype(np.int32)
+    cv2.polylines(canvas, [pts], True, (0, 180, 255), 2, cv2.LINE_AA)
+    center = np.mean(pts, axis=0).astype(int)
+    normal = reference['normal']
+    _draw_axis_direction(
+        canvas,
+        (center[0] - 24, center[1] - 24, center[0] + 24, center[1] + 24),
+        normal,
+        label=f"tag_ref[{reference['tag_id']}]",
+        color=(0, 180, 255),
+    )
+    lines = [
+        f"{reference['source']} n=({normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f})",
+        f"inlier={reference['inlier_ratio']:.2f} rms={reference['rms_error']*1000:.1f}mm",
+    ]
+    for err in valve_errors or []:
+        lines.append(f"valve diff={err['angle_deg']:.1f}deg")
+    x = int(np.min(pts[:, 0]))
+    y = int(np.max(pts[:, 1])) + 18
+    for i, text in enumerate(lines[:5]):
+        cv2.putText(canvas, text, (x, y + i * 16), 0, 0.42,
+                    (0, 180, 255), 1, cv2.LINE_AA)
 
 
 def _regular_polygon_points(bbox, n_sides, edge_angle_deg=0.0):
@@ -587,6 +649,8 @@ class PanelDetectionNode(Node):
         self._topic_depth = None
         self._topic_color_stamp = None
         self._topic_depth_stamp = None
+        self._topic_color_stamp_msg = None
+        self._topic_depth_stamp_msg = None
         self._topic_color_intrin = None
         self._topic_depth_intrin = None
         self._topic_frame_lock = threading.Lock()
@@ -665,6 +729,19 @@ class PanelDetectionNode(Node):
         self._frame_count = 0
         self._normal_interval = self.cfg.get('panel_normal_interval', 10)
         self._last_status_publish_time = 0.0
+        ref_cfg = self.cfg.get('apriltag_reference', {})
+        self._axis_ref_log_fp = None
+        self._axis_ref_log_path = ''
+        if ref_cfg.get('log_enable', True):
+            self._axis_ref_log_path = os.path.abspath(
+                ref_cfg.get('log_path', 'axis_reference_log.jsonl'))
+            try:
+                self._axis_ref_log_fp = open(self._axis_ref_log_path, 'w',
+                                             encoding='utf-8', buffering=1)
+                self.get_logger().info(
+                    f'AprilTag 参考轴线日志: {self._axis_ref_log_path}')
+            except OSError as exc:
+                self.get_logger().warn(f'无法写入参考轴线日志: {exc}')
 
         # 重连
         self._reconnect_interval = 5.0
@@ -681,6 +758,37 @@ class PanelDetectionNode(Node):
 
         status = '运行中' if self._camera_ready else '等待相机'
         self.get_logger().info(f'面板检测节点已启动 ({status})')
+
+    def _write_axis_reference_log(self, stamp, axis_reference, valve_errors):
+        if self._axis_ref_log_fp is None or axis_reference is None or not valve_errors:
+            return
+        stamp_sec = stamp.sec + stamp.nanosec * 1e-9
+        for err in valve_errors:
+            record = {
+                'stamp': stamp_sec,
+                'stamp_sec': int(stamp.sec),
+                'stamp_nanosec': int(stamp.nanosec),
+                'frame': int(self._frame_count),
+                'reference': {
+                    'source': axis_reference.get('source'),
+                    'tag_id': axis_reference.get('tag_id'),
+                    'normal': axis_reference.get('normal'),
+                    'centroid': axis_reference.get('centroid'),
+                    'point_count': axis_reference.get('point_count'),
+                    'inlier_ratio': axis_reference.get('inlier_ratio'),
+                    'rms_error_m': axis_reference.get('rms_error_m'),
+                },
+                'valve': err,
+            }
+            self._axis_ref_log_fp.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    def destroy_node(self):
+        if self._axis_ref_log_fp is not None:
+            try:
+                self._axis_ref_log_fp.close()
+            finally:
+                self._axis_ref_log_fp = None
+        super().destroy_node()
 
     def _init_subscribers(self):
         """订阅相机话题，检测循环按 header stamp 取近似同步帧。"""
@@ -708,6 +816,7 @@ class PanelDetectionNode(Node):
         with self._topic_frame_lock:
             self._topic_color = image
             self._topic_color_stamp = _stamp_to_sec(msg.header.stamp)
+            self._topic_color_stamp_msg = msg.header.stamp
 
     def _depth_callback(self, msg):
         if msg.encoding in ('16UC1', 'mono16'):
@@ -721,6 +830,7 @@ class PanelDetectionNode(Node):
         with self._topic_frame_lock:
             self._topic_depth = depth
             self._topic_depth_stamp = _stamp_to_sec(msg.header.stamp)
+            self._topic_depth_stamp_msg = msg.header.stamp
 
     def _color_info_callback(self, msg):
         intrin = CameraIntrinsics(
@@ -762,8 +872,8 @@ class PanelDetectionNode(Node):
                 self._topic_depth_intrin,
                 self._topic_color.copy(),
                 self._topic_depth.copy(),
-                self._topic_color_stamp,
-                self._topic_depth_stamp,
+                self._topic_color_stamp_msg,
+                self._topic_depth_stamp_msg,
             )
 
     def _select_deprojection_intrin(self, color_intrin, depth_intrin,
@@ -957,7 +1067,7 @@ class PanelDetectionNode(Node):
             if topic_frames is None:
                 self._publish_status('waiting_topic_frames')
                 return
-            color_intrin, depth_intrin, color_image, depth_image, _, _ = topic_frames
+            color_intrin, depth_intrin, color_image, depth_image, color_stamp, _ = topic_frames
             deproj_intrin = self._select_deprojection_intrin(
                 color_intrin, depth_intrin, color_image.shape, depth_image.shape)
         else:
@@ -966,6 +1076,7 @@ class PanelDetectionNode(Node):
             if color_intrin is None:
                 return
             deproj_intrin = depth_intrin
+            color_stamp = None
 
         if color_image.size == 0 or depth_image.size == 0:
             return
@@ -1014,7 +1125,7 @@ class PanelDetectionNode(Node):
             normal, _ = self._panel_normal_cache
             quat = _normal_to_quaternion(normal)
 
-        stamp = self.get_clock().now().to_msg()
+        stamp = color_stamp if color_stamp is not None else self.get_clock().now().to_msg()
 
         # 构建当前帧的 FrameDetection 列表
         frame_detections = []
@@ -1276,6 +1387,15 @@ class PanelDetectionNode(Node):
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
 
+        apriltag_reference = detect_apriltag_reference_axis(
+            color_image,
+            filtered_depth,
+            deproj_intrin,
+            depth_scale=self._depth_scale,
+            cfg=self.cfg.get('apriltag_reference', {}),
+        )
+        valve_reference_errors = []
+
         # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
         hex_angles = []
         axis_directions = []
@@ -1311,7 +1431,15 @@ class PanelDetectionNode(Node):
                 loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
                 reliable_nut = loc is not None and loc.confidence >= 0.45
 
-                if det.class_name == 'valve':
+                if (det.class_name == 'valve' and not _bbox_inside_image(
+                        det.bbox, color_image.shape,
+                        margin_px=self.cfg.get('valve_axis', {}).get('edge_margin_px', 4))):
+                    axis_source = 'valve_incomplete'
+                    axis_result = None
+                    cv2.putText(canvas, 'valve incomplete',
+                                (x1, min(canvas.shape[0] - 8, y2 + 16)),
+                                0, 0.42, (0, 180, 255), 1, cv2.LINE_AA)
+                elif det.class_name == 'valve':
                     axis_source = 'valve_wheel'
                     axis_result = estimate_valve_wheel_axis_direction(
                         filtered_depth,
@@ -1319,15 +1447,6 @@ class PanelDetectionNode(Node):
                         det.bbox,
                         depth_scale=self._depth_scale,
                     )
-                    if axis_result is None:
-                        axis_source = 'valve_depth'
-                        axis_result = estimate_object_axis_direction(
-                            filtered_depth,
-                            deproj_intrin,
-                            det.bbox,
-                            depth_scale=self._depth_scale,
-                            object_class=det.class_name,
-                        )
                 else:
                     axis_source = 'fastener_current'
                     axis_result = estimate_fastener_group_axis_direction(
@@ -1377,7 +1496,7 @@ class PanelDetectionNode(Node):
                         axis_source = 'local_depth'
                 if axis_result is not None:
                     axis_normal, axis_centroid, axis_points = axis_result
-                    axis_directions.append({
+                    axis_item = {
                         'class': det.class_name,
                         'bbox': det.bbox,
                         'source': axis_source,
@@ -1392,7 +1511,22 @@ class PanelDetectionNode(Node):
                             round(float(axis_centroid[2]), 4),
                         ],
                         'point_count': axis_points,
-                    })
+                    }
+                    if det.class_name == 'valve' and apriltag_reference is not None:
+                        angle_deg = angle_between_normals_deg(
+                            axis_normal, apriltag_reference['normal'])
+                        if angle_deg is not None:
+                            axis_item['reference'] = apriltag_reference['source']
+                            axis_item['reference_angle_deg'] = round(angle_deg, 2)
+                            valve_reference_errors.append({
+                                'bbox': det.bbox,
+                                'source': axis_source,
+                                'normal': axis_item['axis_direction'],
+                                'centroid': axis_item['centroid'],
+                                'point_count': axis_points,
+                                'angle_deg': round(angle_deg, 2),
+                            })
+                    axis_directions.append(axis_item)
                     axis_color = (255, 255, 0) if det.class_name == 'valve' else (255, 0, 255)
                     _draw_axis_direction(
                         canvas, det.bbox, axis_normal,
@@ -1401,21 +1535,50 @@ class PanelDetectionNode(Node):
 
                 hex_angle = loc.angle if reliable_nut and loc.angle is not None else None
                 if hex_angle is None:
-                    hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
+                    if det.class_name == 'valve':
+                        hex_angle = estimate_valve_angle(roi)
+                    else:
+                        hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
                 if hex_angle is not None:
-                    hex_angles.append({
+                    angle_item = {
                         'class': det.class_name,
                         'bbox': det.bbox,
                         'hex_angle': round(hex_angle, 1),
                         **({'nut_refined_conf': round(loc.confidence, 3)}
                            if reliable_nut else {}),
-                    })
+                    }
+                    if det.class_name == 'valve':
+                        angle_item['valve_angle'] = round(hex_angle, 1)
+                    hex_angles.append(angle_item)
                     if det.class_name == 'valve':
                         _draw_regular_polygon(
                             canvas, det.bbox, 8, hex_angle,
                             color=(0, 255, 255))
                     elif det.class_name != 'nut' or not reliable_nut:
                         draw_hex_angle(canvas, det.bbox, hex_angle)
+
+        axis_reference = None
+        if apriltag_reference is not None:
+            axis_reference = {
+                'source': apriltag_reference['source'],
+                'tag_id': apriltag_reference['tag_id'],
+                'normal': [
+                    round(float(apriltag_reference['normal'][0]), 6),
+                    round(float(apriltag_reference['normal'][1]), 6),
+                    round(float(apriltag_reference['normal'][2]), 6),
+                ],
+                'centroid': [
+                    round(float(apriltag_reference['centroid'][0]), 4),
+                    round(float(apriltag_reference['centroid'][1]), 4),
+                    round(float(apriltag_reference['centroid'][2]), 4),
+                ],
+                'point_count': apriltag_reference['point_count'],
+                'inlier_ratio': round(float(apriltag_reference['inlier_ratio']), 4),
+                'rms_error_m': round(float(apriltag_reference['rms_error']), 5),
+                'valve_errors': valve_reference_errors,
+            }
+            _draw_apriltag_reference(canvas, apriltag_reference, valve_reference_errors)
+            self._write_axis_reference_log(stamp, axis_reference, valve_reference_errors)
 
         _draw_axis_3d_view(canvas, axis_directions)
 
@@ -1430,13 +1593,14 @@ class PanelDetectionNode(Node):
 
         # 发布旋钮角度 + 六边形角度 + 目标轴线方向
         all_angles = knob_angles + hex_angles + axis_directions
-        if all_angles:
+        if all_angles or axis_reference is not None:
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp.sec + stamp.nanosec * 1e-9,
                 'knob_angles': knob_angles,
                 'hex_angles': hex_angles,
                 'axis_directions': axis_directions,
+                **({'axis_reference': axis_reference} if axis_reference is not None else {}),
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 
