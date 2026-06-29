@@ -1014,6 +1014,131 @@ def _normalize_symmetric_horizontal_angle(angle_deg, sym_angle):
     return angle
 
 
+def _symmetric_circular_mean(angles_deg, weights, sym_angle):
+    if len(angles_deg) == 0:
+        return None
+    scale = 360.0 / float(sym_angle)
+    angles = np.asarray(angles_deg, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if angles.size == 0 or weights.size != angles.size:
+        return None
+    if not np.any(weights > 0):
+        weights = np.ones_like(angles)
+    rads = np.radians((angles % sym_angle) * scale)
+    sin_sum = float(np.sum(np.sin(rads) * weights))
+    cos_sum = float(np.sum(np.cos(rads) * weights))
+    if abs(sin_sum) <= 1e-6 and abs(cos_sum) <= 1e-6:
+        return None
+    mean = math.degrees(math.atan2(sin_sum, cos_sum)) / scale
+    if mean < 0:
+        mean += sym_angle
+    return float(mean)
+
+
+def _valve_spoke_angle_candidates_from_red_mask(red, dist, cx, cy, radius,
+                                                max_candidates=5):
+    """Find valve angle candidates from red spoke pixels, excluding the rim."""
+    if radius <= 0:
+        return []
+    # The outer rim/octagon is red too and can dominate Hough lines.  Use the
+    # middle annulus where the radial spokes live, while skipping the hub.
+    spoke_region = red & (dist >= radius * 0.18) & (dist <= radius * 0.66)
+    ys, xs = np.where(spoke_region)
+    min_pixels = max(35, int(math.pi * radius * radius * 0.012))
+    if len(xs) < min_pixels:
+        return []
+
+    dx = xs.astype(np.float64) - float(cx)
+    dy = ys.astype(np.float64) - float(cy)
+    radial = np.sqrt(dx * dx + dy * dy)
+    angles = (np.degrees(np.arctan2(dy, dx)) % 180.0) % 45.0
+
+    # Weight pixels farther from the hub a little more, but keep the rim out.
+    weights = np.clip((radial - radius * 0.18) / max(radius * 0.48, 1.0), 0.2, 1.0)
+    bin_count = 90
+    hist, _ = np.histogram(angles, bins=bin_count, range=(0.0, 45.0), weights=weights)
+    if not np.any(hist > 0):
+        return []
+    # Smooth circularly and pick the dominant spoke mode.  A full circular mean
+    # can be pulled toward the outer rim or specular red fragments in oblique
+    # views, which is exactly the failure mode seen in ref18.
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float64)
+    smooth = np.zeros_like(hist, dtype=np.float64)
+    offsets = np.arange(-(len(kernel) // 2), len(kernel) // 2 + 1)
+    for coeff, offset in zip(kernel, offsets):
+        smooth += coeff * np.roll(hist, offset)
+    candidates = []
+    for peak_idx in np.argsort(smooth)[::-1]:
+        peak_angle = (int(peak_idx) + 0.5) * (45.0 / bin_count)
+        if any(abs(((peak_angle - angle + 22.5) % 45.0) - 22.5) < 5.0
+               for angle, _ in candidates):
+            continue
+        diff = ((angles - peak_angle + 22.5) % 45.0) - 22.5
+        local = np.abs(diff) <= 7.0
+        if int(np.count_nonzero(local)) >= max(20, min_pixels // 3):
+            angle = _symmetric_circular_mean(angles[local], weights[local], 45.0)
+            if angle is None:
+                angle = float(peak_angle)
+        else:
+            angle = float(peak_angle)
+        candidates.append((float(angle), float(smooth[int(peak_idx)])))
+        if len(candidates) >= max_candidates:
+            break
+    return candidates
+
+
+def _estimate_valve_spoke_angle_from_red_mask(red, dist, cx, cy, radius):
+    """Estimate the valve angle from the strongest red spoke candidate."""
+    candidates = _valve_spoke_angle_candidates_from_red_mask(
+        red, dist, cx, cy, radius, max_candidates=1)
+    return candidates[0][0] if candidates else None
+
+
+def estimate_valve_angle_candidates(color_roi: np.ndarray,
+                                    circle_mask_ratio: float = 0.92,
+                                    max_candidates: int = 5) -> list[float]:
+    """Return valve angle candidates sorted by image evidence strength."""
+    if color_roi is None or color_roi.size == 0:
+        return []
+    h, w = color_roi.shape[:2]
+    if h < 20 or w < 20:
+        return []
+
+    cx, cy = w // 2, h // 2
+    radius = int(min(cx, cy) * circle_mask_ratio)
+    hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    circle = dist <= radius
+    red = (
+        ((hue <= 12) | (hue >= 168)) &
+        (sat >= 55) &
+        (val >= 35) &
+        circle &
+        (dist >= radius * 0.12)
+    )
+    binary = red.astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    red = binary > 0
+
+    if int(np.count_nonzero(binary)) < max(40, int(math.pi * radius * radius * 0.025)):
+        return []
+
+    candidates = _valve_spoke_angle_candidates_from_red_mask(
+        red, dist, cx, cy, radius, max_candidates=max_candidates)
+    angles = [angle for angle, _ in candidates]
+    if angles:
+        return angles
+
+    return []
+
+
 def estimate_valve_angle(color_roi: np.ndarray,
                          circle_mask_ratio: float = 0.92) -> float | None:
     """
@@ -1052,7 +1177,11 @@ def estimate_valve_angle(color_roi: np.ndarray,
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     if int(np.count_nonzero(binary)) < max(40, int(math.pi * radius * radius * 0.025)):
-        return estimate_hex_angle(color_roi, circle_mask_ratio=circle_mask_ratio, n_sides=8)
+        return None
+
+    spoke_angle = _estimate_valve_spoke_angle_from_red_mask(red, dist, cx, cy, radius)
+    if spoke_angle is not None:
+        return spoke_angle
 
     edges = cv2.Canny(binary, 50, 150)
     lines = cv2.HoughLinesP(
@@ -1084,20 +1213,12 @@ def estimate_valve_angle(color_roi: np.ndarray,
             candidates.append((angle, length))
 
     if candidates:
-        sym_angle = 45.0
-        scale = 360.0 / sym_angle
-        sin_sum = 0.0
-        cos_sum = 0.0
-        for angle, weight in candidates:
-            angle_m = _normalize_symmetric_horizontal_angle(angle, sym_angle)
-            rad = math.radians(angle_m * scale)
-            sin_sum += math.sin(rad) * weight
-            cos_sum += math.cos(rad) * weight
-        if abs(sin_sum) > 1e-6 or abs(cos_sum) > 1e-6:
-            mean = math.degrees(math.atan2(sin_sum, cos_sum)) / scale
-            if mean < 0:
-                mean += sym_angle
-            return float(mean)
+        angles = [_normalize_symmetric_horizontal_angle(angle, 45.0)
+                  for angle, _ in candidates]
+        weights = [weight for _, weight in candidates]
+        mean = _symmetric_circular_mean(angles, weights, 45.0)
+        if mean is not None:
+            return mean
 
     # Fallback: use red pixels near the outer wheel, where spoke endpoints and
     # octagon vertices dominate.  This is less precise than Hough lines but
@@ -1106,18 +1227,11 @@ def estimate_valve_angle(color_roi: np.ndarray,
     ys, xs = np.where(outer)
     if len(xs) >= 30:
         angles = np.degrees(np.arctan2(ys - cy, xs - cx)) % 180.0
-        sym_angle = 45.0
-        scale = 360.0 / sym_angle
-        rads = np.radians((angles % sym_angle) * scale)
-        sin_sum = float(np.sum(np.sin(rads)))
-        cos_sum = float(np.sum(np.cos(rads)))
-        if abs(sin_sum) > 1e-6 or abs(cos_sum) > 1e-6:
-            mean = math.degrees(math.atan2(sin_sum, cos_sum)) / scale
-            if mean < 0:
-                mean += sym_angle
-            return float(mean)
+        mean = _symmetric_circular_mean(angles, np.ones_like(angles), 45.0)
+        if mean is not None:
+            return mean
 
-    return estimate_hex_angle(color_roi, circle_mask_ratio=circle_mask_ratio, n_sides=8)
+    return None
 
 
 def draw_hex_angle(image, bbox, angle, color=(0, 0, 0), thickness=1):

@@ -8,6 +8,7 @@ ROS2 面板检测节点
 话题:
   /panel/targets   (String, JSON) — 带编号的检测结果（位置 + 类别 + ID）
   /panel/knob_angles (String, JSON) — 旋钮角度信息（带编号）
+  /objects/geometry (String, JSON) — 非面板目标角度与轴线方向（阀门/螺栓/螺母）
   /panel/distance  (String, JSON) — 相机到操作面板平面的垂直距离
   /panel/status    (String)       — 注册状态（registering / registered）
 """
@@ -44,7 +45,7 @@ from .depth_utils import (
 )
 from .knob_angle import (
     estimate_knob_angle, draw_knob_angle, estimate_hex_angle,
-    estimate_valve_angle, draw_hex_angle,
+    estimate_valve_angle, estimate_valve_angle_candidates, draw_hex_angle,
 )
 from .nut_localizer import localize_nut
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
@@ -78,6 +79,11 @@ DEFAULT_CONFIG = {
     'topic_sync': {'max_dt': 0.05, 'registered_depth': True},
     'valve_axis': {
         'edge_margin_px': 4,
+    },
+    'valve_angle_stabilizer': {
+        'enable': False,
+        'max_jump_deg': 10.0,
+        'confirm_frames': 5,
     },
     'apriltag_reference': {
         'enable': True,
@@ -288,14 +294,18 @@ def _draw_apriltag_reference(canvas, reference, valve_errors=None):
                     (0, 180, 255), 1, cv2.LINE_AA)
 
 
-def _regular_polygon_points(bbox, n_sides, edge_angle_deg=0.0):
+def _regular_polygon_points(bbox, n_sides, angle_deg=0.0, angle_mode='edge'):
     x1, y1, x2, y2 = [float(v) for v in bbox]
     cx = (x1 + x2) * 0.5
     cy = (y1 + y2) * 0.5
     radius = max(2.0, min(x2 - x1, y2 - y1) * 0.47)
-    # Offset by half a sector so the fitted angle follows the detected edge
-    # orientation rather than a vertex orientation.
-    start = math.radians(edge_angle_deg + 180.0 / max(3, n_sides))
+    if angle_mode == 'vertex':
+        start_deg = angle_deg
+    else:
+        # Offset by half a sector so the fitted angle follows the detected edge
+        # orientation rather than a vertex orientation.
+        start_deg = angle_deg + 180.0 / max(3, n_sides)
+    start = math.radians(start_deg)
     angles = start + np.arange(n_sides, dtype=np.float64) * (2.0 * math.pi / n_sides)
     pts = np.column_stack([
         cx + radius * np.cos(angles),
@@ -304,8 +314,9 @@ def _regular_polygon_points(bbox, n_sides, edge_angle_deg=0.0):
     return np.round(pts).astype(np.int32)
 
 
-def _draw_regular_polygon(canvas, bbox, n_sides, angle, color=(0, 255, 255)):
-    pts = _regular_polygon_points(bbox, n_sides, angle)
+def _draw_regular_polygon(canvas, bbox, n_sides, angle, color=(0, 255, 255),
+                          angle_mode='edge'):
+    pts = _regular_polygon_points(bbox, n_sides, angle, angle_mode=angle_mode)
     cv2.polylines(canvas, [pts], True, color, 2, cv2.LINE_AA)
     x1, y1 = int(round(bbox[0])), int(round(bbox[1]))
     cv2.putText(canvas, f'{n_sides}-gon {angle:.1f}deg',
@@ -601,6 +612,71 @@ class KnobDiscreteAngleStabilizer:
         return True
 
 
+def _symmetric_angle_diff_deg(a, b, period=45.0):
+    return abs(((float(a) - float(b) + period * 0.5) % period) - period * 0.5)
+
+
+class ValveAngleStabilizer:
+    """Select valve angle candidates using temporal continuity."""
+
+    def __init__(self, enabled=True, max_jump_deg=10.0, confirm_frames=5):
+        self.enabled = bool(enabled)
+        self.max_jump_deg = float(max_jump_deg)
+        self.confirm_frames = int(confirm_frames)
+        self._stable = {}
+        self._pending = {}
+        self._pending_count = defaultdict(int)
+
+    def update(self, target_key, raw_angle, candidates=None):
+        if raw_angle is None:
+            return self._stable.get(target_key)
+        if not self.enabled:
+            return float(raw_angle) % 45.0
+
+        options = []
+        for angle in list(candidates or []) + [raw_angle]:
+            if angle is None:
+                continue
+            angle = float(angle) % 45.0
+            if not any(_symmetric_angle_diff_deg(angle, existing) < 1e-3
+                       for existing in options):
+                options.append(angle)
+        if not options:
+            return self._stable.get(target_key)
+
+        stable = self._stable.get(target_key)
+        if stable is None:
+            selected = options[0]
+            self._stable[target_key] = selected
+            self._clear_pending(target_key)
+            return selected
+
+        selected = min(options, key=lambda angle: _symmetric_angle_diff_deg(angle, stable))
+        if _symmetric_angle_diff_deg(selected, stable) <= self.max_jump_deg:
+            self._stable[target_key] = selected
+            self._clear_pending(target_key)
+            return selected
+
+        pending = options[0]
+        if self._pending.get(target_key) is None or (
+                _symmetric_angle_diff_deg(pending, self._pending[target_key]) > self.max_jump_deg):
+            self._pending[target_key] = pending
+            self._pending_count[target_key] = 1
+        else:
+            self._pending[target_key] = pending
+            self._pending_count[target_key] += 1
+
+        if self._pending_count[target_key] >= self.confirm_frames:
+            self._stable[target_key] = pending
+            self._clear_pending(target_key)
+
+        return self._stable[target_key]
+
+    def _clear_pending(self, target_key):
+        self._pending.pop(target_key, None)
+        self._pending_count.pop(target_key, None)
+
+
 class PanelDetectionNode(Node):
     def __init__(self):
         super().__init__('panel_detection_node')
@@ -625,6 +701,7 @@ class PanelDetectionNode(Node):
         self._targets_pub = self.create_publisher(String, '/panel/targets', 10)
         self._status_pub = self.create_publisher(String, '/panel/status', 10)
         self._angle_pub = self.create_publisher(String, '/panel/knob_angles', 10)
+        self._object_geometry_pub = self.create_publisher(String, '/objects/geometry', 10)
         self._distance_pub = self.create_publisher(String, '/panel/distance', 10)
 
         # 目标注册器
@@ -700,6 +777,12 @@ class PanelDetectionNode(Node):
         self._knob_angle_stabilizer = KnobDiscreteAngleStabilizer(
             switch_margin=angle_cfg.get('discrete_switch_margin', 8.0),
             confirm_frames=angle_cfg.get('discrete_confirm_frames', 3),
+        )
+        valve_angle_cfg = self.cfg.get('valve_angle_stabilizer', {})
+        self._valve_angle_stabilizer = ValveAngleStabilizer(
+            enabled=valve_angle_cfg.get('enable', True),
+            max_jump_deg=valve_angle_cfg.get('max_jump_deg', 10.0),
+            confirm_frames=valve_angle_cfg.get('confirm_frames', 5),
         )
         self.get_logger().info(
             f'旋钮角度模式: {self._angle_constraint_mode} '
@@ -1536,7 +1619,19 @@ class PanelDetectionNode(Node):
                 hex_angle = loc.angle if reliable_nut and loc.angle is not None else None
                 if hex_angle is None:
                     if det.class_name == 'valve':
-                        hex_angle = estimate_valve_angle(roi)
+                        if not _bbox_inside_image(
+                                det.bbox, color_image.shape,
+                                margin_px=self.cfg.get('valve_axis', {}).get(
+                                    'edge_margin_px', 4)):
+                            hex_angle = None
+                        else:
+                            valve_candidates = estimate_valve_angle_candidates(roi)
+                            raw_valve_angle = (
+                                valve_candidates[0] if valve_candidates
+                                else estimate_valve_angle(roi)
+                            )
+                            hex_angle = self._valve_angle_stabilizer.update(
+                                'valve', raw_valve_angle, valve_candidates)
                     else:
                         hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
                 if hex_angle is not None:
@@ -1553,7 +1648,8 @@ class PanelDetectionNode(Node):
                     if det.class_name == 'valve':
                         _draw_regular_polygon(
                             canvas, det.bbox, 8, hex_angle,
-                            color=(0, 255, 255))
+                            color=(0, 255, 255),
+                            angle_mode='vertex')
                     elif det.class_name != 'nut' or not reliable_nut:
                         draw_hex_angle(canvas, det.bbox, hex_angle)
 
@@ -1591,18 +1687,27 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._targets_pub.publish(msg)
 
-        # 发布旋钮角度 + 六边形角度 + 目标轴线方向
-        all_angles = knob_angles + hex_angles + axis_directions
-        if all_angles or axis_reference is not None:
+        stamp_value = stamp.sec + stamp.nanosec * 1e-9
+
+        # 面板只包含旋钮和按钮：保持旋钮角度话题格式不变，不混入阀门/螺栓/螺母信息。
+        if knob_angles:
             msg = String()
             msg.data = json.dumps({
-                'stamp': stamp.sec + stamp.nanosec * 1e-9,
+                'stamp': stamp_value,
                 'knob_angles': knob_angles,
-                'hex_angles': hex_angles,
+            }, ensure_ascii=False)
+            self._angle_pub.publish(msg)
+
+        # 阀门/螺栓/螺母属于面板外目标，发布到独立几何话题。
+        if hex_angles or axis_directions or axis_reference is not None:
+            msg = String()
+            msg.data = json.dumps({
+                'stamp': stamp_value,
+                'object_angles': hex_angles,
                 'axis_directions': axis_directions,
                 **({'axis_reference': axis_reference} if axis_reference is not None else {}),
             }, ensure_ascii=False)
-            self._angle_pub.publish(msg)
+            self._object_geometry_pub.publish(msg)
 
         # 发布相机到操作面板平面的垂直距离
         panel_distance = None
