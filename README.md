@@ -187,6 +187,25 @@ ros2 launch panel_detection panel_controls.launch.py use_constraint:=1
 
 `use_constraint:=1` 为默认模式：只根据旋钮白色手柄线与竖直线的夹角，稳定输出 `0` 或 `90`。旧写法仍兼容：`true` 等价于 `2`，`false` 等价于 `3`。
 
+**离线管道轴线估计脚本**
+
+给定一张图像和一个模拟/实测漏点像素坐标，可以用独立脚本估计漏点附近的 2D 管道轴线方向。该脚本不在任何 launch 中启动。
+
+```bash
+PYTHONPATH=src/panel_detection \
+src/panel_detection/scripts/estimate_pipe_axis.py \
+  --image bag9_valve_angle_review_after2/frames/050_1782718665566346318.jpg \
+  --point 660,322 \
+  --output pipe_axis_demo/script_pipe_axis_demo.jpg \
+  --angle-prior-deg 0 \
+  --angle-tolerance-deg 35 \
+  --consensus-tolerance-deg 18
+```
+
+输出角度定义为相对图像 x 轴的角度，图像坐标系 y 轴向下；轴线本身有 180 度二义性，因此 `v` 和 `-v` 表示同一条管道轴线。
+
+当前脚本在 `bag9_valve_angle_review_after2/frames` 的 100 帧样本上做过离线验证：根据阀门 bbox 推出旁侧管道模拟漏点，97/100 帧能输出轴线，复核图中箭头基本贴合漏点附近可见管道。3 帧未输出是局部 ROI 内没有足够可靠的管道边缘线段。复核输出示例位于本地调试目录 `pipe_axis_demo/batch100_consensus/review_contact.jpg`。
+
 ### Launch 参数
 
 | 参数 | 默认值 | 作用 | 何时修改 |
