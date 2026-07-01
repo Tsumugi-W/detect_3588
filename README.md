@@ -14,13 +14,10 @@ Orbbec 官方驱动 (独立 launch)
     └── /camera/depth/camera_info
             │
             ▼
-面板检测节点 (话题订阅模式)
-    ├── /panel/targets       (带编号的检测结果)
-    ├── /panel/knob_angles   (旋钮角度)
-    ├── /objects/geometry    (阀门/螺栓/螺母角度与轴线)
-    ├── /panel/distance      (相机到面板平面的垂直距离)
-    ├── /panel/status        (注册状态)
-    └── /panel/buttons, /panel/knobs ...  (兼容旧话题)
+检测节点按任务 launch 拆分
+    ├── panel_controls.launch.py   → /panel/targets, /panel/knob_angles
+    ├── valve_detection.launch.py  → /valve/targets, /valve/geometry
+    └── fastener_detection.launch.py → /fasteners/targets, /fasteners/geometry
 ```
 
 ## 平台要求
@@ -123,11 +120,11 @@ source install/setup.bash
 # 终端1：启动相机（发布 /camera/color 与 /camera/depth 话题）
 ros2 launch panel_detection camera.launch.py
 
-# 终端2：启动检测节点（推荐：订阅相机话题）
-ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered_depth:=true
+# 终端2：按任务启动检测节点
+ros2 launch panel_detection panel_controls.launch.py
 ```
 
-启动后检测节点会弹出可视化窗口。启动后先进入**注册阶段**（积累稳定帧为目标分配编号），注册完成后进入**跟踪阶段**（发布带编号的检测结果）。按 `q` 或 `ESC` 退出。
+启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 会先进入**注册阶段**（积累稳定帧为按钮/旋钮分配编号），注册完成后进入**跟踪阶段**（发布带编号的检测结果）。`valve_detection.launch.py` 和 `fastener_detection.launch.py` 不做面板编号注册，直接发布对应器件结果。按 `q` 或 `ESC` 退出。
 
 ## 启动方式与参数配置
 
@@ -139,8 +136,14 @@ ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered
 # 终端1：启动 Orbbec Gemini 336，相机话题深度已注册到彩色图
 ros2 launch panel_detection camera.launch.py
 
-# 终端2：检测节点订阅相机话题
-ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered_depth:=true
+# 终端2：面板旋钮/按钮
+ros2 launch panel_detection panel_controls.launch.py
+
+# 或：阀门
+ros2 launch panel_detection valve_detection.launch.py
+
+# 或：螺栓/螺母
+ros2 launch panel_detection fastener_detection.launch.py
 ```
 
 **直连模式：检测节点直接打开相机**
@@ -151,11 +154,21 @@ ros2 launch panel_detection panel_detection.launch.py
 
 直连模式会由检测节点自己连接相机，并转发 `/camera/color/image_raw`、`/camera/depth/image_raw` 等话题。现场调试更推荐使用 `use_topic:=true`，相机和检测解耦，bag 回放也使用同一条路径。
 
+`panel_detection.launch.py` 保留为兼容入口，默认 `detection_mode:=all`。新流程推荐使用三个任务 launch，避免不同器件的话题混在一起。
+
+旧版本常用启动指令仍可使用：
+
+```bash
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constraint:=1
+```
+
+该指令使用兼容 all 模式，会同时处理面板、阀门、螺栓和螺母；新下游建议改用上面的任务 launch。
+
 **Bag 回放验证**
 
 ```bash
 # 终端1：启动检测节点
-ros2 launch panel_detection panel_detection.launch.py use_topic:=true registered_depth:=true
+ros2 launch panel_detection valve_detection.launch.py
 
 # 终端2：回放已录制的相机话题
 ros2 bag play panel_test_bag_2 \
@@ -169,7 +182,7 @@ ros2 bag play panel_test_bag_2 \
 **旋钮角度模式**
 
 ```bash
-ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constraint:=1
+ros2 launch panel_detection panel_controls.launch.py use_constraint:=1
 ```
 
 `use_constraint:=1` 为默认模式：只根据旋钮白色手柄线与竖直线的夹角，稳定输出 `0` 或 `90`。旧写法仍兼容：`true` 等价于 `2`，`false` 等价于 `3`。
@@ -178,17 +191,17 @@ ros2 launch panel_detection panel_detection.launch.py use_topic:=true use_constr
 
 | 参数 | 默认值 | 作用 | 何时修改 |
 |------|--------|------|----------|
-| `use_topic` | `false` | `true` 时订阅 `/camera/*` 话题；`false` 时检测节点直连相机 | 使用 `camera.launch.py` 或 bag 回放时设为 `true` |
+| `use_topic` | 任务 launch 为 `true`，兼容 launch 为 `false` | `true` 时订阅 `/camera/*` 话题；`false` 时检测节点直连相机 | 使用 `camera.launch.py` 或 bag 回放时保持 `true` |
 | `registered_depth` | `true` | topic 模式下深度图是否已对齐到彩色图 | Orbbec `camera.launch.py` 已设置 `depth_registration=true`，保持 `true` |
-| `use_constraint` | `1` | 旋钮角度模式：`1`=0/90 稳定输出，`2`=旧物理范围约束，`3`=旧无约束；`use_constrain` 也可作为别名 | 默认保持 `1`；需要旧行为时设为 `2` 或 `3` |
+| `use_constraint` | `1` | 面板 launch 的旋钮角度模式：`1`=0/90 稳定输出，`2`=旧物理范围约束，`3`=旧无约束；`use_constrain` 也可作为别名 | 默认保持 `1`；需要旧行为时设为 `2` 或 `3` |
 | `config_path` | 空字符串 | 外部 YAML 配置文件路径；为空使用默认配置 | 需要换模型、阈值、相机后端、推理后端时使用 |
+| `detection_mode` | `all` | `panel_detection.launch.py` 的兼容模式选择：`all` / `panel_controls` / `valve` / `fastener` | 新流程通常不用手动设置，三个任务 launch 已固定 |
+| `publish_legacy_topics` | `false` | 是否发布 `/panel/valves`、`/panel/bolts` 等旧 PoseStamped 兼容话题 | 旧下游仍订阅这些话题时才打开 |
 
 ### 指定配置文件
 
 ```bash
-ros2 launch panel_detection panel_detection.launch.py \
-  use_topic:=true \
-  registered_depth:=true \
+ros2 launch panel_detection valve_detection.launch.py \
   config_path:=/home/ztl/project/panel_ws/my_panel_config.yaml
 ```
 
@@ -217,9 +230,11 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 ## 两阶段工作流
 
+本节只适用于 `panel_controls.launch.py`。阀门和螺栓/螺母 launch 不做面板编号注册。
+
 ### 注册阶段
 
-节点启动后自动进入注册阶段：
+面板检测节点启动后自动进入注册阶段：
 1. 等待连续 N 帧同时检测到 5 个按钮 + 2 个旋钮
 2. 按 x 坐标从左到右排序
 3. 验证布局：[button, button, button, knob, knob, button, button]
@@ -276,7 +291,88 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 面板定义中只有按钮和旋钮；该话题只发布旋钮角度，`knob_angles` 内每个条目的格式保持不变。旋钮 `angle` 以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。
 
-### /objects/geometry (String, JSON) — 阀门/螺栓/螺母角度与轴线方向
+### /valve/targets (String, JSON) — 阀门位置
+
+`valve_detection.launch.py` 只发布阀门目标：
+
+```json
+{
+  "stamp": 1716192000.123,
+  "targets": [
+    {
+      "class": "valve",
+      "bbox": [620.0, 240.0, 700.0, 320.0],
+      "position": {"x": 0.18, "y": -0.03, "z": 0.82},
+      "orientation": {"x": 0.01, "y": 0.02, "z": 0.0, "w": 0.99},
+      "confidence": 0.88
+    }
+  ]
+}
+```
+
+### /valve/geometry (String, JSON) — 阀门角度与轴线方向
+
+`valve_detection.launch.py` 只发布阀门几何，字段结构如下：
+
+```json
+{
+  "stamp": 1716192000.123,
+  "object_angles": [
+    {
+      "class": "valve",
+      "bbox": [620.0, 240.0, 700.0, 320.0],
+      "hex_angle": 12.5,
+      "valve_angle": 12.5
+    }
+  ],
+  "axis_directions": [
+    {
+      "class": "valve",
+      "bbox": [620.0, 240.0, 700.0, 320.0],
+      "source": "valve_wheel",
+      "axis_direction": [0.012, -0.034, -0.999],
+      "centroid": [0.18, -0.03, 0.82],
+      "point_count": 742
+    }
+  ]
+}
+```
+
+调试时如果画面中有 AprilTag 参考板，该话题会额外带 `axis_reference` 字段。
+
+### /fasteners/targets (String, JSON) — 螺栓/螺母位置
+
+`fastener_detection.launch.py` 只发布螺栓和螺母目标，`targets` 条目结构与 `/valve/targets` 相同，`class` 为 `bolt` 或 `nut`。
+
+### /fasteners/geometry (String, JSON) — 螺栓/螺母角度与轴线方向
+
+`fastener_detection.launch.py` 只发布 `class=bolt` / `class=nut` 的条目：
+
+```json
+{
+  "stamp": 1716192000.123,
+  "object_angles": [
+    {
+      "class": "nut",
+      "bbox": [510.0, 260.0, 560.0, 310.0],
+      "hex_angle": 28.4,
+      "nut_refined_conf": 0.81
+    }
+  ],
+  "axis_directions": [
+    {
+      "class": "nut",
+      "bbox": [510.0, 260.0, 560.0, 310.0],
+      "source": "fastener_current",
+      "axis_direction": [0.012, -0.034, -0.999],
+      "centroid": [0.18, -0.03, 0.82],
+      "point_count": 4
+    }
+  ]
+}
+```
+
+### /objects/geometry (String, JSON) — 兼容 all 模式对象几何
 
 ```json
 {
@@ -299,7 +395,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
     {
       "class": "valve",
       "bbox": [620.0, 240.0, 700.0, 320.0],
-      "source": "fastener_current",
+      "source": "valve_wheel",
       "axis_direction": [0.012, -0.034, -0.999],
       "centroid": [0.18, -0.03, 0.82],
       "point_count": 742
@@ -307,6 +403,8 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
   ]
 }
 ```
+
+`/objects/geometry` 只在兼容入口 `panel_detection.launch.py detection_mode:=all` 中发布。新流程中，阀门使用 `/valve/geometry`，螺栓/螺母使用 `/fasteners/geometry`。
 
 螺栓/螺母 `hex_angle` 是六边形相对画面水平线的对称角，范围 [0, 60)。阀门 `valve_angle` 使用红色十字/外八边形角点方向估计，是相对画面水平线的对称角，范围 [0, 45)；为兼容旧字段，同一数值也放在 `hex_angle` 中。`axis_direction` 是相机坐标系下的单位方向向量，指向相机方向时 z 为负。阀门只使用手轮自身环形深度点拟合轴线，`source` 为 `valve_wheel`；质量门控失败或阀门贴边不完整时不输出阀门轴线，不使用周围安装平面或 bbox 整体深度回退。螺栓、螺母优先使用当前帧附近同平面器件的 3D 点拟合安装平面，`source` 为 `fastener_current`；如果只有两个邻近点，则用两点连线约束局部安装面法向量，`source` 为 `fastener_line`；再往后使用目标外侧深度连续 patch 拟合局部安装面，`source` 为 `local_patch_plane`，该结果会按 z 分量、RANSAC 内点比例和残差做质量门控；最后才回退到全局面板平面 `panel_plane` 和局部目标深度 `local_depth`。调试时如果画面中有 AprilTag 板，节点会额外输出 `axis_reference`，用 tag 内部深度平面法向量和阀门轴线计算 `reference_angle_deg`，该参考只用于精度评估，不参与正式阀门轴线估计。
 
@@ -323,12 +421,25 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 `distance_m` 单位为米，表示相机坐标系原点到操作面板拟合平面的垂直距离。
 
-### /panel/status (String) — 注册状态
+### 状态话题 (String)
 
-- `"registering"` — 注册中
-- `"registered"` — 注册完成
+| Launch | 状态话题 |
+|--------|----------|
+| `panel_controls.launch.py` | `/panel/status` |
+| `valve_detection.launch.py` | `/valve/status` |
+| `fastener_detection.launch.py` | `/fasteners/status` |
+
+常见状态：
+
+- `"waiting_camera"` — 等待相机
+- `"waiting_topic_frames"` — 等待同步后的相机话题
+- `"no_detection"` — 当前帧没有对应模式的检测结果
+- `"no_targets"` — 有检测但没有可发布目标
+- `"registered"` — 当前模式已有可发布目标；面板模式也表示编号结果可用
 
 ### 兼容旧话题 (PoseStamped)
+
+旧 PoseStamped 话题默认不发布。需要兼容旧下游时，在任一检测 launch 中加入 `publish_legacy_topics:=true`。
 
 | 话题 | 类别 |
 |------|------|
@@ -349,7 +460,12 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 ros2 topic list
 ros2 topic echo /panel/targets
 ros2 topic echo /panel/knob_angles
-ros2 topic echo /objects/geometry
+ros2 topic echo /valve/geometry
+ros2 topic echo /valve/targets
+ros2 topic echo /valve/status
+ros2 topic echo /fasteners/geometry
+ros2 topic echo /fasteners/targets
+ros2 topic echo /fasteners/status
 ros2 topic echo /panel/distance
 ros2 topic echo /panel/status
 ```
@@ -368,7 +484,8 @@ class PanelSubscriber(Node):
         super().__init__('panel_subscriber')
         self.create_subscription(String, '/panel/targets', self.targets_cb, 10)
         self.create_subscription(String, '/panel/knob_angles', self.angle_cb, 10)
-        self.create_subscription(String, '/objects/geometry', self.geometry_cb, 10)
+        self.create_subscription(String, '/valve/geometry', self.geometry_cb, 10)
+        self.create_subscription(String, '/fasteners/geometry', self.geometry_cb, 10)
 
     def targets_cb(self, msg):
         data = json.loads(msg.data)
@@ -395,7 +512,7 @@ class PanelSubscriber(Node):
 创建 YAML 文件后通过 `config_path` 参数传入：
 
 ```bash
-ros2 launch panel_detection panel_detection.launch.py use_topic:=true config_path:=/path/to/config.yaml
+ros2 launch panel_detection panel_controls.launch.py config_path:=/path/to/config.yaml
 ```
 
 配置示例：
@@ -410,9 +527,12 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0624.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_model: '0630.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
 onnx_threads: 8
-# rknn_model: '0624.rknn'      # inference_backend='rknn' 时使用
+# rknn_model: '0630.rknn'      # inference_backend='rknn' 时使用
+
+detection_mode: 'all'          # panel_detection.launch.py 兼容模式使用
+publish_legacy_topics: false   # 是否发布旧 PoseStamped 兼容话题
 
 class_num: 8
 class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button', 'door_button']
@@ -465,7 +585,10 @@ ros2_ws/
         ├── setup.py
         ├── launch/
         │   ├── camera.launch.py           ← 启动相机
-        │   └── panel_detection.launch.py  ← 启动检测节点
+        │   ├── panel_controls.launch.py   ← 面板旋钮/按钮
+        │   ├── valve_detection.launch.py  ← 阀门
+        │   ├── fastener_detection.launch.py ← 螺栓/螺母
+        │   └── panel_detection.launch.py  ← 兼容 all 模式
         └── panel_detection/
             ├── __init__.py
             ├── panel_detect_node.py       ← 检测主节点
@@ -479,8 +602,8 @@ ros2_ws/
             ├── detector_onnx.py
             ├── detector_rknn.py
             ├── knob_angle.py
-            ├── 0624.onnx
-            └── 0624.pt
+            ├── 0630.onnx
+            └── 0630.pt
 ```
 
 ## 常见问题

@@ -57,9 +57,9 @@ DEFAULT_CONFIG = {
     'camera': {'color_width': 1280, 'color_height': 720,
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
-    'onnx_model': '0624.onnx',
+    'onnx_model': '0630.onnx',
     'onnx_threads': 8,
-    'weight': '0624.pt',
+    'weight': '0630.pt',
     'input_size': 640,
     'class_num': 8,
     'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump',
@@ -85,6 +85,8 @@ DEFAULT_CONFIG = {
         'max_jump_deg': 10.0,
         'confirm_frames': 5,
     },
+    'detection_mode': 'all',
+    'publish_legacy_topics': False,
     'apriltag_reference': {
         'enable': True,
         'dictionary': 'DICT_APRILTAG_36h11',
@@ -114,6 +116,39 @@ CLASS_TOPIC_MAP = {
     'pump': '/panel/pumps',
     'button': '/panel/buttons',
     'door_button': '/panel/door_buttons',
+}
+
+MODE_CLASS_FILTERS = {
+    'panel_controls': {'button', 'door_button', 'knob', 'light'},
+    'valve': {'valve'},
+    'fastener': {'bolt', 'nut'},
+    'all': None,
+}
+
+MODE_TOPIC_MAP = {
+    'panel_controls': {
+        'targets': '/panel/targets',
+        'angles': '/panel/knob_angles',
+        'status': '/panel/status',
+        'distance': '/panel/distance',
+    },
+    'valve': {
+        'targets': '/valve/targets',
+        'geometry': '/valve/geometry',
+        'status': '/valve/status',
+    },
+    'fastener': {
+        'targets': '/fasteners/targets',
+        'geometry': '/fasteners/geometry',
+        'status': '/fasteners/status',
+    },
+    'all': {
+        'targets': '/panel/targets',
+        'angles': '/panel/knob_angles',
+        'geometry': '/objects/geometry',
+        'status': '/panel/status',
+        'distance': '/panel/distance',
+    },
 }
 
 
@@ -692,17 +727,46 @@ class PanelDetectionNode(Node):
             self.get_logger().info('使用默认配置')
             self.cfg = DEFAULT_CONFIG
 
-        # 创建话题 publisher (每类一个 PoseStamped，保留兼容)
-        self._pose_pubs = {}
-        for cls_name, topic in CLASS_TOPIC_MAP.items():
-            self._pose_pubs[cls_name] = self.create_publisher(PoseStamped, topic, 10)
+        self.declare_parameter('detection_mode', self.cfg.get('detection_mode', 'all'))
+        mode_param = self.get_parameter('detection_mode').get_parameter_value().string_value
+        self._detection_mode = mode_param if mode_param in MODE_CLASS_FILTERS else 'all'
+        if mode_param != self._detection_mode:
+            self.get_logger().warn(f'未知 detection_mode={mode_param}, 回退 all')
+        self._active_classes = MODE_CLASS_FILTERS[self._detection_mode]
+        self._process_panel_controls = self._detection_mode in ('panel_controls', 'all')
+        self._process_valves = self._detection_mode in ('valve', 'all')
+        self._process_fasteners = self._detection_mode in ('fastener', 'all')
+        self.declare_parameter(
+            'publish_legacy_topics', self.cfg.get('publish_legacy_topics', False))
+        self._publish_legacy_topics = (
+            self.get_parameter('publish_legacy_topics').get_parameter_value().bool_value)
+        self.get_logger().info(
+            f'检测模式: {self._detection_mode}, legacy topics={self._publish_legacy_topics}')
 
-        # 带编号的统一话题
-        self._targets_pub = self.create_publisher(String, '/panel/targets', 10)
-        self._status_pub = self.create_publisher(String, '/panel/status', 10)
-        self._angle_pub = self.create_publisher(String, '/panel/knob_angles', 10)
-        self._object_geometry_pub = self.create_publisher(String, '/objects/geometry', 10)
-        self._distance_pub = self.create_publisher(String, '/panel/distance', 10)
+        topics = MODE_TOPIC_MAP[self._detection_mode]
+
+        # 创建话题 publisher (每类一个 PoseStamped，默认关闭，仅兼容旧系统)
+        self._pose_pubs = {}
+        if self._publish_legacy_topics:
+            for cls_name, topic in CLASS_TOPIC_MAP.items():
+                if self._active_classes is None or cls_name in self._active_classes:
+                    self._pose_pubs[cls_name] = self.create_publisher(PoseStamped, topic, 10)
+
+        self._targets_pub = (
+            self.create_publisher(String, topics['targets'], 10)
+            if 'targets' in topics else None)
+        self._status_pub = (
+            self.create_publisher(String, topics['status'], 10)
+            if 'status' in topics else None)
+        self._angle_pub = (
+            self.create_publisher(String, topics['angles'], 10)
+            if 'angles' in topics else None)
+        self._object_geometry_pub = (
+            self.create_publisher(String, topics['geometry'], 10)
+            if 'geometry' in topics else None)
+        self._distance_pub = (
+            self.create_publisher(String, topics['distance'], 10)
+            if 'distance' in topics else None)
 
         # 目标注册器
         reg_cfg = self.cfg.get('registry', {})
@@ -1131,6 +1195,8 @@ class PanelDetectionNode(Node):
         self._depth_info_pub.publish(depth_info_msg)
 
     def _publish_status(self, status, force=False):
+        if self._status_pub is None:
+            return
         now = time.time()
         if not force and now - self._last_status_publish_time < 1.0:
             return
@@ -1225,9 +1291,20 @@ class PanelDetectionNode(Node):
                 confidence=float(conf_list[i]),
             ))
 
+        if self._active_classes is not None:
+            frame_detections = [
+                det for det in frame_detections
+                if det.class_name in self._active_classes
+            ]
+        active_xyxy_list = [det.bbox for det in frame_detections]
+        if not frame_detections:
+            self.display_frame = canvas
+            self._publish_status('no_detection')
+            return
+
         nut_localizations = {}
         for i, det in enumerate(frame_detections):
-            if det.class_name == 'nut':
+            if self._process_fasteners and det.class_name == 'nut':
                 nut_localizations[i] = localize_nut(color_image, det.bbox)
 
         # 检测到两个 knob 时：
@@ -1238,8 +1315,11 @@ class PanelDetectionNode(Node):
         panel_detections = []  # 只有在面板行上的目标才参与编号
         panel_axis_origin = None
         panel_axis_vector = None
+        matched = []
 
-        if len(knobs) >= 2:
+        if not self._process_panel_controls:
+            matched = []
+        elif len(knobs) >= 2:
             k1, k2 = sorted(knobs, key=lambda d: d.center_x)[:2]
             line_vec = np.array([k2.center_x - k1.center_x, k2.center_y - k1.center_y])
             line_len = np.linalg.norm(line_vec)
@@ -1347,11 +1427,12 @@ class PanelDetectionNode(Node):
                 panel_detections = [d for d in frame_detections
                                     if d.class_name in ('button', 'knob')]
 
-        # ─── 每帧独立识别绝对编号（只对面板行上的目标）───
-        matched = self._registry.identify(
-            panel_detections, color_image,
-            axis_origin=panel_axis_origin,
-            axis_vector=panel_axis_vector)
+        if self._process_panel_controls:
+            # ─── 每帧独立识别绝对编号（只对面板行上的目标）───
+            matched = self._registry.identify(
+                panel_detections, color_image,
+                axis_origin=panel_axis_origin,
+                axis_vector=panel_axis_vector)
 
         targets_output = []
         knob_angles = []
@@ -1425,6 +1506,7 @@ class PanelDetectionNode(Node):
 
 
         # 对所有非编号目标计算 3D 坐标并标注。nut 只发布 refined 可靠点。
+        object_targets_output = []
         for det_idx, det in enumerate(frame_detections):
             if det.class_name in ('button', 'knob'):
                 continue  # 已在 matched 中处理
@@ -1466,24 +1548,42 @@ class PanelDetectionNode(Node):
                     det, filtered_depth, deproj_intrin, self._depth_scale)
                 _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
+            if det.class_name in ('valve', 'bolt', 'nut'):
+                object_targets_output.append({
+                    'class': det.class_name,
+                    'bbox': det.bbox,
+                    'position': {'x': round(xyz[0], 4),
+                                 'y': round(xyz[1], 4),
+                                 'z': round(xyz[2], 4)},
+                    'orientation': {'x': quat[0], 'y': quat[1],
+                                    'z': quat[2], 'w': quat[3]},
+                    'confidence': round(det.confidence, 3),
+                })
+
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
 
-        apriltag_reference = detect_apriltag_reference_axis(
-            color_image,
-            filtered_depth,
-            deproj_intrin,
-            depth_scale=self._depth_scale,
-            cfg=self.cfg.get('apriltag_reference', {}),
-        )
+        apriltag_reference = None
+        if self._process_valves:
+            apriltag_reference = detect_apriltag_reference_axis(
+                color_image,
+                filtered_depth,
+                deproj_intrin,
+                depth_scale=self._depth_scale,
+                cfg=self.cfg.get('apriltag_reference', {}),
+            )
         valve_reference_errors = []
 
         # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
         hex_angles = []
         axis_directions = []
         axis_candidate_points = []
-        axis_target_classes = {'nut', 'bolt', 'valve'}
+        axis_target_classes = set()
+        if self._process_valves:
+            axis_target_classes.add('valve')
+        if self._process_fasteners:
+            axis_target_classes.update(('nut', 'bolt'))
         for det_idx, det in enumerate(frame_detections):
             if det.class_name not in axis_target_classes:
                 continue
@@ -1546,7 +1646,7 @@ class PanelDetectionNode(Node):
                             filtered_depth,
                             deproj_intrin,
                             det.bbox,
-                            all_bboxes=xyxy_list,
+                            all_bboxes=active_xyxy_list,
                             depth_scale=self._depth_scale,
                         )
                         if axis_result is not None:
@@ -1678,19 +1778,27 @@ class PanelDetectionNode(Node):
 
         _draw_axis_3d_view(canvas, axis_directions)
 
-        # 发布带编号的检测结果
-        if targets_output:
+        # 发布目标结果：面板模式保持原编号格式；对象模式只包含对应类别。
+        if self._process_panel_controls and targets_output and self._targets_pub is not None:
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp.sec + stamp.nanosec * 1e-9,
                 'targets': targets_output,
             }, ensure_ascii=False)
             self._targets_pub.publish(msg)
+        elif (not self._process_panel_controls and object_targets_output and
+              self._targets_pub is not None):
+            msg = String()
+            msg.data = json.dumps({
+                'stamp': stamp.sec + stamp.nanosec * 1e-9,
+                'targets': object_targets_output,
+            }, ensure_ascii=False)
+            self._targets_pub.publish(msg)
 
         stamp_value = stamp.sec + stamp.nanosec * 1e-9
 
         # 面板只包含旋钮和按钮：保持旋钮角度话题格式不变，不混入阀门/螺栓/螺母信息。
-        if knob_angles:
+        if knob_angles and self._angle_pub is not None:
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp_value,
@@ -1699,7 +1807,8 @@ class PanelDetectionNode(Node):
             self._angle_pub.publish(msg)
 
         # 阀门/螺栓/螺母属于面板外目标，发布到独立几何话题。
-        if hex_angles or axis_directions or axis_reference is not None:
+        if ((hex_angles or axis_directions or axis_reference is not None) and
+                self._object_geometry_pub is not None):
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp_value,
@@ -1714,7 +1823,7 @@ class PanelDetectionNode(Node):
         if self._panel_normal_cache is not None:
             normal, centroid = self._panel_normal_cache
             panel_distance = _panel_plane_distance(normal, centroid)
-            if panel_distance is not None:
+            if panel_distance is not None and self._distance_pub is not None:
                 msg = String()
                 msg.data = json.dumps({
                     'stamp': stamp.sec + stamp.nanosec * 1e-9,
@@ -1725,7 +1834,9 @@ class PanelDetectionNode(Node):
                 self._distance_pub.publish(msg)
 
         # ─── 可视化 ───
-        self._publish_status('registered' if targets_output else 'no_targets')
+        has_mode_targets = bool(targets_output if self._process_panel_controls
+                                else object_targets_output)
+        self._publish_status('registered' if has_mode_targets else 'no_targets')
 
         for target_id, det in matched:
             ux = int(det.center_x)

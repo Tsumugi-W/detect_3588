@@ -16,6 +16,7 @@ Screenshot*.png
 axis_reference_log.jsonl
 axis_error_frames/
 *.pt
+!src/panel_detection/panel_detection/*.pt
 .claude/
 src/panel_detection/panel_detection/weights_archive/
 verify_3d_accuracy.py
