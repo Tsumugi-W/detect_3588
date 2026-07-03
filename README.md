@@ -124,7 +124,7 @@ ros2 launch panel_detection camera.launch.py
 ros2 launch panel_detection panel_controls.launch.py
 ```
 
-启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 会先进入**注册阶段**（积累稳定帧为按钮/旋钮分配编号），注册完成后进入**跟踪阶段**（发布带编号的检测结果）。`valve_detection.launch.py` 和 `fastener_detection.launch.py` 不做面板编号注册，直接发布对应器件结果。按 `q` 或 `ESC` 退出。
+启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 会先进入**注册阶段**（积累稳定帧为按钮/旋钮分配编号），注册完成后进入**跟踪阶段**（发布带编号的检测结果）。`valve_detection.launch.py` 直接发布阀门结果；`fastener_detection.launch.py` 会对同一安装面的螺栓/螺母建立局部 4 槽位编号。按 `q` 或 `ESC` 退出。
 
 ## 启动方式与参数配置
 
@@ -361,7 +361,27 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 ### /fasteners/targets (String, JSON) — 螺栓/螺母位置
 
-`fastener_detection.launch.py` 只发布螺栓和螺母目标，`targets` 条目结构与 `/valve/targets` 相同，`class` 为 `bolt` 或 `nut`。
+`fastener_detection.launch.py` 只发布螺栓和螺母目标，`class` 为 `bolt` 或 `nut`。当同一安装面至少 3 个 fastener 被可靠检测后，节点会建立 4 槽位模板，并在后续帧给已检测到的目标附加稳定编号：
+
+```json
+{
+  "stamp": 1716192000.123,
+  "targets": [
+    {
+      "id": 2,
+      "group_id": 1,
+      "slot": "top_right",
+      "registered": true,
+      "class": "bolt",
+      "bbox": [510.0, 260.0, 560.0, 310.0],
+      "position": {"x": 0.08, "y": -0.04, "z": 0.33},
+      "confidence": 0.74
+    }
+  ]
+}
+```
+
+编号定义为每个 `group_id` 内的局部槽位：`1=top_left`、`2=top_right`、`3=bottom_right`、`4=bottom_left`。机械臂指定目标时应使用 `group_id + id`，不要只使用单独的 `id`。首次冷启动只有 1-2 个 fastener 可见时不会强行猜最终编号；模板注册后，即使后续只检测到部分目标，也会按历史槽位继续编号。
 
 ### /fasteners/geometry (String, JSON) — 螺栓/螺母角度与轴线方向
 
@@ -372,6 +392,9 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
   "stamp": 1716192000.123,
   "object_angles": [
     {
+      "id": 3,
+      "group_id": 1,
+      "slot": "bottom_right",
       "class": "nut",
       "bbox": [510.0, 260.0, 560.0, 310.0],
       "hex_angle": 28.4,
@@ -380,6 +403,9 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
   ],
   "axis_directions": [
     {
+      "id": 3,
+      "group_id": 1,
+      "slot": "bottom_right",
       "class": "nut",
       "bbox": [510.0, 260.0, 560.0, 310.0],
       "source": "fastener_current",
@@ -588,6 +614,15 @@ panel_line:
   proj_margin_ratio: 3.0
   min_proj_margin: 450.0
 
+fastener_registry:
+  min_init_observations: 3      # 首次建立 4 槽位模板所需的最少可见 fastener 数
+  max_group_distance_m: 0.35    # 同组聚类的 3D 距离门限
+  max_slot_distance_m: 0.12     # 历史槽位匹配的最小距离门限
+  slot_match_ratio: 0.45        # 槽距比例门限，和 max_slot_distance_m 取较大值
+  normal_angle_thresh_deg: 25.0 # 同组/同槽位法向量夹角门限
+  ema_alpha: 0.35               # 槽位 3D 位置平滑系数
+  stale_frames: 120             # 多久未观测后删除该 fastener 组
+
 panel_normal_interval: 10
 ```
 
@@ -612,6 +647,7 @@ ros2_ws/
             ├── __init__.py
             ├── panel_detect_node.py       ← 检测主节点
             ├── target_registry.py         ← 目标注册与跟踪
+            ├── fastener_registry.py       ← 螺栓/螺母分组与槽位编号
             ├── nut_localizer.py           ← nut 外六角 refined 定位
             ├── camera/
             │   ├── base.py

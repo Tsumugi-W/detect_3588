@@ -47,6 +47,7 @@ from .knob_angle import (
     estimate_knob_angle, draw_knob_angle, estimate_hex_angle,
     estimate_valve_angle, estimate_valve_angle_candidates, draw_hex_angle,
 )
+from .fastener_registry import FastenerGroupRegistry, FastenerObservation
 from .nut_localizer import localize_nut
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
@@ -79,6 +80,15 @@ DEFAULT_CONFIG = {
     'topic_sync': {'max_dt': 0.05, 'registered_depth': True},
     'valve_axis': {
         'edge_margin_px': 4,
+    },
+    'fastener_registry': {
+        'min_init_observations': 3,
+        'max_group_distance_m': 0.35,
+        'max_slot_distance_m': 0.12,
+        'slot_match_ratio': 0.45,
+        'normal_angle_thresh_deg': 25.0,
+        'ema_alpha': 0.35,
+        'stale_frames': 120,
     },
     'valve_angle_stabilizer': {
         'enable': False,
@@ -774,6 +784,17 @@ class PanelDetectionNode(Node):
             stable_frames=reg_cfg.get('stable_frames', 15),
             green_hue_range=tuple(reg_cfg.get('green_hue_range', [35, 85])),
             match_distance_thresh=reg_cfg.get('match_distance_thresh', 80),
+        )
+        fastener_reg_cfg = self.cfg.get('fastener_registry', {})
+        self._fastener_registry = FastenerGroupRegistry(
+            min_init_observations=fastener_reg_cfg.get('min_init_observations', 3),
+            max_group_distance_m=fastener_reg_cfg.get('max_group_distance_m', 0.35),
+            max_slot_distance_m=fastener_reg_cfg.get('max_slot_distance_m', 0.12),
+            slot_match_ratio=fastener_reg_cfg.get('slot_match_ratio', 0.45),
+            normal_angle_thresh_deg=fastener_reg_cfg.get(
+                'normal_angle_thresh_deg', 25.0),
+            ema_alpha=fastener_reg_cfg.get('ema_alpha', 0.35),
+            stale_frames=fastener_reg_cfg.get('stale_frames', 120),
         )
 
         # 相机来源：直接连接 or 话题订阅
@@ -1507,6 +1528,8 @@ class PanelDetectionNode(Node):
 
         # 对所有非编号目标计算 3D 坐标并标注。nut 只发布 refined 可靠点。
         object_targets_output = []
+        fastener_observation_base = {}
+        fastener_target_items = {}
         for det_idx, det in enumerate(frame_detections):
             if det.class_name in ('button', 'knob'):
                 continue  # 已在 matched 中处理
@@ -1549,7 +1572,7 @@ class PanelDetectionNode(Node):
                 _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
             if det.class_name in ('valve', 'bolt', 'nut'):
-                object_targets_output.append({
+                target_item = {
                     'class': det.class_name,
                     'bbox': det.bbox,
                     'position': {'x': round(xyz[0], 4),
@@ -1558,7 +1581,18 @@ class PanelDetectionNode(Node):
                     'orientation': {'x': quat[0], 'y': quat[1],
                                     'z': quat[2], 'w': quat[3]},
                     'confidence': round(det.confidence, 3),
-                })
+                }
+                object_targets_output.append(target_item)
+                if det.class_name in ('bolt', 'nut'):
+                    fastener_target_items[det_idx] = target_item
+                    fastener_observation_base[det_idx] = {
+                        'det_idx': det_idx,
+                        'class_name': det.class_name,
+                        'center_xy': (float(ux), float(uy)),
+                        'bbox': tuple(float(v) for v in det.bbox),
+                        'confidence': float(det.confidence),
+                        'point_3d': [float(xyz[0]), float(xyz[1]), float(xyz[2])],
+                    }
 
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
@@ -1578,6 +1612,8 @@ class PanelDetectionNode(Node):
         # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
         hex_angles = []
         axis_directions = []
+        fastener_axis_by_det_idx = {}
+        fastener_geometry_items = {}
         axis_candidate_points = []
         axis_target_classes = set()
         if self._process_valves:
@@ -1710,6 +1746,13 @@ class PanelDetectionNode(Node):
                                 'angle_deg': round(angle_deg, 2),
                             })
                     axis_directions.append(axis_item)
+                    if det.class_name in ('bolt', 'nut'):
+                        fastener_axis_by_det_idx[det_idx] = [
+                            float(axis_normal[0]),
+                            float(axis_normal[1]),
+                            float(axis_normal[2]),
+                        ]
+                        fastener_geometry_items.setdefault(det_idx, []).append(axis_item)
                     axis_color = (255, 255, 0) if det.class_name == 'valve' else (255, 0, 255)
                     _draw_axis_direction(
                         canvas, det.bbox, axis_normal,
@@ -1745,6 +1788,8 @@ class PanelDetectionNode(Node):
                     if det.class_name == 'valve':
                         angle_item['valve_angle'] = round(hex_angle, 1)
                     hex_angles.append(angle_item)
+                    if det.class_name in ('bolt', 'nut'):
+                        fastener_geometry_items.setdefault(det_idx, []).append(angle_item)
                     if det.class_name == 'valve':
                         _draw_regular_polygon(
                             canvas, det.bbox, 8, hex_angle,
@@ -1777,6 +1822,50 @@ class PanelDetectionNode(Node):
             self._write_axis_reference_log(stamp, axis_reference, valve_reference_errors)
 
         _draw_axis_3d_view(canvas, axis_directions)
+
+        if self._process_fasteners and fastener_observation_base:
+            observations = []
+            for det_idx, base in fastener_observation_base.items():
+                observations.append(FastenerObservation(
+                    axis_direction=fastener_axis_by_det_idx.get(det_idx),
+                    **base,
+                ))
+            assignments = self._fastener_registry.update(
+                observations, self._frame_count)
+            for det_idx, assignment in assignments.items():
+                target_item = fastener_target_items.get(det_idx)
+                if target_item is not None:
+                    target_item.update({
+                        'id': assignment.target_id,
+                        'group_id': assignment.group_id,
+                        'slot': assignment.slot,
+                        'registered': assignment.registered,
+                        'slot_distance_m': round(assignment.distance_m, 4),
+                    })
+                for geometry_item in fastener_geometry_items.get(det_idx, []):
+                    geometry_item.update({
+                        'id': assignment.target_id,
+                        'group_id': assignment.group_id,
+                        'slot': assignment.slot,
+                        'registered': assignment.registered,
+                    })
+
+                det = frame_detections[det_idx]
+                x1, y1 = int(det.bbox[0]), int(det.bbox[1])
+                label = f'G{assignment.group_id} ID{assignment.target_id} {assignment.slot}'
+                text_y = max(18, y1 - 24)
+                (text_w, text_h), _ = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+                cv2.rectangle(
+                    canvas,
+                    (x1, max(0, text_y - text_h - 5)),
+                    (min(canvas.shape[1] - 1, x1 + text_w + 6), text_y + 4),
+                    (0, 0, 0),
+                    -1,
+                )
+                cv2.putText(canvas, label, (x1 + 3, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                            (0, 255, 255), 2, cv2.LINE_AA)
 
         # 发布目标结果：面板模式保持原编号格式；对象模式只包含对应类别。
         if self._process_panel_controls and targets_output and self._targets_pub is not None:
