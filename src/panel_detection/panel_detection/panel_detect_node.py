@@ -48,6 +48,7 @@ from .knob_angle import (
     estimate_valve_angle, estimate_valve_angle_candidates, draw_hex_angle,
 )
 from .fastener_registry import FastenerGroupRegistry, FastenerObservation
+from .nameplate_ocr import NameplateRecognizer
 from .nut_localizer import localize_nut
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
@@ -94,6 +95,17 @@ DEFAULT_CONFIG = {
         'enable': False,
         'max_jump_deg': 10.0,
         'confirm_frames': 5,
+    },
+    'nameplate_ocr': {
+        'enable': True,
+        'confirm_frames': 3,
+        'ocr_interval': 10,
+        'roi_above_ratio': 0.6,
+        'roi_gap_ratio': 0.1,
+        'roi_width_ratio': 2.8,
+        'roi_min_height': 15,
+        'use_gpu': False,
+        'lang': 'ch',
     },
     'detection_mode': 'all',
     'publish_legacy_topics': False,
@@ -777,6 +789,9 @@ class PanelDetectionNode(Node):
         self._distance_pub = (
             self.create_publisher(String, topics['distance'], 10)
             if 'distance' in topics else None)
+        self._labels_pub = (
+            self.create_publisher(String, '/panel/labels', 10)
+            if self._process_panel_controls else None)
 
         # 目标注册器
         reg_cfg = self.cfg.get('registry', {})
@@ -872,6 +887,24 @@ class PanelDetectionNode(Node):
         self.get_logger().info(
             f'旋钮角度模式: {self._angle_constraint_mode} '
             '(1=0/90稳定输出, 2=旧约束, 3=旧无约束)')
+
+        # 铭牌 OCR
+        ocr_cfg = self.cfg.get('nameplate_ocr', {})
+        self._nameplate_enable = ocr_cfg.get('enable', True) and self._process_panel_controls
+        if self._nameplate_enable:
+            self._nameplate_recognizer = NameplateRecognizer(
+                confirm_frames=ocr_cfg.get('confirm_frames', 5),
+                ocr_interval=ocr_cfg.get('ocr_interval', 10),
+                roi_above_ratio=ocr_cfg.get('roi_above_ratio', 1.8),
+                roi_gap_ratio=ocr_cfg.get('roi_gap_ratio', 0.2),
+                roi_width_ratio=ocr_cfg.get('roi_width_ratio', 2.5),
+                roi_min_height=ocr_cfg.get('roi_min_height', 20),
+                use_gpu=ocr_cfg.get('use_gpu', False),
+                lang=ocr_cfg.get('lang', 'ch'),
+            )
+            self.get_logger().info('铭牌 OCR 已启用')
+        else:
+            self._nameplate_recognizer = None
 
         pos_cfg = self.cfg.get('position_stabilizer', {})
         self._position_stabilizer = PositionStabilizer(
@@ -1473,6 +1506,12 @@ class PanelDetectionNode(Node):
         ]
         self._knob_angle_stabilizer.prune(active_knob_ids)
 
+        # 铭牌 OCR：注册阶段定期识别并投票
+        nameplate_labels = {}
+        if self._nameplate_recognizer is not None:
+            nameplate_labels = self._nameplate_recognizer.update(
+                matched, color_image)
+
         for target_id, det in matched:
             xyz = stable_xyz.get(target_id, matched_xyz[target_id])
             matched_xyz[target_id] = xyz
@@ -1487,6 +1526,9 @@ class PanelDetectionNode(Node):
                                 'z': quat[2], 'w': quat[3]},
                 'confidence': round(det.confidence, 3),
             }
+            label = nameplate_labels.get(target_id)
+            if label:
+                target_info['label'] = label
             targets_output.append(target_info)
 
             # 兼容旧话题
@@ -1895,6 +1937,18 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 
+        # 发布铭牌标签映射（有新确认时发布）
+        if nameplate_labels and self._labels_pub is not None:
+            msg = String()
+            msg.data = json.dumps({
+                'stamp': stamp_value,
+                'labels': [
+                    {'id': tid, 'label': text}
+                    for tid, text in sorted(nameplate_labels.items())
+                ],
+            }, ensure_ascii=False)
+            self._labels_pub.publish(msg)
+
         # 阀门/螺栓/螺母属于面板外目标，发布到独立几何话题。
         if ((hex_angles or axis_directions or axis_reference is not None) and
                 self._object_geometry_pub is not None):
@@ -1958,6 +2012,10 @@ class PanelDetectionNode(Node):
                     elif 'angle' in ka:
                         draw_knob_angle(canvas, det.bbox, ka['angle'])
                     break
+
+        # 铭牌 OCR 可视化
+        if self._nameplate_recognizer is not None:
+            self._nameplate_recognizer.draw_debug(canvas, matched)
 
         cv2.putText(canvas, 'REGISTERED', (10, canvas.shape[0] - 15),
                     0, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
