@@ -83,6 +83,9 @@ sudo apt install -y libusb-1.0-0-dev libudev-dev
 sudo pip3 install onnxruntime -i https://pypi.tuna.tsinghua.edu.cn/simple
 sudo pip3 install "numpy<2" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+# 铭牌 OCR（可选，不装则 OCR 功能自动跳过）
+sudo pip3 install rapidocr-onnxruntime -i https://pypi.tuna.tsinghua.edu.cn/simple
+
 # opencv、pyyaml 通常系统已自带，如果没有：
 # sudo pip3 install opencv-python pyyaml -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
@@ -302,6 +305,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
     {
       "id": 1,
       "class": "button",
+      "label": "自锁按钮2",
       "position": {"x": 0.123, "y": -0.045, "z": 0.850},
       "orientation": {"x": 0.01, "y": 0.02, "z": 0.0, "w": 0.99},
       "confidence": 0.92
@@ -309,6 +313,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
     {
       "id": 4,
       "class": "knob",
+      "label": "旋钮开关",
       "position": {"x": 0.320, "y": -0.040, "z": 0.845},
       "orientation": {"x": 0.01, "y": 0.02, "z": 0.0, "w": 0.99},
       "confidence": 0.88
@@ -317,7 +322,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 }
 ```
 
-位置单位：**米 (m)**，相机坐标系。
+位置单位：**米 (m)**，相机坐标系。`label` 字段在铭牌 OCR 确认后出现，表示器件上方金属铭牌的识别文字。
 
 ### /panel/knob_angles (String, JSON) — 面板旋钮角度
 
@@ -480,6 +485,22 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 螺栓/螺母 `hex_angle` 是六边形相对画面水平线的对称角，范围 [0, 60)。阀门 `valve_angle` 使用红色十字/外八边形角点方向估计，是相对画面水平线的对称角，范围 [0, 45)；为兼容旧字段，同一数值也放在 `hex_angle` 中。`axis_direction` 是相机坐标系下的单位方向向量，指向相机方向时 z 为负。阀门只使用手轮自身环形深度点拟合轴线，`source` 为 `valve_wheel`；质量门控失败或阀门贴边不完整时不输出阀门轴线，不使用周围安装平面或 bbox 整体深度回退。螺栓、螺母优先使用当前帧附近同平面器件的 3D 点拟合安装平面，`source` 为 `fastener_current`；如果只有两个邻近点，则用两点连线约束局部安装面法向量，`source` 为 `fastener_line`；再往后使用目标外侧深度连续 patch 拟合局部安装面，`source` 为 `local_patch_plane`，该结果会按 z 分量、RANSAC 内点比例和残差做质量门控；最后才回退到全局面板平面 `panel_plane` 和局部目标深度 `local_depth`。调试时如果画面中有 AprilTag 板，节点会额外输出 `axis_reference`，用 tag 内部深度平面法向量和阀门轴线计算 `reference_angle_deg`，该参考只用于精度评估，不参与正式阀门轴线估计。
 
+### /panel/labels (String, JSON) — 铭牌文字标签
+
+`panel_controls.launch.py` 在 OCR 确认铭牌文字后发布：
+
+```json
+{
+  "stamp": 1716192000.123,
+  "labels": [
+    {"id": 1, "label": "自锁按钮2"},
+    {"id": 4, "label": "旋钮开关"}
+  ]
+}
+```
+
+铭牌 OCR 使用 RapidOCR (ONNX Runtime) 识别器件上方的金属铭牌文字，多帧投票确认后输出。确认后低频发布（~1Hz），不影响检测帧率。需要安装 `rapidocr-onnxruntime`；未安装时该功能静默跳过。可通过配置 `nameplate_ocr.enable: false` 关闭。
+
 ### /panel/distance (String, JSON) — 相机到面板平面的垂直距离
 
 ```json
@@ -532,6 +553,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 ros2 topic list
 ros2 topic echo /panel/targets
 ros2 topic echo /panel/knob_angles
+ros2 topic echo /panel/labels
 ros2 topic echo /valve/geometry
 ros2 topic echo /valve/targets
 ros2 topic echo /valve/status
@@ -650,6 +672,17 @@ fastener_registry:
   ema_alpha: 0.35               # 槽位 3D 位置平滑系数
   stale_frames: 120             # 多久未观测后删除该 fastener 组
 
+nameplate_ocr:
+  enable: true                 # 铭牌文字识别总开关
+  confirm_frames: 3            # 同一文字连续出现 N 帧后确认
+  ocr_interval: 10             # 每隔 N 帧执行一次 OCR
+  roi_above_ratio: 0.6         # 铭牌 ROI 高度 = 器件高度 × ratio
+  roi_gap_ratio: 0.1           # 铭牌与器件间隙 = 器件高度 × ratio
+  roi_width_ratio: 2.8         # 铭牌 ROI 宽度 = 器件宽度 × ratio
+  roi_min_height: 15           # ROI 最小高度（像素）
+  use_gpu: false
+  lang: 'ch'
+
 panel_normal_interval: 10
 ```
 
@@ -660,7 +693,7 @@ ros2_ws/
 ├── README.md
 ├── .gitignore
 └── src/
-    ├── OrbbecSDK_ROS2/          ← 官方相机驱动
+    ├── OrbbecSDK_ROS2/          ← 官方相机驱动 (submodule)
     └── panel_detection/
         ├── package.xml
         ├── setup.py
@@ -670,12 +703,21 @@ ros2_ws/
         │   ├── valve_detection.launch.py  ← 阀门
         │   ├── fastener_detection.launch.py ← 螺栓/螺母
         │   └── panel_detection.launch.py  ← 兼容 all 模式
+        ├── scripts/
+        │   ├── estimate_pipe_axis.py      ← 离线管道轴线估计
+        │   └── export_model.py            ← 模型转换 (.pt → .onnx)
+        ├── test/
+        │   ├── test_apriltag_reference.py
+        │   └── test_topic_sync.py
         └── panel_detection/
             ├── __init__.py
             ├── panel_detect_node.py       ← 检测主节点
             ├── target_registry.py         ← 目标注册与跟踪
             ├── fastener_registry.py       ← 螺栓/螺母分组与槽位编号
+            ├── nameplate_ocr.py           ← 铭牌文字识别 (OCR)
             ├── nut_localizer.py           ← nut 外六角 refined 定位
+            ├── pipe_axis.py               ← 管道轴线方向估计
+            ├── apriltag_reference.py      ← AprilTag 参考轴线
             ├── camera/
             │   ├── base.py
             │   ├── orbbec.py
@@ -684,8 +726,11 @@ ros2_ws/
             ├── detector_onnx.py
             ├── detector_rknn.py
             ├── knob_angle.py
-            ├── 0630.onnx
-            └── 0630.pt
+            ├── rgb_depth_viewer.py        ← 彩色/深度同步查看工具
+            ├── 0630.onnx                  ← 默认权重
+            ├── 0630.pt
+            ├── 0727.onnx                  ← 备用权重
+            └── 0727.pt
 ```
 
 ## 常见问题
