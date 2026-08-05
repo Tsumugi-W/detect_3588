@@ -48,6 +48,18 @@ def generate_launch_description():
         'publish_legacy_topics', default_value='false',
         description='是否发布 /panel/valves 等旧 PoseStamped 兼容话题'
     )
+    capture_dir_arg = DeclareLaunchArgument(
+        'capture_dir', default_value='',
+        description='检测 canvas 保存目录；为空时不保存'
+    )
+    capture_hz_arg = DeclareLaunchArgument(
+        'capture_hz', default_value='1.0',
+        description='检测 canvas 按 ROS 时间戳保存的频率'
+    )
+    show_gui_arg = DeclareLaunchArgument(
+        'show_gui', default_value='true',
+        description='是否显示 OpenCV 检测窗口'
+    )
 
     detect_node = Node(
         package='panel_detection',
@@ -69,9 +81,15 @@ def generate_launch_description():
             'detection_mode': LaunchConfiguration('detection_mode'),
             'publish_legacy_topics': ParameterValue(
                 LaunchConfiguration('publish_legacy_topics'), value_type=bool),
+            'capture_dir': LaunchConfiguration('capture_dir'),
+            'capture_hz': ParameterValue(
+                LaunchConfiguration('capture_hz'), value_type=float),
+            'show_gui': ParameterValue(
+                LaunchConfiguration('show_gui'), value_type=bool),
         }],
     )
 
     return LaunchDescription([
         use_topic_arg, use_constraint_arg, use_constrain_arg, registered_depth_arg,
-        config_path_arg, detection_mode_arg, publish_legacy_topics_arg, detect_node])
+        config_path_arg, detection_mode_arg, publish_legacy_topics_arg,
+        capture_dir_arg, capture_hz_arg, show_gui_arg, detect_node])

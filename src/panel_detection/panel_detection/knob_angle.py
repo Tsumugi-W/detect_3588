@@ -980,8 +980,8 @@ def estimate_hex_angle(color_roi: np.ndarray, circle_mask_ratio: float = 0.9,
 
     # 收集所有线段角度，归一化到 [0, sym_angle)
     angles_mod = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
+    for line in np.asarray(lines).reshape(-1, 4):
+        x1, y1, x2, y2 = line
         # 线段角度（相对水平，范围 [0, 180)）
         angle = math.degrees(math.atan2(abs(y2 - y1), abs(x2 - x1)))
         # 利用对称性归一化到 [0, sym_angle)
@@ -1194,8 +1194,8 @@ def estimate_valve_angle(color_roi: np.ndarray,
     candidates = []
     center = np.array([cx, cy], dtype=np.float64)
     if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = [float(v) for v in line[0]]
+        for line in np.asarray(lines).reshape(-1, 4):
+            x1, y1, x2, y2 = [float(v) for v in line]
             p1 = np.array([x1, y1], dtype=np.float64)
             p2 = np.array([x2, y2], dtype=np.float64)
             vec = p2 - p1

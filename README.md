@@ -179,6 +179,30 @@ ros2 bag play panel_test_bag_2 \
 
 当画面中同时出现完整阀门和 AprilTag 参考板时，检测节点会把阀门轴线与参考板深度平面法向量的对比结果写入 `axis_reference_log.jsonl`。每行包含 ROS 时间戳、两组法向量、夹角误差、参考板 RANSAC 内点比例和残差，可用来回到 bag 对应时间点排查误差帧。阀门 bbox 贴近图像边缘时视为不完整，不参与轴线精度统计。
 
+**Bag 彩色图/深度图同步查看与截图**
+
+```bash
+# 终端1：启动同步可视化，S 保存当前对比图，Q 或 Esc 退出
+ros2 run panel_detection rgb_depth_viewer
+
+# 终端2：播放 bag
+ros2 bag play /path/to/bag \
+  --topics /camera/color/image_raw /camera/depth/image_raw
+```
+
+窗口左侧是彩色图，右侧是同一时间戳附近的深度伪彩色图，顶部显示两帧的时间差。默认只配对时间差不超过 20 ms 的图像，深度显示范围为 0.2-3.0 m，截图保存到当前目录的 `rgb_depth_captures/`。需要自动保存第一组同步帧时：
+
+```bash
+ros2 run panel_detection rgb_depth_viewer --ros-args \
+  -p save_once:=true \
+  -p output_dir:=/home/ztl/project/panel_ws/rgb_depth_captures \
+  -p min_depth_m:=0.2 \
+  -p max_depth_m:=2.0
+```
+
+`16UC1`/`mono16` 深度默认按毫米解释（`depth_scale:=0.001`），`32FC1` 按米解释。彩色与深度分辨率不一致时仅缩放深度显示；要逐像素对照，录包和回放时应使用已注册到彩色相机坐标系的深度话题。
+无桌面环境只需要自动截图时可再传入 `-p show_window:=false`。
+
 **旋钮角度模式**
 
 ```bash
@@ -216,6 +240,9 @@ src/panel_detection/scripts/estimate_pipe_axis.py \
 | `config_path` | 空字符串 | 外部 YAML 配置文件路径；为空使用默认配置 | 需要换模型、阈值、相机后端、推理后端时使用 |
 | `detection_mode` | `all` | `panel_detection.launch.py` 的兼容模式选择：`all` / `panel_controls` / `valve` / `fastener` | 新流程通常不用手动设置，三个任务 launch 已固定 |
 | `publish_legacy_topics` | `false` | 是否发布 `/panel/valves`、`/panel/bolts` 等旧 PoseStamped 兼容话题 | 旧下游仍订阅这些话题时才打开 |
+| `capture_dir` | 空字符串 | 非空时按 ROS 图像时间戳保存完整检测 canvas | bag 批量复核或制作检测截图时设置 |
+| `capture_hz` | `1.0` | `capture_dir` 启用时的输入采样和画面保存频率 | 需要其他采样频率时修改 |
+| `show_gui` | `true` | 是否显示 OpenCV 检测窗口 | 无桌面批处理时设为 `false` |
 
 ### 指定配置文件
 

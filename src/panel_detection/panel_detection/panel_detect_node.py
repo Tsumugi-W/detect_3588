@@ -236,6 +236,21 @@ def _stamp_to_sec(stamp):
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
 
+def _pop_synced_frame_pair(color_queue, depth_queue, max_dt):
+    """Pop the oldest timestamp-compatible color/depth pair."""
+    while color_queue and depth_queue:
+        color_item = color_queue[0]
+        depth_item = depth_queue[0]
+        delta = color_item[0] - depth_item[0]
+        if abs(delta) <= max_dt:
+            return color_queue.popleft(), depth_queue.popleft()
+        if delta < 0.0:
+            color_queue.popleft()
+        else:
+            depth_queue.popleft()
+    return None
+
+
 def _estimate_detection_point(det, depth_image, intrin, depth_scale):
     """
     估计检测目标中心 3D 点。
@@ -828,6 +843,10 @@ class PanelDetectionNode(Node):
         self._topic_depth_stamp = None
         self._topic_color_stamp_msg = None
         self._topic_depth_stamp_msg = None
+        self._topic_color_queue = deque(maxlen=10)
+        self._topic_depth_queue = deque(maxlen=10)
+        self._topic_pair_queue = deque(maxlen=10)
+        self._last_topic_enqueue_stamp = None
         self._topic_color_intrin = None
         self._topic_depth_intrin = None
         self._topic_frame_lock = threading.Lock()
@@ -950,12 +969,30 @@ class PanelDetectionNode(Node):
 
         # 可视化
         self.display_frame = None
+        self.declare_parameter('capture_dir', '')
+        self.declare_parameter('capture_hz', 1.0)
+        self.declare_parameter('show_gui', True)
+        self._capture_dir = self.get_parameter(
+            'capture_dir').get_parameter_value().string_value
+        capture_hz = self.get_parameter(
+            'capture_hz').get_parameter_value().double_value
+        self._capture_interval = 1.0 / capture_hz if capture_hz > 0.0 else None
+        self._last_capture_stamp = None
+        if self._capture_dir:
+            self._capture_dir = os.path.abspath(os.path.expanduser(self._capture_dir))
+            os.makedirs(self._capture_dir, exist_ok=True)
+            self.get_logger().info(
+                f'检测画面保存: {self._capture_dir} ({capture_hz:g} Hz)')
+
         self._gui_enabled = False
-        try:
-            cv2.namedWindow('panel_detection', cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-            self._gui_enabled = True
-        except cv2.error:
-            self.get_logger().warn('无显示环境，禁用 GUI 可视化')
+        if self.get_parameter('show_gui').get_parameter_value().bool_value:
+            try:
+                cv2.namedWindow(
+                    'panel_detection',
+                    cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                self._gui_enabled = True
+            except cv2.error:
+                self.get_logger().warn('无显示环境，禁用 GUI 可视化')
 
         status = '运行中' if self._camera_ready else '等待相机'
         self.get_logger().info(f'面板检测节点已启动 ({status})')
@@ -983,6 +1020,34 @@ class PanelDetectionNode(Node):
             }
             self._axis_ref_log_fp.write(json.dumps(record, ensure_ascii=False) + '\n')
 
+    def _update_display_frame(self, canvas, stamp=None):
+        self.display_frame = canvas
+        if not self._capture_dir or self._capture_interval is None:
+            return
+
+        if stamp is None:
+            stamp_seconds = time.time()
+            stamp_sec = int(stamp_seconds)
+            stamp_nanosec = int(round(
+                (stamp_seconds - stamp_sec) * 1e9))
+        else:
+            stamp_sec = int(stamp.sec)
+            stamp_nanosec = int(stamp.nanosec)
+            stamp_seconds = stamp_sec + stamp_nanosec * 1e-9
+
+        if (self._last_capture_stamp is not None and
+                stamp_seconds - self._last_capture_stamp <
+                self._capture_interval - 1e-6):
+            return
+
+        filename = f'{stamp_sec}_{stamp_nanosec:09d}.jpg'
+        output_path = os.path.join(self._capture_dir, filename)
+        if cv2.imwrite(
+                output_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+            self._last_capture_stamp = stamp_seconds
+        else:
+            self.get_logger().warn(f'检测画面保存失败: {output_path}')
+
     def destroy_node(self):
         if self._axis_ref_log_fp is not None:
             try:
@@ -994,9 +1059,9 @@ class PanelDetectionNode(Node):
     def _init_subscribers(self):
         """订阅相机话题，检测循环按 header stamp 取近似同步帧。"""
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-        # 只保留最新1帧，避免推理跟不上时帧堆积导致 OOM
+        # 保留短队列，供推理循环按时间戳消费同步帧。
         img_qos = QoSProfile(
-            depth=1,
+            depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST)
         self._sub_color = self.create_subscription(
@@ -1018,6 +1083,9 @@ class PanelDetectionNode(Node):
             self._topic_color = image
             self._topic_color_stamp = _stamp_to_sec(msg.header.stamp)
             self._topic_color_stamp_msg = msg.header.stamp
+            self._topic_color_queue.append((
+                self._topic_color_stamp, msg.header.stamp, image))
+            self._queue_synced_pairs_locked()
 
     def _depth_callback(self, msg):
         if msg.encoding in ('16UC1', 'mono16'):
@@ -1032,6 +1100,9 @@ class PanelDetectionNode(Node):
             self._topic_depth = depth
             self._topic_depth_stamp = _stamp_to_sec(msg.header.stamp)
             self._topic_depth_stamp_msg = msg.header.stamp
+            self._topic_depth_queue.append((
+                self._topic_depth_stamp, msg.header.stamp, depth))
+            self._queue_synced_pairs_locked()
 
     def _color_info_callback(self, msg):
         intrin = CameraIntrinsics(
@@ -1053,28 +1124,41 @@ class PanelDetectionNode(Node):
         with self._topic_frame_lock:
             self._topic_depth_intrin = intrin
 
+    def _queue_synced_pairs_locked(self):
+        while True:
+            pair = _pop_synced_frame_pair(
+                self._topic_color_queue,
+                self._topic_depth_queue,
+                self._topic_sync_max_dt,
+            )
+            if pair is None:
+                return
+            color_item, depth_item = pair
+            if self._capture_dir and self._capture_interval is not None:
+                if (self._last_topic_enqueue_stamp is not None and
+                        color_item[0] - self._last_topic_enqueue_stamp <
+                        self._capture_interval - 1e-6):
+                    continue
+                self._last_topic_enqueue_stamp = color_item[0]
+            else:
+                # Normal live mode prioritizes the freshest complete pair.
+                self._topic_pair_queue.clear()
+            self._topic_pair_queue.append((color_item, depth_item))
+
     def _get_synced_topic_frames(self):
         with self._topic_frame_lock:
-            if (self._topic_color is None or self._topic_depth is None or
-                    self._topic_color_intrin is None or self._topic_depth_intrin is None or
-                    self._topic_color_stamp is None or self._topic_depth_stamp is None):
+            if (self._topic_color_intrin is None or
+                    self._topic_depth_intrin is None or
+                    not self._topic_pair_queue):
                 return None
-            dt = abs(self._topic_color_stamp - self._topic_depth_stamp)
-            if dt > self._topic_sync_max_dt:
-                now = time.time()
-                if now - self._last_sync_warn > 1.0:
-                    self._last_sync_warn = now
-                    self.get_logger().warn(
-                        f'彩色/深度帧时间差 {dt:.3f}s 超过阈值 '
-                        f'{self._topic_sync_max_dt:.3f}s，跳过本轮检测')
-                return None
+            color_item, depth_item = self._topic_pair_queue.popleft()
             return (
                 self._topic_color_intrin,
                 self._topic_depth_intrin,
-                self._topic_color.copy(),
-                self._topic_depth.copy(),
-                self._topic_color_stamp_msg,
-                self._topic_depth_stamp_msg,
+                color_item[2],
+                depth_item[2],
+                color_item[1],
+                depth_item[1],
             )
 
     def _select_deprojection_intrin(self, color_intrin, depth_intrin,
@@ -1294,7 +1378,7 @@ class PanelDetectionNode(Node):
         canvas, class_id_list, xyxy_list, conf_list = self._detector.detect(color_image)
         t1 = time.time()
         if not xyxy_list:
-            self.display_frame = canvas
+            self._update_display_frame(canvas, color_stamp)
             self._publish_status('no_detection')
             return
 
@@ -1352,7 +1436,7 @@ class PanelDetectionNode(Node):
             ]
         active_xyxy_list = [det.bbox for det in frame_detections]
         if not frame_detections:
-            self.display_frame = canvas
+            self._update_display_frame(canvas, color_stamp)
             self._publish_status('no_detection')
             return
 
@@ -2020,7 +2104,7 @@ class PanelDetectionNode(Node):
         cv2.putText(canvas, 'REGISTERED', (10, canvas.shape[0] - 15),
                     0, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
-        self.display_frame = canvas
+        self._update_display_frame(canvas, stamp)
 
 
 def main(args=None):

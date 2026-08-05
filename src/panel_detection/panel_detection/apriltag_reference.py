@@ -33,6 +33,26 @@ def _get_apriltag_dictionary(name):
     return cv2.aruco.Dictionary_get(dictionary_id)
 
 
+def _detect_aruco_markers(gray, dictionary):
+    """Detect markers through either the modern or legacy OpenCV API."""
+    aruco = cv2.aruco
+    if hasattr(aruco, 'ArucoDetector'):
+        params = aruco.DetectorParameters()
+        detector = aruco.ArucoDetector(dictionary, params)
+        return detector.detectMarkers(gray)
+
+    if hasattr(aruco, 'DetectorParameters_create'):
+        params = aruco.DetectorParameters_create()
+    elif hasattr(aruco, 'DetectorParameters'):
+        params = aruco.DetectorParameters()
+    else:
+        return (), None, ()
+
+    if not hasattr(aruco, 'detectMarkers'):
+        return (), None, ()
+    return aruco.detectMarkers(gray, dictionary, parameters=params)
+
+
 def _detect_tag_like_fallback_corners(gray, cfg=None):
     """Fallback for printed tag boards that are visible but not decodable."""
     cfg = cfg or {}
@@ -100,9 +120,8 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
         cfg.get('dictionary', 'DICT_APRILTAG_36h11'))
     if dictionary is None:
         return None
-    params = cv2.aruco.DetectorParameters_create()
     gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary, parameters=params)
+    corners, ids, _ = _detect_aruco_markers(gray, dictionary)
     if ids is None or len(corners) == 0:
         if not cfg.get('fallback_enable', True):
             return None

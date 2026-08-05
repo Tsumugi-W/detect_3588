@@ -102,7 +102,7 @@ def estimate_pipe_axis_from_image(
     segments = []
     angles = []
     weights = []
-    for line in lines[:, 0, :]:
+    for line in np.asarray(lines).reshape(-1, 4):
         lx1, ly1, lx2, ly2 = [float(v) for v in line]
         dx = lx2 - lx1
         dy = ly2 - ly1
