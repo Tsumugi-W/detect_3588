@@ -405,7 +405,10 @@ class NameplateRecognizer:
         best_conf = 0.0
 
         for img in candidates:
-            img = self._upscale(img, min_height=48)
+            # 原始高度太小（<12px）几乎不可能恢复文字
+            if img.shape[0] < 12:
+                continue
+            img = self._upscale(img, min_height=64)
             # 多种预处理策略
             variants = [
                 img,                             # 原图（放大后）
@@ -415,7 +418,7 @@ class NameplateRecognizer:
             ]
             for variant in variants:
                 text, conf = self._ocr_single(variant)
-                if len(text) >= 2 and conf > best_conf:
+                if len(text) >= 2 and conf > best_conf and conf >= 0.6:
                     best_text = text
                     best_conf = conf
 
