@@ -153,12 +153,61 @@ class NameplateRecognizer:
 
             text = self._recognize_text(roi)
             if text:
-                self._votes[target_id][text] += 1
+                # 编辑距离合并：如果新文字与已有投票中某个条目相似，合并到该条目
+                merged_key = self._find_similar_vote(target_id, text)
+                self._votes[target_id][merged_key] += 1
                 top_text, count = self._votes[target_id].most_common(1)[0]
                 if count >= self.confirm_frames:
                     self._confirmed[target_id] = top_text
 
         return dict(self._confirmed)
+
+    def _find_similar_vote(self, target_id: int, text: str) -> str:
+        """
+        在已有投票中找编辑距离最近的条目，距离 <= 阈值时合并。
+
+        策略：较长的文字更可能是完整识别结果，合并时保留更长的那个。
+        """
+        votes = self._votes.get(target_id)
+        if not votes:
+            return text
+
+        best_match = None
+        best_dist = float('inf')
+        threshold = max(1, len(text) // 3)  # 允许 1/3 字符差异
+
+        for existing in votes:
+            dist = self._edit_distance(text, existing)
+            if dist < best_dist:
+                best_dist = dist
+                best_match = existing
+
+        if best_match is not None and best_dist <= threshold and best_dist > 0:
+            # 保留更长的文字作为 key（更可能是完整结果）
+            return text if len(text) > len(best_match) else best_match
+
+        return text
+
+    @staticmethod
+    def _edit_distance(a: str, b: str) -> int:
+        """计算两个字符串的编辑距离（Levenshtein）"""
+        m, n = len(a), len(b)
+        if m == 0:
+            return n
+        if n == 0:
+            return m
+        dp = list(range(n + 1))
+        for i in range(1, m + 1):
+            prev = dp[0]
+            dp[0] = i
+            for j in range(1, n + 1):
+                temp = dp[j]
+                if a[i - 1] == b[j - 1]:
+                    dp[j] = prev
+                else:
+                    dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+                prev = temp
+        return dp[n]
 
     def _extract_nameplate_roi(self, det, color_image: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -199,66 +248,184 @@ class NameplateRecognizer:
         return color_image[roi_y1:roi_y2, roi_x1:roi_x2].copy()
 
     @staticmethod
-    def _preprocess_roi(roi: np.ndarray) -> np.ndarray:
-        """对铭牌 ROI 做预处理以提升 OCR 识别率"""
+    def _locate_nameplate_in_roi(roi: np.ndarray) -> Optional[np.ndarray]:
+        """
+        在粗 ROI 内精定位铭牌金属板区域。
+
+        铭牌特征：灰色面板背景上的浅色/银色矩形小板，宽高比 2:1~6:1。
+        通过自适应阈值 + 轮廓检测找到最可能的铭牌矩形并裁剪。
+        """
         h, w = roi.shape[:2]
-        # 放大至最短边不小于 64px，提升小文字辨识度
-        min_side = 64
-        if min(h, w) < min_side:
-            scale = min_side / min(h, w)
+        if h < 10 or w < 10:
+            return None
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        # 自适应阈值：铭牌在背景上通常偏亮（银色金属）
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 25, -8)
+
+        # 形态学闭合填充文字间隙
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_plate = None
+        best_area = 0
+        min_area = h * w * 0.05
+        max_area = h * w * 0.85
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area or area > max_area:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            rw, rh = rect[1]
+            if rw < 1 or rh < 1:
+                continue
+            # 确保 rw > rh
+            if rw < rh:
+                rw, rh = rh, rw
+            aspect = rw / rh
+            # 铭牌宽高比约 2~7
+            if not (1.5 <= aspect <= 8.0):
+                continue
+            if area > best_area:
+                best_area = area
+                x, y, bw, bh = cv2.boundingRect(cnt)
+                best_plate = roi[y:y+bh, x:x+bw]
+
+        return best_plate
+
+    @staticmethod
+    def _upscale(roi: np.ndarray, min_height: int = 48) -> np.ndarray:
+        """放大图像使短边不小于 min_height"""
+        h, w = roi.shape[:2]
+        if h < min_height:
+            scale = min_height / h
             roi = cv2.resize(roi, None, fx=scale, fy=scale,
                              interpolation=cv2.INTER_CUBIC)
-        # 转灰度 → CLAHE 增强对比 → 转回 BGR
+        return roi
+
+    @staticmethod
+    def _preprocess_clahe(roi: np.ndarray) -> np.ndarray:
+        """CLAHE 对比度增强"""
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
         enhanced = clahe.apply(gray)
         return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
-    def _recognize_text(self, roi: np.ndarray) -> Optional[str]:
-        """对 ROI 执行 OCR 并返回识别文字"""
-        if self._ocr is None:
-            return None
-        roi = self._preprocess_roi(roi)
+    @staticmethod
+    def _preprocess_sharpen(roi: np.ndarray) -> np.ndarray:
+        """锐化 + 对比拉伸"""
+        kernel = np.array([[-1, -1, -1],
+                           [-1,  9, -1],
+                           [-1, -1, -1]], dtype=np.float32)
+        sharpened = cv2.filter2D(roi, -1, kernel)
+        # 对比拉伸
+        lab = cv2.cvtColor(sharpened, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = cv2.normalize(l, None, 0, 255, cv2.NORM_MINMAX)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
+    @staticmethod
+    def _preprocess_binary(roi: np.ndarray) -> np.ndarray:
+        """自适应二值化（适合刻字铭牌）"""
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 15, 5)
+        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    def _ocr_single(self, image: np.ndarray) -> Tuple[str, float]:
+        """对单张图执行 OCR，返回 (合并文字, 平均置信度)"""
         try:
             if self._ocr_backend == 'rapidocr':
-                result, _ = self._ocr(roi)
+                result, _ = self._ocr(image)
                 if not result:
-                    return None
-                # RapidOCR 返回 [(box, text, conf), ...]
+                    return ('', 0.0)
                 texts = []
+                confs = []
                 for item in result:
                     box, text, conf = item
-                    if conf >= 0.5:
+                    if conf >= 0.4:
                         texts.append(text)
+                        confs.append(conf)
             else:
-                # PaddleOCR 3.7 predict API
-                results = self._ocr.predict(roi)
+                results = self._ocr.predict(image)
                 if not results:
-                    return None
+                    return ('', 0.0)
                 texts = []
+                confs = []
                 for r in results:
                     if hasattr(r, 'rec_text'):
-                        if r.rec_score >= 0.5:
+                        if r.rec_score >= 0.4:
                             texts.append(r.rec_text)
+                            confs.append(r.rec_score)
                     elif isinstance(r, dict):
                         text = r.get('text', r.get('rec_text', ''))
                         conf = r.get('confidence', r.get('rec_score', 0))
-                        if conf >= 0.5 and text:
+                        if conf >= 0.4 and text:
                             texts.append(text)
+                            confs.append(conf)
         except Exception:
-            return None
+            return ('', 0.0)
 
         if not texts:
-            return None
+            return ('', 0.0)
 
-        # 合并为单行文字，去除多余空白
         merged = ''.join(texts).strip()
-        # 过滤掉纯数字/单字符等噪声结果
-        if len(merged) < 2:
+        avg_conf = sum(confs) / len(confs) if confs else 0.0
+        return (merged, avg_conf)
+
+    def _recognize_text(self, roi: np.ndarray) -> Optional[str]:
+        """
+        对 ROI 执行多策略 OCR，取置信度最高的结果。
+
+        流程：
+          1. 尝试在 ROI 内精定位铭牌矩形
+          2. 对定位后的图像尝试多种预处理
+          3. 取置信度最高且长度 >= 2 的结果
+        """
+        if self._ocr is None:
             return None
 
-        return merged
+        # 精定位铭牌区域
+        plate = self._locate_nameplate_in_roi(roi)
+        # 用精定位结果和原始 ROI 都尝试
+        candidates = []
+        if plate is not None and plate.size > 0:
+            candidates.append(plate)
+        candidates.append(roi)
+
+        best_text = ''
+        best_conf = 0.0
+
+        for img in candidates:
+            img = self._upscale(img, min_height=48)
+            # 多种预处理策略
+            variants = [
+                img,                             # 原图（放大后）
+                self._preprocess_clahe(img),     # CLAHE
+                self._preprocess_sharpen(img),   # 锐化
+                self._preprocess_binary(img),    # 二值化
+            ]
+            for variant in variants:
+                text, conf = self._ocr_single(variant)
+                if len(text) >= 2 and conf > best_conf:
+                    best_text = text
+                    best_conf = conf
+
+        if len(best_text) < 2:
+            return None
+        # 铭牌应以中文为主，过滤表盘数字/英文噪声
+        cjk_count = sum(1 for c in best_text if '一' <= c <= '鿿')
+        if cjk_count < 2 or cjk_count < len(best_text) * 0.5:
+            return None
+        return best_text
 
     def reset(self):
         """重置所有状态（如需重新识别）"""
