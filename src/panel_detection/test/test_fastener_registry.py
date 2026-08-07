@@ -136,3 +136,14 @@ def test_fastener_registry_prefers_axis_consensus_over_non_coplanar_centers():
     assert {item.group_id for item in second.values()} == {1}
     assert second[10].target_id == 2
     assert second[11].target_id == 4
+
+
+def test_fastener_registry_rejects_invalid_depth_points():
+    registry = FastenerGroupRegistry()
+    invalid = [
+        _obs(0, (100, 100), (0.0, 0.0, 0.0)),
+        _obs(1, (200, 100), (0.1, 0.0, -0.2)),
+        _obs(2, (100, 200), (float('nan'), 0.0, 0.3)),
+    ]
+
+    assert registry.update(invalid, frame_index=1) == {}

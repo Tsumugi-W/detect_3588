@@ -305,6 +305,25 @@ def _estimate_nut_detection_point(localization, depth_image, intrin, depth_scale
     return ux, uy, xyz
 
 
+def _estimate_bbox_grouping_point(det, depth_image, intrin, depth_scale):
+    """Estimate a robust center point used only for fastener grouping."""
+    ux = int(round(det.center_x))
+    uy = int(round(det.center_y))
+    depth = get_bbox_robust_depth(
+        depth_image, det.bbox, depth_scale=depth_scale,
+        center_ratio=0.70, min_valid=12, quantile=0.5)
+    if depth <= 0.0:
+        return ux, uy, None
+    return ux, uy, deproject_pixel_to_point(intrin, (ux, uy), depth)
+
+
+def _valid_point_3d(xyz):
+    if xyz is None:
+        return False
+    point = np.asarray(xyz, dtype=np.float64)
+    return point.shape == (3,) and np.all(np.isfinite(point)) and point[2] > 0.0
+
+
 def _is_button_like_detection(det):
     """允许被当作按钮的几何形状：近似方形/圆形，排除细长指示灯。"""
     w = max(1.0, det.bbox[2] - det.bbox[0])
@@ -1716,6 +1735,17 @@ class PanelDetectionNode(Node):
                     cv2.putText(canvas, f'nut refine fail {conf_text:.2f}',
                                 (x1, max(15, y1 - 8)), 0, 0.4,
                                 (0, 0, 255), 1, cv2.LINE_AA)
+                    ux, uy, fallback_xyz = _estimate_bbox_grouping_point(
+                        det, filtered_depth, deproj_intrin, self._depth_scale)
+                    if _valid_point_3d(fallback_xyz):
+                        fastener_observation_base[det_idx] = {
+                            'det_idx': det_idx,
+                            'class_name': det.class_name,
+                            'center_xy': (float(det.center_x), float(det.center_y)),
+                            'bbox': tuple(float(v) for v in det.bbox),
+                            'confidence': float(det.confidence) * 0.75,
+                            'point_3d': [float(value) for value in fallback_xyz],
+                        }
                     continue
 
                 ux, uy, xyz = _estimate_nut_detection_point(
@@ -1729,7 +1759,7 @@ class PanelDetectionNode(Node):
                             (ux + 10, uy - 8), 0, 0.4,
                             (0, 255, 255), 1, cv2.LINE_AA)
 
-                if xyz is None:
+                if not _valid_point_3d(xyz):
                     cv2.putText(canvas, 'nut depth fail',
                                 (ux + 10, uy + 18), 0, 0.4,
                                 (0, 0, 255), 1, cv2.LINE_AA)
@@ -1739,6 +1769,12 @@ class PanelDetectionNode(Node):
             else:
                 ux, uy, xyz = _estimate_detection_point(
                     det, filtered_depth, deproj_intrin, self._depth_scale)
+                if not _valid_point_3d(xyz):
+                    x1, y1 = int(det.bbox[0]), int(det.bbox[1])
+                    cv2.putText(canvas, f'{det.class_name} depth fail',
+                                (x1, max(15, y1 - 8)), 0, 0.4,
+                                (0, 0, 255), 1, cv2.LINE_AA)
+                    continue
                 if det.class_name != 'bolt':
                     _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 

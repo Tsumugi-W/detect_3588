@@ -415,6 +415,8 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 编号定义为每个 `group_id` 内的局部槽位：`1=top_left`、`2=top_right`、`3=bottom_right`、`4=bottom_left`。机械臂指定目标时应使用 `group_id + id`，不要只使用单独的 `id`。冷启动只有 2 个 fastener 可见时会输出稳定的临时 ID，但两点无法唯一确定四槽位布局，因此 `registered=false`，第三个目标出现后 ID 可能校正一次；模板注册后，即使后续只检测到部分目标，也会按历史槽位继续编号。
 
+螺母外轮廓精定位失败时，bbox 中心的有效深度只用于分组编号，不会作为机械臂操作点发布；无效深度或 `(0,0,0)` 坐标不会进入目标话题和注册器。
+
 ### /fasteners/geometry (String, JSON) — 螺栓/螺母角度与轴线方向
 
 `fastener_detection.launch.py` 只发布 `class=bolt` / `class=nut` 的条目：

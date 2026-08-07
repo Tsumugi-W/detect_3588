@@ -173,7 +173,10 @@ class FastenerGroupRegistry:
                frame_index: int) -> Dict[int, FastenerAssignment]:
         valid = [
             obs for obs in observations
-            if obs.point_3d is not None and np.asarray(obs.point_3d).shape[0] == 3
+            if obs.point_3d is not None
+            and np.asarray(obs.point_3d).shape == (3,)
+            and np.all(np.isfinite(np.asarray(obs.point_3d, dtype=np.float64)))
+            and float(np.asarray(obs.point_3d, dtype=np.float64)[2]) > 0.0
         ]
         self._prune(frame_index)
         assignments: Dict[int, FastenerAssignment] = {}
