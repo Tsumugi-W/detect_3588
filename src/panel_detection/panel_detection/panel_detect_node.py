@@ -48,6 +48,10 @@ from .knob_angle import (
     estimate_valve_angle, estimate_valve_angle_candidates, draw_hex_angle,
 )
 from .fastener_registry import FastenerGroupRegistry, FastenerObservation
+from .fastener_axis_stabilizer import (
+    FastenerAxisMeasurement,
+    FastenerAxisStabilizer,
+)
 from .nameplate_ocr import NameplateRecognizer
 from .nut_localizer import localize_nut
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
@@ -83,13 +87,30 @@ DEFAULT_CONFIG = {
         'edge_margin_px': 4,
     },
     'fastener_registry': {
-        'min_init_observations': 3,
+        'min_init_observations': 2,
         'max_group_distance_m': 0.35,
         'max_slot_distance_m': 0.12,
         'slot_match_ratio': 0.45,
         'normal_angle_thresh_deg': 25.0,
         'ema_alpha': 0.35,
         'stale_frames': 120,
+    },
+    'fastener_axis_stabilizer': {
+        'enable': True,
+        'ema_alpha': 0.18,
+        'max_jump_deg': 12.0,
+        'confirm_frames': 5,
+        'match_distance_px': 60.0,
+        'match_size_ratio': 1.2,
+        'stale_frames': 60,
+    },
+    'fastener_position_stabilizer': {
+        'enable': True,
+        'still_time': 1.0,
+        'pixel_thresh': 5.0,
+        'window_size': 30,
+        'ema_alpha': 0.20,
+        'depth_std_thresh': 0.008,
     },
     'valve_angle_stabilizer': {
         'enable': False,
@@ -817,7 +838,7 @@ class PanelDetectionNode(Node):
         )
         fastener_reg_cfg = self.cfg.get('fastener_registry', {})
         self._fastener_registry = FastenerGroupRegistry(
-            min_init_observations=fastener_reg_cfg.get('min_init_observations', 3),
+            min_init_observations=fastener_reg_cfg.get('min_init_observations', 2),
             max_group_distance_m=fastener_reg_cfg.get('max_group_distance_m', 0.35),
             max_slot_distance_m=fastener_reg_cfg.get('max_slot_distance_m', 0.12),
             slot_match_ratio=fastener_reg_cfg.get('slot_match_ratio', 0.45),
@@ -825,6 +846,16 @@ class PanelDetectionNode(Node):
                 'normal_angle_thresh_deg', 25.0),
             ema_alpha=fastener_reg_cfg.get('ema_alpha', 0.35),
             stale_frames=fastener_reg_cfg.get('stale_frames', 120),
+        )
+        fastener_axis_cfg = self.cfg.get('fastener_axis_stabilizer', {})
+        self._fastener_axis_stabilizer = FastenerAxisStabilizer(
+            enabled=fastener_axis_cfg.get('enable', True),
+            ema_alpha=fastener_axis_cfg.get('ema_alpha', 0.18),
+            max_jump_deg=fastener_axis_cfg.get('max_jump_deg', 12.0),
+            confirm_frames=fastener_axis_cfg.get('confirm_frames', 5),
+            match_distance_px=fastener_axis_cfg.get('match_distance_px', 60.0),
+            match_size_ratio=fastener_axis_cfg.get('match_size_ratio', 1.2),
+            stale_frames=fastener_axis_cfg.get('stale_frames', 60),
         )
 
         # 相机来源：直接连接 or 话题订阅
@@ -933,6 +964,15 @@ class PanelDetectionNode(Node):
             window_size=pos_cfg.get('window_size', 45),
             ema_alpha=pos_cfg.get('ema_alpha', 0.25),
             depth_std_thresh=pos_cfg.get('depth_std_thresh', 0.01),
+        )
+        fastener_pos_cfg = self.cfg.get('fastener_position_stabilizer', {})
+        self._fastener_position_stabilizer = PositionStabilizer(
+            enabled=fastener_pos_cfg.get('enable', True),
+            still_time=fastener_pos_cfg.get('still_time', 1.0),
+            pixel_thresh=fastener_pos_cfg.get('pixel_thresh', 5.0),
+            window_size=fastener_pos_cfg.get('window_size', 30),
+            ema_alpha=fastener_pos_cfg.get('ema_alpha', 0.20),
+            depth_std_thresh=fastener_pos_cfg.get('depth_std_thresh', 0.008),
         )
         self._panel_line_cfg = self.cfg.get('panel_line', {})
         self._persistent_panel_axis = PersistentPanelAxis(
@@ -1692,11 +1732,12 @@ class PanelDetectionNode(Node):
                                 (0, 0, 255), 1, cv2.LINE_AA)
                     continue
 
-                _publish_pose(self._pose_pubs.get('nut'), stamp, xyz, quat)
+                # Fastener legacy pose is published after ID-based position filtering.
             else:
                 ux, uy, xyz = _estimate_detection_point(
                     det, filtered_depth, deproj_intrin, self._depth_scale)
-                _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
+                if det.class_name != 'bolt':
+                    _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
             if det.class_name in ('valve', 'bolt', 'nut'):
                 target_item = {
@@ -1721,9 +1762,10 @@ class PanelDetectionNode(Node):
                         'point_3d': [float(xyz[0]), float(xyz[1]), float(xyz[2])],
                     }
 
-            cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
-                        (ux + 10, uy + 5), 0, 0.4,
-                        (225, 255, 255), 1, cv2.LINE_AA)
+            if det.class_name not in ('bolt', 'nut'):
+                cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
+                            (ux + 10, uy + 5), 0, 0.4,
+                            (225, 255, 255), 1, cv2.LINE_AA)
 
         apriltag_reference = None
         if self._process_valves and self._apriltag_reference_enabled:
@@ -1880,11 +1922,11 @@ class PanelDetectionNode(Node):
                             float(axis_normal[2]),
                         ]
                         fastener_geometry_items.setdefault(det_idx, []).append(axis_item)
-                    axis_color = (255, 255, 0) if det.class_name == 'valve' else (255, 0, 255)
-                    _draw_axis_direction(
-                        canvas, det.bbox, axis_normal,
-                        label=f'{det.class_name}_axis[{axis_source}]',
-                        color=axis_color)
+                    if det.class_name == 'valve':
+                        _draw_axis_direction(
+                            canvas, det.bbox, axis_normal,
+                            label=f'{det.class_name}_axis[{axis_source}]',
+                            color=(255, 255, 0))
 
                 hex_angle = loc.angle if reliable_nut and loc.angle is not None else None
                 if hex_angle is None:
@@ -1925,6 +1967,36 @@ class PanelDetectionNode(Node):
                     elif det.class_name != 'nut' or not reliable_nut:
                         draw_hex_angle(canvas, det.bbox, hex_angle)
 
+        fastener_axis_measurements = []
+        for det_idx, raw_axis in fastener_axis_by_det_idx.items():
+            det = frame_detections[det_idx]
+            fastener_axis_measurements.append(FastenerAxisMeasurement(
+                det_idx=det_idx,
+                center_xy=(float(det.center_x), float(det.center_y)),
+                bbox=tuple(float(value) for value in det.bbox),
+                axis_direction=raw_axis,
+            ))
+        stabilized_fastener_axes = self._fastener_axis_stabilizer.update(
+            fastener_axis_measurements, self._frame_count)
+        for det_idx, stable_axis in stabilized_fastener_axes.items():
+            stable_values = [float(value) for value in stable_axis]
+            fastener_axis_by_det_idx[det_idx] = stable_values
+            axis_item = None
+            for geometry_item in fastener_geometry_items.get(det_idx, []):
+                if 'axis_direction' not in geometry_item:
+                    continue
+                geometry_item['axis_direction'] = [
+                    round(value, 6) for value in stable_values
+                ]
+                axis_item = geometry_item
+            if axis_item is None:
+                continue
+            det = frame_detections[det_idx]
+            _draw_axis_direction(
+                canvas, det.bbox, stable_axis,
+                label=f"{det.class_name}_axis[{axis_item['source']}]",
+                color=(255, 0, 255))
+
         axis_reference = None
         if apriltag_reference is not None:
             axis_reference = {
@@ -1950,6 +2022,7 @@ class PanelDetectionNode(Node):
 
         _draw_axis_3d_view(canvas, axis_directions)
 
+        assignments = {}
         if self._process_fasteners and fastener_observation_base:
             observations = []
             for det_idx, base in fastener_observation_base.items():
@@ -1993,6 +2066,40 @@ class PanelDetectionNode(Node):
                 cv2.putText(canvas, label, (x1 + 3, text_y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                             (0, 255, 255), 2, cv2.LINE_AA)
+
+        fastener_position_keys = {}
+        fastener_position_measurements = []
+        for det_idx, assignment in assignments.items():
+            base = fastener_observation_base.get(det_idx)
+            if base is None:
+                continue
+            filter_key = (assignment.group_id, assignment.target_id)
+            fastener_position_keys[det_idx] = filter_key
+            fastener_position_measurements.append((
+                filter_key,
+                base['center_xy'],
+                base['point_3d'],
+            ))
+        stable_fastener_xyz = self._fastener_position_stabilizer.update(
+            fastener_position_measurements, time.time())
+
+        for det_idx, target_item in fastener_target_items.items():
+            base = fastener_observation_base.get(det_idx)
+            if base is None:
+                continue
+            filter_key = fastener_position_keys.get(det_idx)
+            xyz = stable_fastener_xyz.get(filter_key, base['point_3d'])
+            target_item['position'] = {
+                'x': round(float(xyz[0]), 4),
+                'y': round(float(xyz[1]), 4),
+                'z': round(float(xyz[2]), 4),
+            }
+            det = frame_detections[det_idx]
+            ux, uy = [int(round(value)) for value in base['center_xy']]
+            cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
+                        (ux + 10, uy + 5), 0, 0.4,
+                        (225, 255, 255), 1, cv2.LINE_AA)
+            _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
         # 发布目标结果：面板模式保持原编号格式；对象模式只包含对应类别。
         if self._process_panel_controls and targets_output and self._targets_pub is not None:

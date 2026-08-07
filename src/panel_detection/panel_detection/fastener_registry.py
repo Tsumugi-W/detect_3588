@@ -141,7 +141,7 @@ def _assign_slots_by_image(observations: List[FastenerObservation]) -> Dict[int,
 class FastenerGroupRegistry:
     """Track and number bolt/nut groups mounted on local four-fastener planes."""
 
-    def __init__(self, min_init_observations=3, max_group_distance_m=0.35,
+    def __init__(self, min_init_observations=2, max_group_distance_m=0.35,
                  max_slot_distance_m=0.12, slot_match_ratio=0.45,
                  normal_angle_thresh_deg=25.0, ema_alpha=0.35,
                  stale_frames=120):
@@ -323,6 +323,9 @@ class FastenerGroupRegistry:
     def _update_group(self, group: _FastenerGroup,
                       observations: List[FastenerObservation],
                       frame_index: int) -> Dict[int, FastenerAssignment]:
+        if len(group.slots) < 4 and len(observations) >= 3:
+            return self._promote_group(group, observations, frame_index)
+
         matches = self._match_observations_to_slots(group, observations)
         if not matches:
             return {}
@@ -366,6 +369,51 @@ class FastenerGroupRegistry:
                 _normalize((1.0 - alpha) * group.normal + alpha * normal))
         group.last_seen_frame = frame_index
         return assignments
+
+    def _promote_group(self, group: _FastenerGroup,
+                       observations: List[FastenerObservation],
+                       frame_index: int) -> Dict[int, FastenerAssignment]:
+        """Replace a provisional two-point layout with a four-slot template."""
+        selected = sorted(
+            observations, key=lambda obs: obs.confidence, reverse=True)[:4]
+        slot_by_det_idx = _assign_slots_by_image(selected)
+        group.slots = {
+            slot_by_det_idx[obs.det_idx]: np.asarray(obs.point_3d, dtype=np.float64)
+            for obs in selected
+        }
+        group.class_by_slot = {
+            slot_by_det_idx[obs.det_idx]: obs.class_name for obs in selected
+        }
+        group.confidence_by_slot = {
+            slot_by_det_idx[obs.det_idx]: float(obs.confidence) for obs in selected
+        }
+        _infer_missing_slot(group.slots)
+        group.origin = np.mean(
+            np.asarray(list(group.slots.values()), dtype=np.float64), axis=0)
+        normals = [
+            _normalize(obs.axis_direction)
+            for obs in selected if obs.axis_direction is not None
+        ]
+        normal = _fit_normal(
+            [np.asarray(point, dtype=np.float64) for point in group.slots.values()],
+            [value for value in normals if value is not None],
+        )
+        if normal is not None:
+            group.normal = normal
+        group.last_seen_frame = frame_index
+
+        registered = len(group.slots) >= 4
+        return {
+            obs.det_idx: FastenerAssignment(
+                det_idx=obs.det_idx,
+                group_id=group.group_id,
+                target_id=slot_by_det_idx[obs.det_idx],
+                slot=SLOT_NAMES[slot_by_det_idx[obs.det_idx]],
+                registered=registered,
+                distance_m=0.0,
+            )
+            for obs in selected
+        }
 
     def _match_observations_to_slots(
             self, group: _FastenerGroup,

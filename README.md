@@ -393,7 +393,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 ### /fasteners/targets (String, JSON) — 螺栓/螺母位置
 
-`fastener_detection.launch.py` 只发布螺栓和螺母目标，`class` 为 `bolt` 或 `nut`。当同一安装面至少 3 个 fastener 被可靠检测后，节点会建立 4 槽位模板，并在后续帧给已检测到的目标附加稳定编号：
+`fastener_detection.launch.py` 只发布螺栓和螺母目标，`class` 为 `bolt` 或 `nut`。同一安装面检测到 2 个 fastener 时会先输出临时编号（`registered=false`）；至少 3 个被可靠检测后，节点会建立 4 槽位模板，并在后续帧给已检测到的目标附加稳定编号：
 
 ```json
 {
@@ -413,7 +413,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 }
 ```
 
-编号定义为每个 `group_id` 内的局部槽位：`1=top_left`、`2=top_right`、`3=bottom_right`、`4=bottom_left`。机械臂指定目标时应使用 `group_id + id`，不要只使用单独的 `id`。首次冷启动只有 1-2 个 fastener 可见时不会强行猜最终编号；模板注册后，即使后续只检测到部分目标，也会按历史槽位继续编号。
+编号定义为每个 `group_id` 内的局部槽位：`1=top_left`、`2=top_right`、`3=bottom_right`、`4=bottom_left`。机械臂指定目标时应使用 `group_id + id`，不要只使用单独的 `id`。冷启动只有 2 个 fastener 可见时会输出稳定的临时 ID，但两点无法唯一确定四槽位布局，因此 `registered=false`，第三个目标出现后 ID 可能校正一次；模板注册后，即使后续只检测到部分目标，也会按历史槽位继续编号。
 
 ### /fasteners/geometry (String, JSON) — 螺栓/螺母角度与轴线方向
 
@@ -664,13 +664,30 @@ panel_line:
   min_proj_margin: 450.0
 
 fastener_registry:
-  min_init_observations: 3      # 首次建立 4 槽位模板所需的最少可见 fastener 数
+  min_init_observations: 2      # 两个目标先建立临时编号，三个目标升级为 4 槽位模板
   max_group_distance_m: 0.35    # 同组聚类的 3D 距离门限
   max_slot_distance_m: 0.12     # 历史槽位匹配的最小距离门限
   slot_match_ratio: 0.45        # 槽距比例门限，和 max_slot_distance_m 取较大值
   normal_angle_thresh_deg: 25.0 # 同组/同槽位法向量夹角门限
   ema_alpha: 0.35               # 槽位 3D 位置平滑系数
   stale_frames: 120             # 多久未观测后删除该 fastener 组
+
+fastener_axis_stabilizer:
+  enable: true                  # 螺栓/螺母法向量跨帧稳定
+  ema_alpha: 0.18               # 小幅变化的单位向量 EMA 系数
+  max_jump_deg: 12.0            # 超过该角度视为候选跳变
+  confirm_frames: 5             # 大角度变化连续出现多少帧后才接受
+  match_distance_px: 60.0       # 静止相机下的目标中心关联距离
+  match_size_ratio: 1.2         # bbox 尺寸相关的关联距离倍率
+  stale_frames: 60              # 轨迹丢失多少帧后删除
+
+fastener_position_stabilizer:
+  enable: true                  # 按 group_id + id 稳定螺栓/螺母三维坐标
+  still_time: 1.0               # 画面静止多久后启用窗口滤波
+  pixel_thresh: 5.0             # 判断目标静止的像素位移门限
+  window_size: 30               # 三维坐标中值滤波窗口
+  ema_alpha: 0.20               # 稳定坐标 EMA 系数
+  depth_std_thresh: 0.008       # 深度标准差门限，单位 m
 
 nameplate_ocr:
   enable: true                 # 铭牌文字识别总开关

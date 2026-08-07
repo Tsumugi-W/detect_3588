@@ -40,14 +40,36 @@ def test_fastener_registry_initializes_from_three_and_tracks_single_target():
     assert matched[10].slot == 'bottom_right'
 
 
-def test_fastener_registry_does_not_guess_final_ids_from_two_cold_start_points():
+def test_fastener_registry_publishes_provisional_ids_from_two_cold_start_points():
     registry = FastenerGroupRegistry()
     matched = registry.update([
         _obs(0, (100, 100), (-0.05, -0.05, 0.5)),
         _obs(1, (200, 100), (0.05, -0.05, 0.5)),
     ], frame_index=1)
 
-    assert matched == {}
+    assert set(matched) == {0, 1}
+    assert {item.group_id for item in matched.values()} == {1}
+    assert len({item.target_id for item in matched.values()}) == 2
+    assert all(not item.registered for item in matched.values())
+
+
+def test_fastener_registry_promotes_two_point_group_when_third_appears():
+    registry = FastenerGroupRegistry(max_slot_distance_m=0.08)
+    first = [
+        _obs(0, (100, 100), (-0.05, -0.05, 0.5)),
+        _obs(1, (200, 100), (0.05, -0.05, 0.5)),
+    ]
+    provisional = registry.update(first, frame_index=1)
+
+    promoted = registry.update(first + [
+        _obs(2, (200, 200), (0.05, 0.05, 0.5)),
+    ], frame_index=2)
+
+    assert {item.group_id for item in promoted.values()} == {
+        provisional[0].group_id
+    }
+    assert {item.target_id for item in promoted.values()} == {1, 2, 3}
+    assert all(item.registered for item in promoted.values())
 
 
 def test_fastener_registry_keeps_spatially_separate_groups_apart():
