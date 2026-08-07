@@ -765,9 +765,7 @@ def _try_color_handle(color_roi, circle_mask, circle_area,
             sector_brightness[s] = np.mean(pixels)
             sector_counts[s] = len(pixels)
 
-    # 用高斯平滑扇区亮度（循环卷积，消除噪声）
-    from scipy.ndimage import uniform_filter1d
-    # 简单用滑窗平均代替（避免依赖 scipy）
+    # 用循环滑窗平均平滑扇区亮度，避免引入 SciPy 运行时依赖。
     smooth = np.zeros(n_sectors)
     kernel_half = 2  # ±2 扇区 = ±20° 平滑
     for s in range(n_sectors):

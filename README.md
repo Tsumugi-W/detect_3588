@@ -621,7 +621,7 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0630.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_model: '0807.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
 onnx_threads: 8
 # rknn_model: '0630.rknn'      # inference_backend='rknn' 时使用
 
@@ -727,10 +727,12 @@ ros2_ws/
             ├── detector_rknn.py
             ├── knob_angle.py
             ├── rgb_depth_viewer.py        ← 彩色/深度同步查看工具
-            ├── 0630.onnx                  ← 默认权重
+            ├── 0630.onnx
             ├── 0630.pt
             ├── 0727.onnx                  ← 备用权重
-            └── 0727.pt
+            ├── 0727.pt
+            ├── 0807.onnx                  ← 默认权重
+            └── 0807.pt
 ```
 
 ## 常见问题

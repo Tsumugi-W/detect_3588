@@ -59,9 +59,9 @@ DEFAULT_CONFIG = {
     'camera': {'color_width': 1280, 'color_height': 720,
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
-    'onnx_model': '0630.onnx',
+    'onnx_model': '0807.onnx',
     'onnx_threads': 8,
-    'weight': '0630.pt',
+    'weight': '0807.pt',
     'input_size': 640,
     'class_num': 8,
     'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump',
@@ -110,7 +110,7 @@ DEFAULT_CONFIG = {
     'detection_mode': 'all',
     'publish_legacy_topics': False,
     'apriltag_reference': {
-        'enable': True,
+        'enable': False,
         'dictionary': 'DICT_APRILTAG_36h11',
         'sample_stride': 3,
         'border_margin_ratio': 0.12,
@@ -950,9 +950,10 @@ class PanelDetectionNode(Node):
         self._normal_interval = self.cfg.get('panel_normal_interval', 10)
         self._last_status_publish_time = 0.0
         ref_cfg = self.cfg.get('apriltag_reference', {})
+        self._apriltag_reference_enabled = bool(ref_cfg.get('enable', False))
         self._axis_ref_log_fp = None
         self._axis_ref_log_path = ''
-        if ref_cfg.get('log_enable', True):
+        if self._apriltag_reference_enabled and ref_cfg.get('log_enable', True):
             self._axis_ref_log_path = os.path.abspath(
                 ref_cfg.get('log_path', 'axis_reference_log.jsonl'))
             try:
@@ -1242,7 +1243,7 @@ class PanelDetectionNode(Node):
 
         if backend == 'onnx':
             from .detector_onnx import YoloV5ORT
-            onnx_path = self.cfg.get('onnx_model', '0520.onnx')
+            onnx_path = self.cfg.get('onnx_model', '0807.onnx')
             if not os.path.isabs(onnx_path):
                 onnx_path = os.path.join(pkg_dir, onnx_path)
             threads = self.cfg.get('onnx_threads', 4)
@@ -1725,7 +1726,7 @@ class PanelDetectionNode(Node):
                         (225, 255, 255), 1, cv2.LINE_AA)
 
         apriltag_reference = None
-        if self._process_valves:
+        if self._process_valves and self._apriltag_reference_enabled:
             apriltag_reference = detect_apriltag_reference_axis(
                 color_image,
                 filtered_depth,

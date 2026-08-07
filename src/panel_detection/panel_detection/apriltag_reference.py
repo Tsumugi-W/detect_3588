@@ -39,7 +39,8 @@ def _detect_aruco_markers(gray, dictionary):
     if hasattr(aruco, 'ArucoDetector'):
         params = aruco.DetectorParameters()
         detector = aruco.ArucoDetector(dictionary, params)
-        return detector.detectMarkers(gray)
+        result = detector.detectMarkers(gray)
+        return _normalize_aruco_result(result)
 
     if hasattr(aruco, 'DetectorParameters_create'):
         params = aruco.DetectorParameters_create()
@@ -50,7 +51,16 @@ def _detect_aruco_markers(gray, dictionary):
 
     if not hasattr(aruco, 'detectMarkers'):
         return (), None, ()
-    return aruco.detectMarkers(gray, dictionary, parameters=params)
+    result = aruco.detectMarkers(gray, dictionary, parameters=params)
+    return _normalize_aruco_result(result)
+
+
+def _normalize_aruco_result(result):
+    """Keep marker IDs compatible across OpenCV versions."""
+    corners, ids, rejected = result
+    if ids is not None:
+        ids = np.asarray(ids, dtype=np.int32).reshape(-1, 1)
+    return corners, ids, rejected
 
 
 def _detect_tag_like_fallback_corners(gray, cfg=None):
@@ -134,8 +144,11 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
         return None
 
     h, w = depth_image.shape[:2]
+    marker_ids = np.asarray(ids, dtype=np.int32).reshape(-1)
     candidates = []
     for idx, corner in enumerate(corners):
+        if idx >= marker_ids.size:
+            continue
         pts = corner.reshape(4, 2).astype(np.float32)
         area = abs(float(cv2.contourArea(pts)))
         if area < 100.0:
@@ -188,7 +201,7 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
             if float(inlier_ratio) < float(cfg.get('fallback_min_inlier_ratio', 0.75)):
                 continue
         candidates.append({
-            'tag_id': int(ids[idx][0]),
+            'tag_id': int(marker_ids[idx]),
             'source': source,
             'corners': pts,
             'normal': normal,

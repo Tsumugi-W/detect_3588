@@ -4,6 +4,7 @@ import numpy as np
 from panel_detection.apriltag_reference import (
     _detect_aruco_markers,
     _get_apriltag_dictionary,
+    _normalize_aruco_result,
 )
 
 
@@ -33,4 +34,16 @@ def test_aruco_detector_finds_generated_marker_when_supported():
     corners, ids, _ = _detect_aruco_markers(gray, dictionary)
 
     assert len(corners) == 1
+    assert ids.shape == (1, 1)
     assert ids.reshape(-1).tolist() == [0]
+
+
+def test_aruco_result_normalizes_flat_marker_ids():
+    corners = [np.zeros((1, 4, 2), dtype=np.float32)]
+    normalized_corners, ids, rejected = _normalize_aruco_result(
+        (corners, np.array([7], dtype=np.int32), []))
+
+    assert normalized_corners is corners
+    assert ids.shape == (1, 1)
+    assert ids.tolist() == [[7]]
+    assert rejected == []
