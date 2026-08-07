@@ -21,6 +21,7 @@ class _AxisTrack:
     last_seen_frame: int
     pending_axis: np.ndarray | None = None
     pending_count: int = 0
+    transitioning: bool = False
 
 
 def _normalize_camera_facing(axis) -> np.ndarray | None:
@@ -45,12 +46,14 @@ class FastenerAxisStabilizer:
     """Stabilize bolt/nut normals using short-lived image-space tracks."""
 
     def __init__(self, enabled=True, ema_alpha=0.18, max_jump_deg=12.0,
-                 confirm_frames=5, match_distance_px=60.0,
+                 confirm_frames=5, max_output_step_deg=3.0,
+                 match_distance_px=60.0,
                  match_size_ratio=1.2, stale_frames=60):
         self.enabled = bool(enabled)
         self.ema_alpha = float(np.clip(ema_alpha, 0.0, 1.0))
         self.max_jump_deg = float(max_jump_deg)
         self.confirm_frames = max(1, int(confirm_frames))
+        self.max_output_step_deg = max(0.1, float(max_output_step_deg))
         self.match_distance_px = float(match_distance_px)
         self.match_size_ratio = float(match_size_ratio)
         self.stale_frames = max(1, int(stale_frames))
@@ -130,6 +133,16 @@ class FastenerAxisStabilizer:
 
     def _update_track(self, track, measurement, raw_axis, frame_index):
         angle = _angle_deg(track.stable_axis, raw_axis)
+        if track.transitioning:
+            track.stable_axis = self._bounded_axis_step(
+                track.stable_axis, raw_axis)
+            if _angle_deg(track.stable_axis, raw_axis) <= self.max_jump_deg:
+                track.transitioning = False
+            track.pending_axis = None
+            track.pending_count = 0
+            self._update_track_position(track, measurement, frame_index)
+            return
+
         if angle <= self.max_jump_deg:
             blended = ((1.0 - self.ema_alpha) * track.stable_axis
                        + self.ema_alpha * raw_axis)
@@ -146,14 +159,30 @@ class FastenerAxisStabilizer:
             track.pending_axis = raw_axis.copy()
             track.pending_count = track.pending_count + 1 if pending_matches else 1
             if track.pending_count >= self.confirm_frames:
-                track.stable_axis = raw_axis.copy()
+                track.stable_axis = self._bounded_axis_step(
+                    track.stable_axis, raw_axis)
+                track.transitioning = (
+                    _angle_deg(track.stable_axis, raw_axis) > self.max_jump_deg
+                )
                 track.pending_axis = None
                 track.pending_count = 0
 
+        self._update_track_position(track, measurement, frame_index)
+
+    def _update_track_position(self, track, measurement, frame_index):
         center = np.asarray(measurement.center_xy, dtype=np.float64)
         track.center_xy = 0.7 * track.center_xy + 0.3 * center
         track.size_px = 0.7 * track.size_px + 0.3 * self._measurement_size(measurement)
         track.last_seen_frame = frame_index
+
+    def _bounded_axis_step(self, stable_axis, raw_axis):
+        angle = _angle_deg(stable_axis, raw_axis)
+        if angle <= self.max_output_step_deg:
+            return raw_axis.copy()
+        fraction = self.max_output_step_deg / max(angle, 1e-9)
+        blended = (1.0 - fraction) * stable_axis + fraction * raw_axis
+        normalized = _normalize_camera_facing(blended)
+        return stable_axis.copy() if normalized is None else normalized
 
     def _prune(self, frame_index):
         self._tracks = {

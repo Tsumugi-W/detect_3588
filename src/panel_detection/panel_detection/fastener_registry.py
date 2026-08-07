@@ -68,6 +68,20 @@ def _angle_between_deg(a, b) -> Optional[float]:
 
 def _fit_normal(points: List[np.ndarray],
                 fallback_normals: List[np.ndarray]) -> Optional[np.ndarray]:
+    if fallback_normals:
+        reference = _normalize(fallback_normals[0])
+        aligned = []
+        for value in fallback_normals:
+            normal = _normalize(value)
+            if normal is None:
+                continue
+            if reference is not None and np.dot(reference, normal) < 0:
+                normal = -normal
+            aligned.append(normal)
+        if aligned:
+            normal = np.mean(np.asarray(aligned, dtype=np.float64), axis=0)
+            return _normalize(normal)
+
     if len(points) >= 3:
         pts = np.asarray(points, dtype=np.float64)
         centered = pts - np.mean(pts, axis=0)
@@ -81,10 +95,6 @@ def _fit_normal(points: List[np.ndarray],
             if normal[2] > 0:
                 normal = -normal
             return normal / np.linalg.norm(normal)
-
-    if fallback_normals:
-        normal = np.mean(np.asarray(fallback_normals, dtype=np.float64), axis=0)
-        return _normalize(normal)
     return None
 
 

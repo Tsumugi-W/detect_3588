@@ -677,6 +677,7 @@ fastener_axis_stabilizer:
   ema_alpha: 0.18               # 小幅变化的单位向量 EMA 系数
   max_jump_deg: 12.0            # 超过该角度视为候选跳变
   confirm_frames: 5             # 大角度变化连续出现多少帧后才接受
+  max_output_step_deg: 3.0      # 确认变化后每帧允许的最大渐进转角
   match_distance_px: 60.0       # 静止相机下的目标中心关联距离
   match_size_ratio: 1.2         # bbox 尺寸相关的关联距离倍率
   stale_frames: 60              # 轨迹丢失多少帧后删除

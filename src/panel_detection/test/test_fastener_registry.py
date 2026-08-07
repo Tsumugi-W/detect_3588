@@ -107,3 +107,32 @@ def test_fastener_registry_rejects_normal_mismatch_for_existing_group():
                        normal=(1.0, 0.0, 0.0))]
 
     assert registry.update(mismatched, frame_index=2) == {}
+
+
+def test_fastener_registry_prefers_axis_consensus_over_non_coplanar_centers():
+    registry = FastenerGroupRegistry(max_slot_distance_m=0.12,
+                                     normal_angle_thresh_deg=25.0)
+    initial = [
+        _obs(0, (100, 100), (-0.01, -0.12, 0.32),
+             normal=(-0.18, -0.43, -0.88)),
+        _obs(1, (200, 100), (0.05, -0.11, 0.32),
+             normal=(0.20, -0.34, -0.92)),
+        _obs(2, (200, 200), (0.05, -0.09, 0.38),
+             normal=(0.10, -0.41, -0.91)),
+        _obs(3, (100, 200), (-0.01, -0.10, 0.38),
+             normal=(-0.20, -0.47, -0.86)),
+    ]
+    first = registry.update(initial, frame_index=1)
+
+    later = [
+        _obs(10, (201, 101), (0.051, -0.109, 0.321),
+             normal=(0.19, -0.35, -0.92)),
+        _obs(11, (101, 201), (-0.009, -0.099, 0.379),
+             normal=(-0.19, -0.46, -0.87)),
+    ]
+    second = registry.update(later, frame_index=2)
+
+    assert {item.group_id for item in first.values()} == {1}
+    assert {item.group_id for item in second.values()} == {1}
+    assert second[10].target_id == 2
+    assert second[11].target_id == 4

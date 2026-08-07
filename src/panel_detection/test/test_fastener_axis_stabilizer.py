@@ -43,7 +43,8 @@ def test_stabilizer_holds_single_large_jump():
 
 
 def test_stabilizer_accepts_confirmed_direction_change():
-    stabilizer = FastenerAxisStabilizer(max_jump_deg=10.0, confirm_frames=3)
+    stabilizer = FastenerAxisStabilizer(
+        max_jump_deg=10.0, confirm_frames=3, max_output_step_deg=3.0)
     stabilizer.update([
         _measurement(0, (100.0, 100.0), (0.0, 0.0, -1.0)),
     ], frame_index=1)
@@ -58,7 +59,20 @@ def test_stabilizer_accepts_confirmed_direction_change():
     accepted = stabilizer.update([
         _measurement(4, (100.0, 100.0), new_axis),
     ], frame_index=4)[4]
-    assert np.allclose(accepted, new_axis)
+    accepted_angle = np.degrees(np.arccos(np.clip(
+        np.dot(accepted, (0.0, 0.0, -1.0)), -1.0, 1.0)))
+    assert 0.0 < accepted_angle <= 3.1
+
+    previous = accepted
+    for frame_index in range(5, 30):
+        current = stabilizer.update([
+            _measurement(frame_index, (100.0, 100.0), new_axis),
+        ], frame_index=frame_index)[frame_index]
+        step = np.degrees(np.arccos(np.clip(
+            np.dot(previous, current), -1.0, 1.0)))
+        assert step <= 3.1
+        previous = current
+    assert np.dot(previous, new_axis) > 0.999
 
 
 def test_stabilizer_tracks_two_fasteners_independently():

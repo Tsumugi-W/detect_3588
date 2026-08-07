@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
         'ema_alpha': 0.18,
         'max_jump_deg': 12.0,
         'confirm_frames': 5,
+        'max_output_step_deg': 3.0,
         'match_distance_px': 60.0,
         'match_size_ratio': 1.2,
         'stale_frames': 60,
@@ -853,6 +854,8 @@ class PanelDetectionNode(Node):
             ema_alpha=fastener_axis_cfg.get('ema_alpha', 0.18),
             max_jump_deg=fastener_axis_cfg.get('max_jump_deg', 12.0),
             confirm_frames=fastener_axis_cfg.get('confirm_frames', 5),
+            max_output_step_deg=fastener_axis_cfg.get(
+                'max_output_step_deg', 3.0),
             match_distance_px=fastener_axis_cfg.get('match_distance_px', 60.0),
             match_size_ratio=fastener_axis_cfg.get('match_size_ratio', 1.2),
             stale_frames=fastener_axis_cfg.get('stale_frames', 60),
@@ -1756,7 +1759,7 @@ class PanelDetectionNode(Node):
                     fastener_observation_base[det_idx] = {
                         'det_idx': det_idx,
                         'class_name': det.class_name,
-                        'center_xy': (float(ux), float(uy)),
+                        'center_xy': (float(det.center_x), float(det.center_y)),
                         'bbox': tuple(float(v) for v in det.bbox),
                         'confidence': float(det.confidence),
                         'point_3d': [float(xyz[0]), float(xyz[1]), float(xyz[2])],
