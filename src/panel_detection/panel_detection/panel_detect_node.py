@@ -54,6 +54,11 @@ from .fastener_axis_stabilizer import (
 )
 from .nameplate_ocr import NameplateRecognizer
 from .nut_localizer import localize_nut
+from .panel_apriltag import (
+    PanelAprilTagTracker,
+    detect_panel_tags,
+    draw_panel_tag_assignments,
+)
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
 
@@ -81,6 +86,21 @@ DEFAULT_CONFIG = {
                    'min_dist': 45.0, 'max_dist': 110.0,
                    'proj_margin_ratio': 3.0,
                    'min_proj_margin': 450.0},
+    'panel_apriltag': {
+        'enable': True,
+        'dictionary': 'DICT_APRILTAG_36h11',
+        'min_id': 0,
+        'max_id': 39,
+        'min_area_px': 64.0,
+        'max_horizontal_ratio': 1.35,
+        'max_vertical_ratio': 3.0,
+        'overlap_tolerance_ratio': 0.35,
+        'min_horizontal_gate_px': 24.0,
+        'min_vertical_gate_px': 30.0,
+        'track_distance_px': 90.0,
+        'track_size_ratio': 1.3,
+        'stale_frames': 8,
+    },
     'panel_normal_interval': 10,
     'topic_sync': {'max_dt': 0.05, 'registered_depth': True},
     'valve_axis': {
@@ -856,6 +876,21 @@ class PanelDetectionNode(Node):
             green_hue_range=tuple(reg_cfg.get('green_hue_range', [35, 85])),
             match_distance_thresh=reg_cfg.get('match_distance_thresh', 80),
         )
+        panel_tag_cfg = self.cfg.get('panel_apriltag', {})
+        self.declare_parameter(
+            'use_panel_tags', panel_tag_cfg.get('enable', True))
+        self._panel_tags_enabled = (
+            self._process_panel_controls and
+            self.get_parameter('use_panel_tags').get_parameter_value().bool_value)
+        self._panel_tag_cfg = panel_tag_cfg
+        self._panel_tag_tracker = PanelAprilTagTracker(panel_tag_cfg)
+        if self._panel_tags_enabled:
+            if hasattr(cv2, 'aruco'):
+                self.get_logger().info(
+                    '面板 AprilTag 编号已启用 (tag36h11, ID 00-39)')
+            else:
+                self.get_logger().warn(
+                    '当前 OpenCV 不包含 aruco，面板 AprilTag 编号不可用')
         fastener_reg_cfg = self.cfg.get('fastener_registry', {})
         self._fastener_registry = FastenerGroupRegistry(
             min_init_observations=fastener_reg_cfg.get('min_init_observations', 2),
@@ -1441,6 +1476,8 @@ class PanelDetectionNode(Node):
         canvas, class_id_list, xyxy_list, conf_list = self._detector.detect(color_image)
         t1 = time.time()
         if not xyxy_list:
+            if self._panel_tags_enabled:
+                self._panel_tag_tracker.update([], [])
             self._update_display_frame(canvas, color_stamp)
             self._publish_status('no_detection')
             return
@@ -1499,9 +1536,24 @@ class PanelDetectionNode(Node):
             ]
         active_xyxy_list = [det.bbox for det in frame_detections]
         if not frame_detections:
+            if self._panel_tags_enabled:
+                self._panel_tag_tracker.update([], [])
             self._update_display_frame(canvas, color_stamp)
             self._publish_status('no_detection')
             return
+
+        panel_tag_markers = []
+        panel_tag_assignments = {}
+        tagged_detection_ids = set()
+        if self._panel_tags_enabled:
+            panel_tag_markers = detect_panel_tags(color_image, self._panel_tag_cfg)
+            panel_tag_assignments = self._panel_tag_tracker.update(
+                frame_detections, panel_tag_markers)
+            for det_index, assignment in panel_tag_assignments.items():
+                frame_detections[det_index].class_name = assignment.forced_class
+                tagged_detection_ids.add(id(frame_detections[det_index]))
+            draw_panel_tag_assignments(
+                canvas, panel_tag_markers, panel_tag_assignments, frame_detections)
 
         nut_localizations = {}
         for i, det in enumerate(frame_detections):
@@ -1602,7 +1654,8 @@ class PanelDetectionNode(Node):
                         dist <= line_dist_thresh and
                         proj_min <= proj <= proj_max
                     )
-                    if d.class_name == 'light' and on_line:
+                    if (d.class_name == 'light' and on_line and
+                            id(d) not in tagged_detection_ids):
                         d.class_name = 'button'
                         x1, y1 = int(d.bbox[0]), int(d.bbox[1])
                         cv2.rectangle(canvas, (x1, y1 - 20), (x1 + 80, y1), (0, 0, 0), -1)
@@ -1613,7 +1666,12 @@ class PanelDetectionNode(Node):
                         panel_detections.append(d)
             else:
                 # knob 重叠退化，取所有 button/knob
-                cached_axis_result = self._persistent_panel_axis.select(frame_detections)
+                axis_candidates = [
+                    d for d in frame_detections
+                    if id(d) not in tagged_detection_ids or
+                    d.class_name in ('button', 'knob')
+                ]
+                cached_axis_result = self._persistent_panel_axis.select(axis_candidates)
                 if cached_axis_result is not None:
                     panel_detections, panel_axis_origin, panel_axis_vector = cached_axis_result
                 else:
@@ -1621,7 +1679,12 @@ class PanelDetectionNode(Node):
                                         if d.class_name in ('button', 'knob')]
         else:
             # 没有两个 knob 可见，取所有 button/knob
-            cached_axis_result = self._persistent_panel_axis.select(frame_detections)
+            axis_candidates = [
+                d for d in frame_detections
+                if id(d) not in tagged_detection_ids or
+                d.class_name in ('button', 'knob')
+            ]
+            cached_axis_result = self._persistent_panel_axis.select(axis_candidates)
             if cached_axis_result is not None:
                 panel_detections, panel_axis_origin, panel_axis_vector = cached_axis_result
             else:
@@ -1629,11 +1692,30 @@ class PanelDetectionNode(Node):
                                     if d.class_name in ('button', 'knob')]
 
         if self._process_panel_controls:
-            # ─── 每帧独立识别绝对编号（只对面板行上的目标）───
-            matched = self._registry.identify(
-                panel_detections, color_image,
+            direct_matches = [
+                (assignment.target_id, frame_detections[det_index])
+                for det_index, assignment in panel_tag_assignments.items()
+            ]
+            fallback_detections = [
+                detection for detection in panel_detections
+                if id(detection) not in tagged_detection_ids
+            ]
+            fallback_matches = self._registry.identify(
+                fallback_detections, color_image,
                 axis_origin=panel_axis_origin,
                 axis_vector=panel_axis_vector)
+            direct_target_ids = {target_id for target_id, _ in direct_matches}
+            fallback_matches = [
+                item for item in fallback_matches
+                if item[0] not in direct_target_ids
+            ]
+            matched = sorted(
+                direct_matches + fallback_matches, key=lambda item: item[0])
+
+        tag_assignment_by_detection = {
+            id(frame_detections[det_index]): assignment
+            for det_index, assignment in panel_tag_assignments.items()
+        }
 
         targets_output = []
         knob_angles = []
@@ -1657,15 +1739,23 @@ class PanelDetectionNode(Node):
         nameplate_labels = {}
         if self._nameplate_recognizer is not None:
             nameplate_labels = self._nameplate_recognizer.update(
-                matched, color_image)
+                [item for item in matched
+                 if item[1].class_name in ('button', 'knob')],
+                color_image)
 
         for target_id, det in matched:
             xyz = stable_xyz.get(target_id, matched_xyz[target_id])
             matched_xyz[target_id] = xyz
+            tag_assignment = tag_assignment_by_detection.get(id(det))
 
             target_info = {
                 'id': target_id,
                 'class': det.class_name,
+                'tag_id': (tag_assignment.tag_id
+                           if tag_assignment is not None else None),
+                'classification_source': (
+                    tag_assignment.source
+                    if tag_assignment is not None else 'yolo_layout'),
                 'position': {'x': round(xyz[0], 4),
                              'y': round(xyz[1], 4),
                              'z': round(xyz[2], 4)},
@@ -1719,8 +1809,10 @@ class PanelDetectionNode(Node):
         object_targets_output = []
         fastener_observation_base = {}
         fastener_target_items = {}
+        matched_detection_ids = {id(det) for _, det in matched}
         for det_idx, det in enumerate(frame_detections):
-            if det.class_name in ('button', 'knob'):
+            if (id(det) in matched_detection_ids or
+                    det.class_name in ('button', 'knob')):
                 continue  # 已在 matched 中处理
 
             if det.class_name == 'nut':
@@ -2159,7 +2251,7 @@ class PanelDetectionNode(Node):
 
         stamp_value = stamp.sec + stamp.nanosec * 1e-9
 
-        # 面板只包含旋钮和按钮：保持旋钮角度话题格式不变，不混入阀门/螺栓/螺母信息。
+        # 保持旋钮角度话题格式不变，不混入指示灯或面板外目标信息。
         if knob_angles and self._angle_pub is not None:
             msg = String()
             msg.data = json.dumps({

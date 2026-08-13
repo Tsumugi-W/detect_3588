@@ -1,5 +1,5 @@
 """
-启动面板旋钮/按钮检测节点。
+启动面板按钮/旋钮/指示灯检测节点。
 
 发布话题:
   /panel/targets
@@ -39,6 +39,10 @@ def generate_launch_description():
         'publish_legacy_topics', default_value='false',
         description='是否发布旧 PoseStamped 兼容话题'
     )
+    use_panel_tags_arg = DeclareLaunchArgument(
+        'use_panel_tags', default_value='true',
+        description='是否使用 tag36h11 ID 00-39 强制面板元器件分类和编号'
+    )
 
     detect_node = Node(
         package='panel_detection',
@@ -60,11 +64,12 @@ def generate_launch_description():
             'detection_mode': 'panel_controls',
             'publish_legacy_topics': ParameterValue(
                 LaunchConfiguration('publish_legacy_topics'), value_type=bool),
+            'use_panel_tags': ParameterValue(
+                LaunchConfiguration('use_panel_tags'), value_type=bool),
         }],
     )
 
     return LaunchDescription([
         use_topic_arg, use_constraint_arg, use_constrain_arg,
         registered_depth_arg, config_path_arg, publish_legacy_topics_arg,
-        detect_node])
-
+        use_panel_tags_arg, detect_node])

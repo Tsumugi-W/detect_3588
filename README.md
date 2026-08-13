@@ -127,7 +127,7 @@ ros2 launch panel_detection camera.launch.py
 ros2 launch panel_detection panel_controls.launch.py
 ```
 
-启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 会先进入**注册阶段**（积累稳定帧为按钮/旋钮分配编号），注册完成后进入**跟踪阶段**（发布带编号的检测结果）。`valve_detection.launch.py` 直接发布阀门结果；`fastener_detection.launch.py` 会对同一安装面的螺栓/螺母建立局部 4 槽位编号。按 `q` 或 `ESC` 退出。
+启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 同时运行 YOLO 和 tag36h11 检测，用 Tag 强制区分并编号按钮、旋钮和指示灯；Tag 未关联时保留原有布局编号回退。`valve_detection.launch.py` 直接发布阀门结果；`fastener_detection.launch.py` 会对同一安装面的螺栓/螺母建立局部 4 槽位编号。按 `q` 或 `ESC` 退出。
 
 ## 启动方式与参数配置
 
@@ -139,7 +139,7 @@ ros2 launch panel_detection panel_controls.launch.py
 # 终端1：启动 Orbbec Gemini 336，相机话题深度已注册到彩色图
 ros2 launch panel_detection camera.launch.py
 
-# 终端2：面板旋钮/按钮
+# 终端2：面板按钮/旋钮/指示灯
 ros2 launch panel_detection panel_controls.launch.py
 
 # 或：阀门
@@ -246,6 +246,7 @@ src/panel_detection/scripts/estimate_pipe_axis.py \
 | `capture_dir` | 空字符串 | 非空时按 ROS 图像时间戳保存完整检测 canvas | bag 批量复核或制作检测截图时设置 |
 | `capture_hz` | `1.0` | `capture_dir` 启用时的输入采样和画面保存频率 | 需要其他采样频率时修改 |
 | `show_gui` | `true` | 是否显示 OpenCV 检测窗口 | 无桌面批处理时设为 `false` |
+| `use_panel_tags` | `true` | 使用 tag36h11 ID 00-39 强制面板元器件分类和编号 | 临时使用无 Tag 的旧面板时设为 `false` |
 
 ### 指定配置文件
 
@@ -277,22 +278,24 @@ ros2 launch panel_detection valve_detection.launch.py \
 echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 ```
 
-## 两阶段工作流
+## 面板 AprilTag 分类与编号
 
 本节只适用于 `panel_controls.launch.py`。阀门和螺栓/螺母 launch 不做面板编号注册。
 
-### 注册阶段
+面板元器件上方使用边长 20 mm 的 tag36h11：
 
-面板检测节点启动后自动进入注册阶段：
-1. 等待连续 N 帧同时检测到 5 个按钮 + 2 个旋钮
-2. 按 x 坐标从左到右排序
-3. 验证布局：[button, button, button, knob, knob, button, button]
-4. 验证第 1 个按钮为绿色
-5. 验证通过后分配编号 1-7
+- Tag 00、01、02、05、06：强制识别为 `button`
+- Tag 03、04：强制识别为 `knob`
+- Tag 07-39：强制识别为 `light`
+- 下游 `id = tag_id + 1`，因此 Tag 00 对应目标 ID 1，Tag 39 对应目标 ID 40
 
-### 跟踪阶段
+每帧先运行 YOLO，再检测成功解码的 Tag。Tag 必须位于元器件 bbox 上方并通过水平距离、垂直间距和一对一关联门控，才能覆盖 YOLO 类别。短暂漏检 Tag 时会使用有限帧跟踪结果；超过 `stale_frames` 后自动失效，避免相机移动后继承错误编号。
 
-注册完成后，每帧检测结果与注册表匹配，输出带编号的目标信息。
+没有关联到 Tag 的按钮和旋钮仍使用原有类别、颜色和面板行布局编号作为兼容回退。可视化中 `Txx` 是原始 Tag ID，`#n` 是发布给下游的目标 ID，连线表示 Tag 与元器件的关联。使用无 Tag 的旧面板时可启动：
+
+```bash
+ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
+```
 
 ## 发布话题
 
@@ -305,6 +308,8 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
     {
       "id": 1,
       "class": "button",
+      "tag_id": 0,
+      "classification_source": "apriltag_36h11",
       "label": "自锁按钮2",
       "position": {"x": 0.123, "y": -0.045, "z": 0.850},
       "orientation": {"x": 0.01, "y": 0.02, "z": 0.0, "w": 0.99},
@@ -313,6 +318,8 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
     {
       "id": 4,
       "class": "knob",
+      "tag_id": 3,
+      "classification_source": "apriltag_track",
       "label": "旋钮开关",
       "position": {"x": 0.320, "y": -0.040, "z": 0.845},
       "orientation": {"x": 0.01, "y": 0.02, "z": 0.0, "w": 0.99},
@@ -322,7 +329,7 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 }
 ```
 
-位置单位：**米 (m)**，相机坐标系。`label` 字段在铭牌 OCR 确认后出现，表示器件上方金属铭牌的识别文字。
+位置单位：**米 (m)**，相机坐标系。`tag_id` 为成功关联的原始 Tag 编号，无 Tag 回退时为 `null`。`classification_source` 为 `apriltag_36h11`、`apriltag_track` 或 `yolo_layout`。`label` 字段在铭牌 OCR 确认后出现，表示器件上方金属铭牌的识别文字。
 
 ### /panel/knob_angles (String, JSON) — 面板旋钮角度
 
@@ -665,6 +672,17 @@ panel_line:
   proj_margin_ratio: 3.0
   min_proj_margin: 450.0
 
+panel_apriltag:
+  enable: true
+  dictionary: 'DICT_APRILTAG_36h11'
+  min_id: 0
+  max_id: 39
+  min_area_px: 64.0
+  max_horizontal_ratio: 1.35
+  max_vertical_ratio: 3.0
+  track_distance_px: 90.0
+  stale_frames: 8
+
 fastener_registry:
   min_init_observations: 2      # 两个目标先建立临时编号，三个目标升级为 4 槽位模板
   max_group_distance_m: 0.35    # 同组聚类的 3D 距离门限
@@ -719,7 +737,7 @@ ros2_ws/
         ├── setup.py
         ├── launch/
         │   ├── camera.launch.py           ← 启动相机
-        │   ├── panel_controls.launch.py   ← 面板旋钮/按钮
+        │   ├── panel_controls.launch.py   ← 面板按钮/旋钮/指示灯
         │   ├── valve_detection.launch.py  ← 阀门
         │   ├── fastener_detection.launch.py ← 螺栓/螺母
         │   └── panel_detection.launch.py  ← 兼容 all 模式
@@ -728,6 +746,7 @@ ros2_ws/
         │   └── export_model.py            ← 模型转换 (.pt → .onnx)
         ├── test/
         │   ├── test_apriltag_reference.py
+        │   ├── test_panel_apriltag.py
         │   └── test_topic_sync.py
         └── panel_detection/
             ├── __init__.py
@@ -737,6 +756,7 @@ ros2_ws/
             ├── nameplate_ocr.py           ← 铭牌文字识别 (OCR)
             ├── nut_localizer.py           ← nut 外六角 refined 定位
             ├── pipe_axis.py               ← 管道轴线方向估计
+            ├── panel_apriltag.py           ← 面板 Tag 分类、编号和短时跟踪
             ├── apriltag_reference.py      ← AprilTag 参考轴线
             ├── camera/
             │   ├── base.py

@@ -60,6 +60,10 @@ def generate_launch_description():
         'show_gui', default_value='true',
         description='是否显示 OpenCV 检测窗口'
     )
+    use_panel_tags_arg = DeclareLaunchArgument(
+        'use_panel_tags', default_value='true',
+        description='是否使用 tag36h11 ID 00-39 强制面板元器件分类和编号'
+    )
 
     detect_node = Node(
         package='panel_detection',
@@ -86,10 +90,13 @@ def generate_launch_description():
                 LaunchConfiguration('capture_hz'), value_type=float),
             'show_gui': ParameterValue(
                 LaunchConfiguration('show_gui'), value_type=bool),
+            'use_panel_tags': ParameterValue(
+                LaunchConfiguration('use_panel_tags'), value_type=bool),
         }],
     )
 
     return LaunchDescription([
         use_topic_arg, use_constraint_arg, use_constrain_arg, registered_depth_arg,
         config_path_arg, detection_mode_arg, publish_legacy_topics_arg,
-        capture_dir_arg, capture_hz_arg, show_gui_arg, detect_node])
+        capture_dir_arg, capture_hz_arg, show_gui_arg, use_panel_tags_arg,
+        detect_node])
