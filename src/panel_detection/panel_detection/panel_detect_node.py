@@ -69,13 +69,13 @@ DEFAULT_CONFIG = {
     'camera': {'color_width': 1280, 'color_height': 720,
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
-    'onnx_model': '0807.onnx',
+    'onnx_model': '0813.onnx',
     'onnx_threads': 8,
-    'weight': '0807.pt',
+    'weight': '0813.pt',
     'input_size': 640,
-    'class_num': 8,
+    'class_num': 9,
     'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump',
-                   'button', 'door_button'],
+                   'button', 'door_button', 'air_switch'],
     'threshold': {'iou': 0.01, 'confidence': 0.3},
     'knob_angle': {'enable': True, 'binary_thresh': 180,
                    'circle_mask_ratio': 0.85, 'knob_class': 'knob',
@@ -174,6 +174,7 @@ CLASS_TOPIC_MAP = {
     'pump': '/panel/pumps',
     'button': '/panel/buttons',
     'door_button': '/panel/door_buttons',
+    'air_switch': '/panel/air_switches',
 }
 
 MODE_CLASS_FILTERS = {
@@ -1319,7 +1320,7 @@ class PanelDetectionNode(Node):
 
         if backend == 'onnx':
             from .detector_onnx import YoloV5ORT
-            onnx_path = self.cfg.get('onnx_model', '0807.onnx')
+            onnx_path = self.cfg.get('onnx_model', '0813.onnx')
             if not os.path.isabs(onnx_path):
                 onnx_path = os.path.join(pkg_dir, onnx_path)
             threads = self.cfg.get('onnx_threads', 4)

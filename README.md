@@ -2,7 +2,7 @@
 
 基于 YOLOv5 + 深度相机的操作面板实时 3D 检测系统，封装为标准 ROS2 Humble 功能包。
 
-检测 8 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)。支持目标注册编号、旋钮角度估计和螺栓/螺母/阀门轴线方向估计。
+检测 9 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)。支持目标注册编号、旋钮角度估计和螺栓/螺母/阀门轴线方向估计。
 
 ## 系统架构
 
@@ -614,15 +614,15 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0807.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_model: '0813.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
 onnx_threads: 8
 # rknn_model: '0630.rknn'      # inference_backend='rknn' 时使用
 
 detection_mode: 'all'          # panel_detection.launch.py 兼容模式使用
 publish_legacy_topics: false   # 是否发布旧 PoseStamped 兼容话题
 
-class_num: 8
-class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button', 'door_button']
+class_num: 9
+class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button', 'door_button', 'air_switch']
 threshold:
   confidence: 0.3
   iou: 0.01
@@ -744,8 +744,8 @@ ros2_ws/
             ├── 0630.pt
             ├── 0727.onnx                  ← 备用权重
             ├── 0727.pt
-            ├── 0807.onnx                  ← 默认权重
-            └── 0807.pt
+            ├── 0813.onnx                  ← 默认权重
+            └── 0813.pt
 ```
 
 ## 常见问题
