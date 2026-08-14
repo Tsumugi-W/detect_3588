@@ -65,14 +65,41 @@ def test_buttons_become_lights_when_current_frame_has_no_tags():
         'light', 'door_button', 'knob', 'light']
 
 
-def test_buttons_keep_yolo_class_when_any_current_tag_is_visible():
+def test_button_keeps_class_only_when_its_own_tag_is_directly_assigned():
     detections = [_detection('button', 50.0)]
+    assignments = PanelAprilTagTracker().update(
+        detections, [_marker(0, 50.0)])
 
-    changed = reclassify_buttons_without_tags(
-        detections, [_marker(7, 50.0)])
+    changed = reclassify_buttons_without_tags(detections, assignments)
 
     assert changed == []
     assert detections[0].class_name == 'button'
+
+
+def test_unassigned_button_becomes_light_even_when_another_tag_is_visible():
+    detections = [_detection('button', 50.0), _detection('button', 150.0)]
+    assignments = PanelAprilTagTracker().update(
+        detections, [_marker(0, 50.0)])
+
+    changed = reclassify_buttons_without_tags(detections, assignments)
+
+    assert changed == [detections[1]]
+    assert [item.class_name for item in detections] == ['button', 'light']
+
+
+def test_tracked_tag_does_not_keep_button_class_without_current_marker():
+    tracker = PanelAprilTagTracker({'stale_frames': 3})
+    first_detection = _detection('button', 50.0)
+    tracker.update([first_detection], [_marker(0, 50.0)])
+    current_detection = _detection('button', 52.0)
+    assignments = tracker.update([current_detection], [])
+
+    changed = reclassify_buttons_without_tags(
+        [current_detection], assignments)
+
+    assert assignments[0].source == 'apriltag_track'
+    assert changed == [current_detection]
+    assert current_detection.class_name == 'light'
 
 
 def test_canvas_redraw_uses_only_reclassified_light_label(monkeypatch):

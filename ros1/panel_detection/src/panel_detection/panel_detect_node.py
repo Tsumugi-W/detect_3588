@@ -1617,23 +1617,29 @@ class PanelDetectionNode(Node):
         tagged_detection_ids = set()
         no_tag_light_ids = set()
         if self._panel_tags_enabled:
-            if panel_tag_markers:
-                panel_tag_assignments = self._panel_tag_tracker.update(
-                    frame_detections, panel_tag_markers)
-                for det_index, assignment in panel_tag_assignments.items():
-                    frame_detections[det_index].class_name = assignment.forced_class
-                    tagged_detection_ids.add(id(frame_detections[det_index]))
-            else:
-                # Current-frame Tag visibility is authoritative. Do not let a
-                # stale track keep a YOLO button classified as a button.
-                self._panel_tag_tracker.update([], [])
-                changed = reclassify_buttons_without_tags(
-                    frame_detections, panel_tag_markers)
-                no_tag_light_ids = {id(detection) for detection in changed}
-                for detection in changed:
-                    redraw_reclassified_detection(
-                        canvas, color_image, detection,
-                        old_class='button', color=(255, 255, 0))
+            panel_tag_assignments = self._panel_tag_tracker.update(
+                frame_detections, panel_tag_markers)
+            for det_index, assignment in panel_tag_assignments.items():
+                frame_detections[det_index].class_name = assignment.forced_class
+
+            changed = reclassify_buttons_without_tags(
+                frame_detections, panel_tag_assignments)
+            no_tag_light_ids = {id(detection) for detection in changed}
+            # A stale tracked assignment cannot provide a button ID after the
+            # current frame failed to associate that button with a real Tag.
+            panel_tag_assignments = {
+                det_index: assignment
+                for det_index, assignment in panel_tag_assignments.items()
+                if id(frame_detections[det_index]) not in no_tag_light_ids
+            }
+            tagged_detection_ids = {
+                id(frame_detections[det_index])
+                for det_index in panel_tag_assignments
+            }
+            for detection in changed:
+                redraw_reclassified_detection(
+                    canvas, color_image, detection,
+                    old_class='button', color=(255, 255, 0))
             draw_panel_tag_assignments(
                 canvas, panel_tag_markers, panel_tag_assignments, frame_detections)
 
@@ -1737,6 +1743,7 @@ class PanelDetectionNode(Node):
                         proj_min <= proj <= proj_max
                     )
                     if (d.class_name == 'light' and on_line and
+                            not self._panel_tags_enabled and
                             id(d) not in tagged_detection_ids and
                             id(d) not in no_tag_light_ids):
                         d.class_name = 'button'
@@ -1751,7 +1758,8 @@ class PanelDetectionNode(Node):
                 # knob 重叠退化，取所有 button/knob
                 axis_candidates = [
                     d for d in frame_detections
-                    if id(d) not in no_tag_light_ids and (
+                    if (not self._panel_tags_enabled or d.class_name != 'light') and
+                    id(d) not in no_tag_light_ids and (
                         id(d) not in tagged_detection_ids or
                         d.class_name in ('button', 'knob'))
                 ]
@@ -1765,7 +1773,8 @@ class PanelDetectionNode(Node):
             # 没有两个 knob 可见，取所有 button/knob
             axis_candidates = [
                 d for d in frame_detections
-                if id(d) not in no_tag_light_ids and (
+                if (not self._panel_tags_enabled or d.class_name != 'light') and
+                id(d) not in no_tag_light_ids and (
                     id(d) not in tagged_detection_ids or
                     d.class_name in ('button', 'knob'))
             ]

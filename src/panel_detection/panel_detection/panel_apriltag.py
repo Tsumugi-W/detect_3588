@@ -17,13 +17,16 @@ PANEL_TAG_ID_MAX = 39
 ELIGIBLE_CLASSES = frozenset(('button', 'knob', 'light'))
 
 
-def reclassify_buttons_without_tags(detections, markers):
-    """Treat YOLO buttons as lights when no tag is decoded this frame."""
-    if markers:
-        return []
+def reclassify_buttons_without_tags(detections, assignments):
+    """Require every final button to have a direct Tag in the current frame."""
+    assignments = assignments or {}
+    direct_tag_indices = {
+        index for index, assignment in assignments.items()
+        if assignment.source == 'apriltag_36h11' and assignment.marker is not None
+    }
     changed = []
-    for detection in detections:
-        if detection.class_name == 'button':
+    for index, detection in enumerate(detections):
+        if detection.class_name == 'button' and index not in direct_tag_indices:
             detection.class_name = 'light'
             changed.append(detection)
     return changed

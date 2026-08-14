@@ -56,9 +56,10 @@ Dedicated modes publish only their own object family:
 - `/valve/targets`, `/valve/geometry`, `/valve/status`
 - `/fasteners/targets`, `/fasteners/geometry`, `/fasteners/status`
 
-In panel mode, when AprilTag support is enabled but the current frame contains
-no decoded panel tag, every exact YOLO `button` detection is treated as
-`light`. Layout fallback cannot promote those detections back to `button`.
+In panel mode, every final `button` must be directly associated with its own
+AprilTag in the current frame. A YOLO `button` without a direct assignment is
+treated as `light`, even when another tag is visible or a stale tracked tag ID
+exists. Layout fallback cannot promote an untagged `light` back to `button`.
 `door_button`, knobs and non-panel modes are unaffected. Set
 `use_panel_tags:=false` to retain the legacy no-tag classification behavior.
 
