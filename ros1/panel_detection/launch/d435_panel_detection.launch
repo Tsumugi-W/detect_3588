@@ -1,0 +1,22 @@
+<launch>
+  <arg name="serial_no" default=""/>
+  <arg name="camera_name" default="camera_d435_0"/>
+  <arg name="detection_mode" default="all"/>
+  <arg name="use_constraint" default="1"/>
+  <arg name="show_gui" default="false"/>
+
+  <include file="$(find realsense2_camera)/launch/rs_camera.launch">
+    <arg name="camera" value="$(arg camera_name)"/>
+    <arg name="serial_no" value="$(arg serial_no)"/>
+    <arg name="align_depth" value="true"/>
+    <arg name="enable_sync" value="true"/>
+    <arg name="publish_tf" value="false"/>
+  </include>
+
+  <include file="$(find panel_detection)/launch/panel_detection.launch">
+    <arg name="camera_name" value="$(arg camera_name)"/>
+    <arg name="detection_mode" value="$(arg detection_mode)"/>
+    <arg name="use_constraint" value="$(arg use_constraint)"/>
+    <arg name="show_gui" value="$(arg show_gui)"/>
+  </include>
+</launch>

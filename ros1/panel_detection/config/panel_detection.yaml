@@ -1,0 +1,30 @@
+# Partial overrides are recursively merged with the defaults in the node.
+inference_backend: onnx
+onnx_model: 0813.onnx
+onnx_threads: 8
+input_size: 640
+class_num: 9
+class_name:
+  - light
+  - knob
+  - bolt
+  - nut
+  - valve
+  - pump
+  - button
+  - door_button
+  - air_switch
+threshold:
+  iou: 0.01
+  confidence: 0.3
+topic_sync:
+  max_dt: 0.05
+  registered_depth: true
+panel_apriltag:
+  enable: true
+apriltag_reference:
+  enable: false
+knob_angle:
+  enable: true
+  use_constraint: 1
+publish_legacy_topics: false

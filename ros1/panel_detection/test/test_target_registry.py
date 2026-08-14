@@ -1,0 +1,147 @@
+import cv2
+import numpy as np
+
+from panel_detection.target_registry import (
+    FrameDetection,
+    PersistentPanelAxis,
+    TargetRegistry,
+)
+
+
+def _detection(class_name, x1, color_bgr):
+    x2 = x1 + 30
+    y1, y2 = 20, 50
+    return FrameDetection(
+        class_name=class_name,
+        center_x=(x1 + x2) / 2.0,
+        center_y=(y1 + y2) / 2.0,
+        bbox=(x1, y1, x2, y2),
+        confidence=0.9,
+    ), (x1, y1, x2, y2, color_bgr)
+
+
+def _image_with_detections(draws):
+    max_x = max((x2 for _, _, x2, _, _ in draws), default=220)
+    image = np.zeros((80, max(220, max_x + 20), 3), dtype=np.uint8)
+    for x1, y1, x2, y2, color_bgr in draws:
+        cv2.rectangle(image, (x1, y1), (x2, y2), color_bgr, -1)
+    return image
+
+
+def test_partial_view_uses_contiguous_ids_without_skipping_layout_positions():
+    knob, knob_draw = _detection('knob', 20, (0, 0, 255))
+    red_button, red_draw = _detection('button', 70, (0, 0, 255))
+    green_button, green_draw = _detection('button', 120, (0, 255, 0))
+    image = _image_with_detections([knob_draw, red_draw, green_draw])
+
+    matched = TargetRegistry().identify([knob, red_button, green_button], image)
+
+    assert [target_id for target_id, _ in matched] == [5, 6, 7]
+
+
+def test_partial_view_keeps_ids_contiguous_even_when_knob_color_disagrees():
+    green_button, green_draw = _detection('button', 20, (0, 255, 0))
+    red_button_a, red_draw_a = _detection('button', 70, (0, 0, 255))
+    red_button_b, red_draw_b = _detection('button', 120, (0, 0, 255))
+    knob, knob_draw = _detection('knob', 160, (0, 0, 0))
+    image = _image_with_detections([
+        green_draw, red_draw_a, red_draw_b, knob_draw,
+    ])
+
+    matched = TargetRegistry().identify([
+        green_button, red_button_a, red_button_b, knob,
+    ], image)
+
+    assert [target_id for target_id, _ in matched] == [1, 2, 3, 4]
+
+
+def test_persistent_axis_relocates_parallel_line_after_camera_translation():
+    axis = PersistentPanelAxis()
+    axis.update((40.0, 40.0), (1.0, 0.0))
+    row_button, _ = _detection('button', 40, (0, 0, 255))
+    row_button.center_y = 90.0
+    row_button.bbox = (row_button.bbox[0], 75.0, row_button.bbox[2], 105.0)
+    off_row_button, _ = _detection('button', 90, (0, 0, 255))
+    off_row_button.center_y = 170.0
+    off_row_button.bbox = (
+        off_row_button.bbox[0], 155.0, off_row_button.bbox[2], 185.0)
+
+    result = axis.select([row_button, off_row_button])
+
+    assert result is not None
+    selected, origin, vector = result
+    assert selected == [row_button]
+    assert origin[1] == row_button.center_y
+    assert vector == (1.0, 0.0)
+
+
+def test_persistent_axis_converts_button_like_light_on_cached_row():
+    axis = PersistentPanelAxis()
+    axis.update((40.0, 40.0), (1.0, 0.0))
+    light, _ = _detection('light', 40, (0, 255, 0))
+    light.center_y = 88.0
+    light.bbox = (light.bbox[0], 73.0, light.bbox[2], 103.0)
+
+    result = axis.select([light])
+
+    assert result is not None
+    selected, _, _ = result
+    assert selected == [light]
+    assert light.class_name == 'button'
+
+
+def test_complete_reference_keeps_single_knob_id_by_nearest_neighbor():
+    layout = [
+        ('button', 10, (0, 255, 0)),
+        ('button', 50, (0, 0, 255)),
+        ('button', 90, (0, 0, 255)),
+        ('knob', 130, (0, 0, 255)),
+        ('knob', 170, (0, 0, 0)),
+        ('button', 210, (0, 0, 255)),
+        ('button', 250, (0, 255, 0)),
+    ]
+    initial_dets = []
+    initial_draws = []
+    for class_name, x1, color in layout:
+        det, draw = _detection(class_name, x1, color)
+        initial_dets.append(det)
+        initial_draws.append(draw)
+
+    registry = TargetRegistry(match_distance_thresh=80)
+    initial = registry.identify(initial_dets, _image_with_detections(initial_draws))
+    assert [target_id for target_id, _ in initial] == [1, 2, 3, 4, 5, 6, 7]
+
+    # 只剩原 #5 附近的一个旋钮，即使颜色误判成红色，也应沿用最近邻编号 #5。
+    moved_knob, moved_draw = _detection('knob', 178, (0, 0, 255))
+    matched = registry.identify([moved_knob], _image_with_detections([moved_draw]))
+
+    assert [target_id for target_id, _ in matched] == [5]
+
+
+def test_complete_reference_selects_contiguous_right_button_window_by_position():
+    layout = [
+        ('button', 10, (0, 255, 0)),
+        ('button', 50, (0, 0, 255)),
+        ('button', 90, (0, 0, 255)),
+        ('knob', 130, (0, 0, 255)),
+        ('knob', 170, (0, 0, 0)),
+        ('button', 210, (0, 0, 255)),
+        ('button', 250, (0, 255, 0)),
+    ]
+    initial_dets = []
+    initial_draws = []
+    for class_name, x1, color in layout:
+        det, draw = _detection(class_name, x1, color)
+        initial_dets.append(det)
+        initial_draws.append(draw)
+
+    registry = TargetRegistry(match_distance_thresh=80)
+    registry.identify(initial_dets, _image_with_detections(initial_draws))
+
+    red_button, red_draw = _detection('button', 214, (0, 0, 255))
+    green_button, green_draw = _detection('button', 254, (0, 255, 0))
+    matched = registry.identify(
+        [red_button, green_button],
+        _image_with_detections([red_draw, green_draw]))
+
+    assert [target_id for target_id, _ in matched] == [6, 7]

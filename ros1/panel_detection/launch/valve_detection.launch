@@ -1,0 +1,16 @@
+<launch>
+  <arg name="camera_name" default="camera_d435_0"/>
+  <arg name="model_path" default="$(find panel_detection)/models/0813.onnx"/>
+  <arg name="show_gui" default="false"/>
+  <arg name="debug_image_topic" default="/valve/debug_image"/>
+
+  <include file="$(find panel_detection)/launch/panel_detection.launch">
+    <arg name="camera_name" value="$(arg camera_name)"/>
+    <arg name="model_path" value="$(arg model_path)"/>
+    <arg name="node_name" value="valve_detection"/>
+    <arg name="detection_mode" value="valve"/>
+    <arg name="use_panel_tags" value="false"/>
+    <arg name="show_gui" value="$(arg show_gui)"/>
+    <arg name="debug_image_topic" value="$(arg debug_image_topic)"/>
+  </include>
+</launch>

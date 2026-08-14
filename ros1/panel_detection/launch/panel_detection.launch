@@ -1,0 +1,38 @@
+<launch>
+  <arg name="camera_name" default="camera_d435_0"/>
+  <arg name="model_path" default="$(find panel_detection)/models/0813.onnx"/>
+  <arg name="config_file" default="$(find panel_detection)/config/panel_detection.yaml"/>
+  <arg name="node_name" default="panel_detection"/>
+  <arg name="detection_mode" default="all"/>
+  <arg name="use_constraint" default="1"/>
+  <arg name="use_panel_tags" default="true"/>
+  <arg name="publish_legacy_topics" default="false"/>
+  <arg name="show_gui" default="false"/>
+  <arg name="publish_debug_image" default="true"/>
+  <arg name="debug_image_topic" default="/panel/debug_image"/>
+  <arg name="capture_dir" default=""/>
+  <arg name="capture_hz" default="1.0"/>
+
+  <node pkg="panel_detection"
+        type="panel_detect_node.py"
+        name="$(arg node_name)"
+        output="screen">
+    <param name="config_path" value="$(arg config_file)"/>
+    <param name="onnx_model" value="$(arg model_path)"/>
+    <param name="detection_mode" value="$(arg detection_mode)"/>
+    <param name="use_topic" value="true"/>
+    <param name="registered_depth" value="true"/>
+    <param name="color_topic" value="/$(arg camera_name)/color/image_raw"/>
+    <param name="depth_topic" value="/$(arg camera_name)/aligned_depth_to_color/image_raw"/>
+    <param name="color_info_topic" value="/$(arg camera_name)/color/camera_info"/>
+    <param name="depth_info_topic" value="/$(arg camera_name)/color/camera_info"/>
+    <param name="use_constraint" type="str" value="$(arg use_constraint)"/>
+    <param name="use_panel_tags" value="$(arg use_panel_tags)"/>
+    <param name="publish_legacy_topics" value="$(arg publish_legacy_topics)"/>
+    <param name="show_gui" value="$(arg show_gui)"/>
+    <param name="publish_debug_image" value="$(arg publish_debug_image)"/>
+    <param name="debug_image_topic" value="$(arg debug_image_topic)"/>
+    <param name="capture_dir" value="$(arg capture_dir)"/>
+    <param name="capture_hz" value="$(arg capture_hz)"/>
+  </node>
+</launch>

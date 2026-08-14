@@ -30,6 +30,31 @@ Orbbec 官方驱动 (独立 launch)
 | 相机 | 奥比中光 Gemini 336 (默认) 或 Intel RealSense D435i |
 | 推理 | ONNX Runtime CPU (默认) 或 RKNN NPU |
 
+## ROS1 Noetic 版本
+
+仓库中的 `ros1/panel_detection` 是当前算法的 ROS1 Noetic catkin 版本，默认面向
+Intel RealSense D435 的彩色图、对齐深度图和彩色相机内参，使用同一份
+`0813.onnx` 九类别权重。该版本保留面板、阀门和螺栓/螺母三个独立检测模式及
+对应 JSON 话题，并通过 `/panel/debug_image` 等图像话题发布 Canvas；无显示环境
+默认不创建 OpenCV 窗口。
+
+```bash
+mkdir -p ~/panel_ros1_ws/src
+cp -a ros1/panel_detection ~/panel_ros1_ws/src/
+cd ~/panel_ros1_ws
+source /opt/ros/noetic/setup.bash
+catkin_make
+source devel/setup.bash
+
+# 相机已单独启动时，按任务选择一个 launch
+roslaunch panel_detection panel_controls.launch
+roslaunch panel_detection valve_detection.launch
+roslaunch panel_detection fastener_detection.launch
+```
+
+完整的 ROS1 输入话题、输出话题和 D435 联合启动方式见
+`ros1/panel_detection/README.md`。
+
 ## 安装教程
 
 ### 第一步：安装 ROS2 Humble
