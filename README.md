@@ -311,7 +311,12 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 - Tag 07-39：强制识别为 `light`
 - 下游 `id = tag_id + 1`，因此 Tag 00 对应目标 ID 1，Tag 39 对应目标 ID 40
 
-每帧先运行 YOLO，再检测成功解码的 Tag。Tag 必须位于元器件 bbox 上方并通过水平距离、垂直间距和一对一关联门控，才能覆盖 YOLO 类别。短暂漏检 Tag 时会使用有限帧跟踪结果；超过 `stale_frames` 后自动失效，避免相机移动后继承错误编号。
+每帧先运行 YOLO，再检测成功解码的 Tag。Tag 必须位于元器件 bbox 上方并通过水平距离、垂直间距和一对一关联门控，才能覆盖 YOLO 类别。当前帧仍有其他有效 Tag 时，单个 Tag 的短暂漏检会使用有限帧跟踪结果；超过 `stale_frames` 后自动失效，避免相机移动后继承错误编号。
+
+当面板模式启用了 Tag 识别、但当前帧一个有效 AprilTag 都没有解码出来时，
+该帧所有 YOLO `button` 会强制改为 `light`，并且不会被面板行布局回退重新改成
+`button`。该规则只针对精确类别 `button`，不影响 `door_button`、`knob` 或其他
+任务模式；`use_panel_tags:=false` 时仍保留旧的无 Tag 分类和布局回退行为。
 
 没有关联到 Tag 的按钮和旋钮仍使用原有类别、颜色和面板行布局编号作为兼容回退。可视化中 `Txx` 是原始 Tag ID，`#n` 是发布给下游的目标 ID，连线表示 Tag 与元器件的关联。使用无 Tag 的旧面板时可启动：
 

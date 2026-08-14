@@ -6,6 +6,7 @@ from panel_detection.panel_apriltag import (
     PanelTagMarker,
     detect_panel_tags,
     forced_class_for_tag,
+    reclassify_buttons_without_tags,
 )
 from panel_detection.target_registry import FrameDetection
 
@@ -46,6 +47,31 @@ def test_tag_class_mapping_matches_panel_definition():
     assert forced_class_for_tag(39) == 'light'
     assert forced_class_for_tag(-1) is None
     assert forced_class_for_tag(40) is None
+
+
+def test_buttons_become_lights_when_current_frame_has_no_tags():
+    detections = [
+        _detection('button', 50.0),
+        _detection('door_button', 100.0),
+        _detection('knob', 150.0),
+        _detection('light', 200.0),
+    ]
+
+    changed = reclassify_buttons_without_tags(detections, [])
+
+    assert changed == [detections[0]]
+    assert [item.class_name for item in detections] == [
+        'light', 'door_button', 'knob', 'light']
+
+
+def test_buttons_keep_yolo_class_when_any_current_tag_is_visible():
+    detections = [_detection('button', 50.0)]
+
+    changed = reclassify_buttons_without_tags(
+        detections, [_marker(7, 50.0)])
+
+    assert changed == []
+    assert detections[0].class_name == 'button'
 
 
 def test_tags_above_components_are_associated_one_to_one():

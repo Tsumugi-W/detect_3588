@@ -56,6 +56,12 @@ Dedicated modes publish only their own object family:
 - `/valve/targets`, `/valve/geometry`, `/valve/status`
 - `/fasteners/targets`, `/fasteners/geometry`, `/fasteners/status`
 
+In panel mode, when AprilTag support is enabled but the current frame contains
+no decoded panel tag, every exact YOLO `button` detection is treated as
+`light`. Layout fallback cannot promote those detections back to `button`.
+`door_button`, knobs and non-panel modes are unaffected. Set
+`use_panel_tags:=false` to retain the legacy no-tag classification behavior.
+
 All structured results use `std_msgs/String` JSON. Debug images use
 `sensor_msgs/Image`. Legacy per-class `PoseStamped` topics remain available via
 `publish_legacy_topics:=true`, but are disabled by default.

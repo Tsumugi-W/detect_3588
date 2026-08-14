@@ -59,6 +59,7 @@ from .panel_apriltag import (
     PanelAprilTagTracker,
     detect_panel_tags,
     draw_panel_tag_assignments,
+    reclassify_buttons_without_tags,
 )
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
@@ -1536,12 +1537,31 @@ class PanelDetectionNode(Node):
 
         panel_tag_assignments = {}
         tagged_detection_ids = set()
+        no_tag_light_ids = set()
         if self._panel_tags_enabled:
-            panel_tag_assignments = self._panel_tag_tracker.update(
-                frame_detections, panel_tag_markers)
-            for det_index, assignment in panel_tag_assignments.items():
-                frame_detections[det_index].class_name = assignment.forced_class
-                tagged_detection_ids.add(id(frame_detections[det_index]))
+            if panel_tag_markers:
+                panel_tag_assignments = self._panel_tag_tracker.update(
+                    frame_detections, panel_tag_markers)
+                for det_index, assignment in panel_tag_assignments.items():
+                    frame_detections[det_index].class_name = assignment.forced_class
+                    tagged_detection_ids.add(id(frame_detections[det_index]))
+            else:
+                # Current-frame Tag visibility is authoritative. Do not let a
+                # stale track keep a YOLO button classified as a button.
+                self._panel_tag_tracker.update([], [])
+                changed = reclassify_buttons_without_tags(
+                    frame_detections, panel_tag_markers)
+                no_tag_light_ids = {id(detection) for detection in changed}
+                for detection in changed:
+                    x1, y1, x2, y2 = [
+                        int(round(value)) for value in detection.bbox]
+                    cv2.rectangle(canvas, (x1, max(0, y1 - 22)),
+                                  (min(canvas.shape[1] - 1, x1 + 64), y1),
+                                  (0, 0, 0), -1)
+                    cv2.putText(canvas, 'light', (x1 + 2, max(14, y1 - 5)),
+                                0, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
+                    cv2.rectangle(canvas, (x1, y1), (x2, y2),
+                                  (255, 255, 0), 2, cv2.LINE_AA)
             draw_panel_tag_assignments(
                 canvas, panel_tag_markers, panel_tag_assignments, frame_detections)
 
@@ -1645,7 +1665,8 @@ class PanelDetectionNode(Node):
                         proj_min <= proj <= proj_max
                     )
                     if (d.class_name == 'light' and on_line and
-                            id(d) not in tagged_detection_ids):
+                            id(d) not in tagged_detection_ids and
+                            id(d) not in no_tag_light_ids):
                         d.class_name = 'button'
                         x1, y1 = int(d.bbox[0]), int(d.bbox[1])
                         cv2.rectangle(canvas, (x1, y1 - 20), (x1 + 80, y1), (0, 0, 0), -1)
@@ -1658,8 +1679,9 @@ class PanelDetectionNode(Node):
                 # knob 重叠退化，取所有 button/knob
                 axis_candidates = [
                     d for d in frame_detections
-                    if id(d) not in tagged_detection_ids or
-                    d.class_name in ('button', 'knob')
+                    if id(d) not in no_tag_light_ids and (
+                        id(d) not in tagged_detection_ids or
+                        d.class_name in ('button', 'knob'))
                 ]
                 cached_axis_result = self._persistent_panel_axis.select(axis_candidates)
                 if cached_axis_result is not None:
@@ -1671,8 +1693,9 @@ class PanelDetectionNode(Node):
             # 没有两个 knob 可见，取所有 button/knob
             axis_candidates = [
                 d for d in frame_detections
-                if id(d) not in tagged_detection_ids or
-                d.class_name in ('button', 'knob')
+                if id(d) not in no_tag_light_ids and (
+                    id(d) not in tagged_detection_ids or
+                    d.class_name in ('button', 'knob'))
             ]
             cached_axis_result = self._persistent_panel_axis.select(axis_candidates)
             if cached_axis_result is not None:

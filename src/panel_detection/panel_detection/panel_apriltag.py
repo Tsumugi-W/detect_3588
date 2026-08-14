@@ -17,6 +17,18 @@ PANEL_TAG_ID_MAX = 39
 ELIGIBLE_CLASSES = frozenset(('button', 'knob', 'light'))
 
 
+def reclassify_buttons_without_tags(detections, markers):
+    """Treat YOLO buttons as lights when no tag is decoded this frame."""
+    if markers:
+        return []
+    changed = []
+    for detection in detections:
+        if detection.class_name == 'button':
+            detection.class_name = 'light'
+            changed.append(detection)
+    return changed
+
+
 def forced_class_for_tag(tag_id: int) -> Optional[str]:
     """Return the authoritative component class encoded by a panel tag."""
     tag_id = int(tag_id)
