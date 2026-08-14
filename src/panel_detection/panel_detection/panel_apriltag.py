@@ -29,6 +29,40 @@ def reclassify_buttons_without_tags(detections, markers):
     return changed
 
 
+def redraw_reclassified_detection(canvas, raw_image, detection,
+                                   old_class, color):
+    """Remove the detector's old label and draw the final class on Canvas."""
+    x1, y1, x2, y2 = [int(round(value)) for value in detection.bbox]
+    height, width = canvas.shape[:2]
+    x1 = int(np.clip(x1, 0, width - 1))
+    x2 = int(np.clip(x2, 0, width - 1))
+    y1 = int(np.clip(y1, 0, height - 1))
+    y2 = int(np.clip(y2, 0, height - 1))
+
+    font_scale = 2.0 / 3.0
+    thickness = 1
+    old_label = f'{old_class} {detection.confidence:.2f}'
+    new_label = f'{detection.class_name} {detection.confidence:.2f}'
+    old_size = cv2.getTextSize(old_label, 0, font_scale, thickness)[0]
+    new_size = cv2.getTextSize(new_label, 0, font_scale, thickness)[0]
+    restore_top = max(0, y1 - max(old_size[1], new_size[1]) - 7)
+    restore_right = min(width, x1 + max(old_size[0], new_size[0]) + 5)
+    if restore_top < y1 + 2 and x1 < restore_right:
+        canvas[restore_top:min(height, y1 + 2), x1:restore_right] = \
+            raw_image[restore_top:min(height, y1 + 2), x1:restore_right]
+
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+    text_width, text_height = new_size
+    text_y = max(text_height + 3, y1 - 2)
+    cv2.rectangle(
+        canvas,
+        (x1, max(0, text_y - text_height - 3)),
+        (min(width - 1, x1 + text_width + 4), min(height - 1, text_y + 2)),
+        (0, 0, 0), -1)
+    cv2.putText(canvas, new_label, (x1 + 2, text_y), 0, font_scale,
+                color, thickness, cv2.LINE_AA)
+
+
 def forced_class_for_tag(tag_id: int) -> Optional[str]:
     """Return the authoritative component class encoded by a panel tag."""
     tag_id = int(tag_id)

@@ -7,6 +7,7 @@ from panel_detection.panel_apriltag import (
     detect_panel_tags,
     forced_class_for_tag,
     reclassify_buttons_without_tags,
+    redraw_reclassified_detection,
 )
 from panel_detection.target_registry import FrameDetection
 
@@ -72,6 +73,25 @@ def test_buttons_keep_yolo_class_when_any_current_tag_is_visible():
 
     assert changed == []
     assert detections[0].class_name == 'button'
+
+
+def test_canvas_redraw_uses_only_reclassified_light_label(monkeypatch):
+    raw_image = np.full((120, 180, 3), 127, dtype=np.uint8)
+    canvas = raw_image.copy()
+    detection = _detection('light', 80.0, center_y=70.0, size=40.0)
+    labels = []
+    original_put_text = cv2.putText
+
+    def record_put_text(image, text, *args, **kwargs):
+        labels.append(text)
+        return original_put_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, 'putText', record_put_text)
+    redraw_reclassified_detection(
+        canvas, raw_image, detection, 'button', (255, 255, 0))
+
+    assert labels == ['light 0.90']
+    assert np.any(canvas != raw_image)
 
 
 def test_tags_above_components_are_associated_one_to_one():

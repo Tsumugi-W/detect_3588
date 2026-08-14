@@ -62,6 +62,7 @@ from .panel_apriltag import (
     detect_panel_tags,
     draw_panel_tag_assignments,
     reclassify_buttons_without_tags,
+    redraw_reclassified_detection,
 )
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
@@ -1630,15 +1631,9 @@ class PanelDetectionNode(Node):
                     frame_detections, panel_tag_markers)
                 no_tag_light_ids = {id(detection) for detection in changed}
                 for detection in changed:
-                    x1, y1, x2, y2 = [
-                        int(round(value)) for value in detection.bbox]
-                    cv2.rectangle(canvas, (x1, max(0, y1 - 22)),
-                                  (min(canvas.shape[1] - 1, x1 + 64), y1),
-                                  (0, 0, 0), -1)
-                    cv2.putText(canvas, 'light', (x1 + 2, max(14, y1 - 5)),
-                                0, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
-                    cv2.rectangle(canvas, (x1, y1), (x2, y2),
-                                  (255, 255, 0), 2, cv2.LINE_AA)
+                    redraw_reclassified_detection(
+                        canvas, color_image, detection,
+                        old_class='button', color=(255, 255, 0))
             draw_panel_tag_assignments(
                 canvas, panel_tag_markers, panel_tag_assignments, frame_detections)
 
