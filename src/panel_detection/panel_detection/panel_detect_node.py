@@ -52,7 +52,8 @@ from .fastener_axis_stabilizer import (
     FastenerAxisMeasurement,
     FastenerAxisStabilizer,
 )
-from .nameplate_ocr import NameplateRecognizer
+# 铭牌 OCR 暂停使用。保留 nameplate_ocr.py，后续需要时再恢复接入。
+# from .nameplate_ocr import NameplateRecognizer
 from .nut_localizer import localize_nut
 from .panel_apriltag import (
     PanelAprilTagTracker,
@@ -138,17 +139,10 @@ DEFAULT_CONFIG = {
         'max_jump_deg': 10.0,
         'confirm_frames': 5,
     },
-    'nameplate_ocr': {
-        'enable': True,
-        'confirm_frames': 3,
-        'ocr_interval': 10,
-        'roi_above_ratio': 0.6,
-        'roi_gap_ratio': 0.1,
-        'roi_width_ratio': 2.8,
-        'roi_min_height': 15,
-        'use_gpu': False,
-        'lang': 'ch',
-    },
+    # 铭牌 OCR 配置暂停使用。
+    # 'nameplate_ocr': {
+    #     'enable': False,
+    # },
     'detection_mode': 'all',
     'publish_legacy_topics': False,
     'apriltag_reference': {
@@ -865,9 +859,8 @@ class PanelDetectionNode(Node):
         self._distance_pub = (
             self.create_publisher(String, topics['distance'], 10)
             if 'distance' in topics else None)
-        self._labels_pub = (
-            self.create_publisher(String, '/panel/labels', 10)
-            if self._process_panel_controls else None)
+        # 铭牌 OCR 暂停使用，不创建 /panel/labels publisher。
+        self._labels_pub = None
 
         # 目标注册器
         reg_cfg = self.cfg.get('registry', {})
@@ -995,23 +988,9 @@ class PanelDetectionNode(Node):
             f'旋钮角度模式: {self._angle_constraint_mode} '
             '(1=0/90稳定输出, 2=旧约束, 3=旧无约束)')
 
-        # 铭牌 OCR
-        ocr_cfg = self.cfg.get('nameplate_ocr', {})
-        self._nameplate_enable = ocr_cfg.get('enable', True) and self._process_panel_controls
-        if self._nameplate_enable:
-            self._nameplate_recognizer = NameplateRecognizer(
-                confirm_frames=ocr_cfg.get('confirm_frames', 5),
-                ocr_interval=ocr_cfg.get('ocr_interval', 10),
-                roi_above_ratio=ocr_cfg.get('roi_above_ratio', 1.8),
-                roi_gap_ratio=ocr_cfg.get('roi_gap_ratio', 0.2),
-                roi_width_ratio=ocr_cfg.get('roi_width_ratio', 2.5),
-                roi_min_height=ocr_cfg.get('roi_min_height', 20),
-                use_gpu=ocr_cfg.get('use_gpu', False),
-                lang=ocr_cfg.get('lang', 'ch'),
-            )
-            self.get_logger().info('铭牌 OCR 已启用')
-        else:
-            self._nameplate_recognizer = None
+        # 铭牌 OCR 暂停使用，不初始化 RapidOCR/PaddleOCR，也不绘制 OCR ROI。
+        self._nameplate_enable = False
+        self._nameplate_recognizer = None
 
         pos_cfg = self.cfg.get('position_stabilizer', {})
         self._position_stabilizer = PositionStabilizer(
@@ -1475,9 +1454,19 @@ class PanelDetectionNode(Node):
         t0 = time.time()
         canvas, class_id_list, xyxy_list, conf_list = self._detector.detect(color_image)
         t1 = time.time()
+
+        # Detect panel tags independently of YOLO. This keeps decoded tag
+        # outlines visible while commissioning a tag sheet or when the
+        # associated component is temporarily missed by the detector.
+        panel_tag_markers = []
+        if self._panel_tags_enabled:
+            panel_tag_markers = detect_panel_tags(color_image, self._panel_tag_cfg)
+
         if not xyxy_list:
             if self._panel_tags_enabled:
-                self._panel_tag_tracker.update([], [])
+                self._panel_tag_tracker.update([], panel_tag_markers)
+                draw_panel_tag_assignments(
+                    canvas, panel_tag_markers, {}, [])
             self._update_display_frame(canvas, color_stamp)
             self._publish_status('no_detection')
             return
@@ -1537,16 +1526,16 @@ class PanelDetectionNode(Node):
         active_xyxy_list = [det.bbox for det in frame_detections]
         if not frame_detections:
             if self._panel_tags_enabled:
-                self._panel_tag_tracker.update([], [])
+                self._panel_tag_tracker.update([], panel_tag_markers)
+                draw_panel_tag_assignments(
+                    canvas, panel_tag_markers, {}, [])
             self._update_display_frame(canvas, color_stamp)
             self._publish_status('no_detection')
             return
 
-        panel_tag_markers = []
         panel_tag_assignments = {}
         tagged_detection_ids = set()
         if self._panel_tags_enabled:
-            panel_tag_markers = detect_panel_tags(color_image, self._panel_tag_cfg)
             panel_tag_assignments = self._panel_tag_tracker.update(
                 frame_detections, panel_tag_markers)
             for det_index, assignment in panel_tag_assignments.items():
@@ -1735,14 +1724,6 @@ class PanelDetectionNode(Node):
         ]
         self._knob_angle_stabilizer.prune(active_knob_ids)
 
-        # 铭牌 OCR：注册阶段定期识别并投票
-        nameplate_labels = {}
-        if self._nameplate_recognizer is not None:
-            nameplate_labels = self._nameplate_recognizer.update(
-                [item for item in matched
-                 if item[1].class_name in ('button', 'knob')],
-                color_image)
-
         for target_id, det in matched:
             xyz = stable_xyz.get(target_id, matched_xyz[target_id])
             matched_xyz[target_id] = xyz
@@ -1763,9 +1744,6 @@ class PanelDetectionNode(Node):
                                 'z': quat[2], 'w': quat[3]},
                 'confidence': round(det.confidence, 3),
             }
-            label = nameplate_labels.get(target_id)
-            if label:
-                target_info['label'] = label
             targets_output.append(target_info)
 
             # 兼容旧话题
@@ -2260,18 +2238,6 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._angle_pub.publish(msg)
 
-        # 发布铭牌标签映射（有新确认时发布）
-        if nameplate_labels and self._labels_pub is not None:
-            msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp_value,
-                'labels': [
-                    {'id': tid, 'label': text}
-                    for tid, text in sorted(nameplate_labels.items())
-                ],
-            }, ensure_ascii=False)
-            self._labels_pub.publish(msg)
-
         # 阀门/螺栓/螺母属于面板外目标，发布到独立几何话题。
         if ((hex_angles or axis_directions or axis_reference is not None) and
                 self._object_geometry_pub is not None):
@@ -2336,9 +2302,7 @@ class PanelDetectionNode(Node):
                         draw_knob_angle(canvas, det.bbox, ka['angle'])
                     break
 
-        # 铭牌 OCR 可视化
-        if self._nameplate_recognizer is not None:
-            self._nameplate_recognizer.draw_debug(canvas, matched)
+        # 铭牌 OCR 可视化暂停使用，Canvas 不再绘制黄色/橙色 OCR ROI 框。
 
         cv2.putText(canvas, 'REGISTERED', (10, canvas.shape[0] - 15),
                     0, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
