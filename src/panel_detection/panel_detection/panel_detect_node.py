@@ -71,9 +71,9 @@ DEFAULT_CONFIG = {
     'camera': {'color_width': 1280, 'color_height': 720,
                'depth_width': 1280, 'depth_height': 720, 'fps': 30},
     'inference_backend': 'onnx',
-    'onnx_model': '0813.onnx',
+    'onnx_model': '0824.onnx',
     'onnx_threads': 8,
-    'weight': '0813.pt',
+    'weight': '0824.pt',
     'input_size': 640,
     'class_num': 9,
     'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump',
@@ -1322,7 +1322,7 @@ class PanelDetectionNode(Node):
 
         if backend == 'onnx':
             from .detector_onnx import YoloV5ORT
-            onnx_path = self.cfg.get('onnx_model', '0813.onnx')
+            onnx_path = self.cfg.get('onnx_model', '0824.onnx')
             if not os.path.isabs(onnx_path):
                 onnx_path = os.path.join(pkg_dir, onnx_path)
             threads = self.cfg.get('onnx_threads', 4)
