@@ -1,6 +1,6 @@
 <launch>
   <arg name="camera_name" default="camera_d435_0"/>
-  <arg name="model_path" default="$(find panel_detection)/models/0813.onnx"/>
+  <arg name="model_path" default="$(find panel_detection)/models/0824.onnx"/>
   <arg name="use_constraint" default="1"/>
   <arg name="use_panel_tags" default="true"/>
   <arg name="show_gui" default="false"/>

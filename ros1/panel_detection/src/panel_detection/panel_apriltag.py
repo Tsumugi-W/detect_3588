@@ -114,6 +114,7 @@ class _TagTrack:
     velocity_xy: np.ndarray
     last_frame: int
     last_tag_frame: int
+    tag_center_xy: np.ndarray = None
 
 
 def detect_panel_tags(color_image: np.ndarray, cfg=None) -> List[PanelTagMarker]:
@@ -213,7 +214,8 @@ class PanelAprilTagTracker:
             assignments[detection_index] = assignment
             used_tags.add(tag_id)
             used_detections.add(detection_index)
-            self._update_track(tag_id, detections[detection_index], tag_seen=True)
+            self._update_track(tag_id, detections[detection_index],
+                               tag_seen=True, marker=marker)
 
         track_candidates = []
         for tag_id, track in self._tracks.items():
@@ -292,6 +294,9 @@ class PanelAprilTagTracker:
 
     def _track_score(self, track: _TagTrack,
                      detection: FrameDetection) -> Optional[float]:
+        if (track.tag_center_xy is not None and
+                track.tag_center_xy[1] >= detection.center_y):
+            return None
         center = np.array(
             [detection.center_x, detection.center_y], dtype=np.float64)
         size = self._detection_size(detection)
@@ -309,7 +314,8 @@ class PanelAprilTagTracker:
         return distance / distance_gate + 0.25 * size_error
 
     def _update_track(self, tag_id: int, detection: FrameDetection,
-                      tag_seen: bool) -> None:
+                      tag_seen: bool,
+                      marker: Optional[PanelTagMarker] = None) -> None:
         center = np.array(
             [detection.center_x, detection.center_y], dtype=np.float64)
         size = self._detection_size(detection)
@@ -323,6 +329,12 @@ class PanelAprilTagTracker:
             velocity = 0.5 * previous.velocity_xy + 0.5 * measured_velocity
             last_tag_frame = (
                 self._frame_index if tag_seen else previous.last_tag_frame)
+        if marker is not None:
+            tag_center = np.array(marker.center_xy, dtype=np.float64)
+        elif previous is not None and previous.tag_center_xy is not None:
+            tag_center = previous.tag_center_xy
+        else:
+            tag_center = None
         self._tracks[tag_id] = _TagTrack(
             tag_id=tag_id,
             center_xy=center,
@@ -330,6 +342,7 @@ class PanelAprilTagTracker:
             velocity_xy=velocity,
             last_frame=self._frame_index,
             last_tag_frame=last_tag_frame,
+            tag_center_xy=tag_center,
         )
 
     @staticmethod

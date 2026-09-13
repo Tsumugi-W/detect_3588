@@ -1,6 +1,6 @@
 # Partial overrides are recursively merged with the defaults in the node.
 inference_backend: onnx
-onnx_model: 0813.onnx
+onnx_model: 0824.onnx
 onnx_threads: 8
 input_size: 640
 class_num: 9
