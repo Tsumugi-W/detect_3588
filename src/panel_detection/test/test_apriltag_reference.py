@@ -5,7 +5,16 @@ from panel_detection.apriltag_reference import (
     _detect_aruco_markers,
     _get_apriltag_dictionary,
     _normalize_aruco_result,
+    estimate_apriltag_pnp_normal,
 )
+
+
+class _Intrinsics:
+    fx = 600.0
+    fy = 600.0
+    cx = 320.0
+    cy = 240.0
+    coeffs = [0.0] * 5
 
 
 def test_aruco_detector_api_is_compatible_with_installed_opencv():
@@ -47,3 +56,19 @@ def test_aruco_result_normalizes_flat_marker_ids():
     assert ids.shape == (1, 1)
     assert ids.tolist() == [[7]]
     assert rejected == []
+
+
+def test_pnp_normal_does_not_require_the_tag_size():
+    corners = np.array([
+        [260.0, 300.0],
+        [380.0, 300.0],
+        [380.0, 180.0],
+        [260.0, 180.0],
+    ], dtype=np.float32)
+
+    result = estimate_apriltag_pnp_normal(corners, _Intrinsics())
+
+    assert result is not None
+    normal, reprojection_error = result
+    assert np.allclose(normal, [0.0, 0.0, -1.0], atol=1e-6)
+    assert reprojection_error < 1e-5

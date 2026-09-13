@@ -55,6 +55,11 @@ from .fastener_axis_stabilizer import (
 # 铭牌 OCR 暂停使用。保留 nameplate_ocr.py，后续需要时再恢复接入。
 # from .nameplate_ocr import NameplateRecognizer
 from .nut_localizer import localize_nut
+from .concentric_bolt_marker import (
+    detect_concentric_bolt_markers,
+    estimate_concentric_bolt_poses,
+)
+from .concentric_marker_stabilizer import ConcentricMarkerStabilizer
 from .panel_apriltag import (
     PanelAprilTagTracker,
     detect_panel_tags,
@@ -116,6 +121,7 @@ DEFAULT_CONFIG = {
         'slot_match_ratio': 0.45,
         'normal_angle_thresh_deg': 25.0,
         'ema_alpha': 0.35,
+        'slot_ambiguity_margin_m': 0.008,
         'stale_frames': 120,
     },
     'fastener_axis_stabilizer': {
@@ -136,6 +142,29 @@ DEFAULT_CONFIG = {
         'ema_alpha': 0.20,
         'depth_std_thresh': 0.008,
     },
+    'concentric_bolt_marker': {
+        'enable': True,
+        'min_area_px': 45.0,
+        'max_area_ratio': 0.04,
+        'min_circularity': 0.72,
+        'min_axis_ratio': 0.60,
+        'min_axis_for_angle_px': 22.0,
+        'min_valid_depth_px': 8,
+        'max_plane_offset_residual_m': 0.008,
+        'reference_cache_frames': 15,
+        'stabilizer_enable': True,
+        'position_ema_alpha': 0.35,
+        'position_jump_thresh_m': 0.03,
+        'position_max_velocity_mps': 1.0,
+        'normal_ema_alpha': 0.25,
+        'normal_max_jump_deg': 12.0,
+        'angle_ema_alpha': 0.30,
+        'angle_max_jump_deg': 30.0,
+        'direction_ema_alpha': 0.30,
+        'direction_max_jump_deg': 20.0,
+        'stabilizer_max_dt': 0.5,
+        'stabilizer_stale_frames': 90,
+    },
     'valve_angle_stabilizer': {
         'enable': False,
         'max_jump_deg': 10.0,
@@ -148,7 +177,7 @@ DEFAULT_CONFIG = {
     'detection_mode': 'all',
     'publish_legacy_topics': False,
     'apriltag_reference': {
-        'enable': False,
+        'enable': True,
         'dictionary': 'DICT_APRILTAG_36h11',
         'sample_stride': 3,
         'border_margin_ratio': 0.12,
@@ -896,6 +925,8 @@ class PanelDetectionNode(Node):
             normal_angle_thresh_deg=fastener_reg_cfg.get(
                 'normal_angle_thresh_deg', 25.0),
             ema_alpha=fastener_reg_cfg.get('ema_alpha', 0.35),
+            slot_ambiguity_margin_m=fastener_reg_cfg.get(
+                'slot_ambiguity_margin_m', 0.008),
             stale_frames=fastener_reg_cfg.get('stale_frames', 120),
         )
         fastener_axis_cfg = self.cfg.get('fastener_axis_stabilizer', {})
@@ -1030,6 +1061,34 @@ class PanelDetectionNode(Node):
         self._last_status_publish_time = 0.0
         ref_cfg = self.cfg.get('apriltag_reference', {})
         self._apriltag_reference_enabled = bool(ref_cfg.get('enable', False))
+        self._apriltag_reference_cache = None
+        self._concentric_marker_cfg = self.cfg.get('concentric_bolt_marker', {})
+        self._concentric_marker_enabled = bool(
+            self._concentric_marker_cfg.get('enable', True))
+        self._concentric_marker_stabilizer = ConcentricMarkerStabilizer(
+            enabled=self._concentric_marker_cfg.get('stabilizer_enable', True),
+            position_ema_alpha=self._concentric_marker_cfg.get(
+                'position_ema_alpha', 0.35),
+            position_jump_thresh_m=self._concentric_marker_cfg.get(
+                'position_jump_thresh_m', 0.03),
+            position_max_velocity_mps=self._concentric_marker_cfg.get(
+                'position_max_velocity_mps', 1.0),
+            normal_ema_alpha=self._concentric_marker_cfg.get(
+                'normal_ema_alpha', 0.25),
+            normal_max_jump_deg=self._concentric_marker_cfg.get(
+                'normal_max_jump_deg', 12.0),
+            angle_ema_alpha=self._concentric_marker_cfg.get(
+                'angle_ema_alpha', 0.30),
+            angle_max_jump_deg=self._concentric_marker_cfg.get(
+                'angle_max_jump_deg', 30.0),
+            direction_ema_alpha=self._concentric_marker_cfg.get(
+                'direction_ema_alpha', 0.30),
+            direction_max_jump_deg=self._concentric_marker_cfg.get(
+                'direction_max_jump_deg', 20.0),
+            max_dt=self._concentric_marker_cfg.get('stabilizer_max_dt', 0.5),
+            stale_frames=self._concentric_marker_cfg.get(
+                'stabilizer_stale_frames', 90),
+        )
         self._axis_ref_log_fp = None
         self._axis_ref_log_path = ''
         if self._apriltag_reference_enabled and ref_cfg.get('log_enable', True):
@@ -1465,6 +1524,51 @@ class PanelDetectionNode(Node):
         if self._panel_tags_enabled:
             panel_tag_markers = detect_panel_tags(color_image, self._panel_tag_cfg)
 
+        # Printed concentric targets replace YOLO fastener detections whenever
+        # present. Their geometry is deterministic and remains detectable even
+        # though the training set contained only bare bolt/nut heads.
+        concentric_markers = []
+        marker_by_raw_detection_index = {}
+        if self._process_fasteners and self._concentric_marker_enabled:
+            concentric_markers = detect_concentric_bolt_markers(
+                color_image, self._concentric_marker_cfg)
+        if concentric_markers and 'bolt' in self._class_names:
+            keep_indices = []
+            for index, bbox in enumerate(xyxy_list):
+                class_id = class_id_list[index]
+                class_name = (
+                    self._class_names[class_id]
+                    if class_id < len(self._class_names) else 'unknown')
+                center = ((bbox[0] + bbox[2]) * 0.5,
+                          (bbox[1] + bbox[3]) * 0.5)
+                overlaps_marker = any(
+                    np.hypot(center[0] - marker.center[0],
+                             center[1] - marker.center[1])
+                    <= 1.8 * marker.radius
+                    for marker in concentric_markers)
+                if class_name not in ('bolt', 'nut', 'valve') or not overlaps_marker:
+                    keep_indices.append(index)
+            class_id_list = [class_id_list[index] for index in keep_indices]
+            xyxy_list = [xyxy_list[index] for index in keep_indices]
+            conf_list = [conf_list[index] for index in keep_indices]
+
+            bolt_class_id = self._class_names.index('bolt')
+            for marker in concentric_markers:
+                raw_index = len(xyxy_list)
+                marker_by_raw_detection_index[raw_index] = marker
+                class_id_list.append(bolt_class_id)
+                xyxy_list.append(list(marker.bbox))
+                conf_list.append(float(marker.confidence))
+                cv2.drawContours(canvas, [marker.contour], -1, (0, 255, 0), 2)
+                center_px = tuple(int(round(value)) for value in marker.center)
+                cv2.drawMarker(
+                    canvas, center_px, (0, 0, 255), cv2.MARKER_CROSS, 12, 2)
+                if marker.gap_point is not None:
+                    gap_px = tuple(int(round(value)) for value in marker.gap_point)
+                    cv2.arrowedLine(
+                        canvas, center_px, gap_px, (255, 0, 255), 2,
+                        tipLength=0.3)
+
         if not xyxy_list:
             if self._panel_tags_enabled:
                 self._panel_tag_tracker.update([], panel_tag_markers)
@@ -1492,6 +1596,54 @@ class PanelDetectionNode(Node):
                     self._panel_normal_cache = stable_plane
         t3 = time.time()
 
+        apriltag_reference = None
+        if ((self._process_valves or self._process_fasteners)
+                and self._apriltag_reference_enabled):
+            apriltag_reference = detect_apriltag_reference_axis(
+                color_image,
+                filtered_depth,
+                deproj_intrin,
+                depth_scale=self._depth_scale,
+                cfg=self.cfg.get('apriltag_reference', {}),
+            )
+            if apriltag_reference is not None:
+                self._apriltag_reference_cache = (
+                    self._frame_count, apriltag_reference)
+            elif self._apriltag_reference_cache is not None:
+                cached_frame, cached_reference = self._apriltag_reference_cache
+                cache_frames = int(self._concentric_marker_cfg.get(
+                    'reference_cache_frames', 15))
+                if self._frame_count - cached_frame <= cache_frames:
+                    apriltag_reference = dict(cached_reference)
+                    apriltag_reference['source'] = 'apriltag_pnp_cache'
+
+        marker_normal_status = 'missing'
+        if apriltag_reference is not None:
+            stable_normal, marker_normal_status = (
+                self._concentric_marker_stabilizer.update_reference(
+                    apriltag_reference['normal'],
+                    color_stamp.sec + color_stamp.nanosec * 1e-9
+                    if color_stamp is not None else self.get_clock().now().nanoseconds * 1e-9))
+            if stable_normal is not None:
+                apriltag_reference = dict(apriltag_reference)
+                apriltag_reference['normal'] = stable_normal
+                apriltag_reference['normal_filter_status'] = marker_normal_status
+
+        marker_pose_by_marker_id = {}
+        if concentric_markers and apriltag_reference is not None:
+            marker_poses = estimate_concentric_bolt_poses(
+                concentric_markers,
+                filtered_depth,
+                deproj_intrin,
+                apriltag_reference['normal'],
+                depth_scale=self._depth_scale,
+                cfg=self._concentric_marker_cfg,
+            )
+            marker_pose_by_marker_id = {
+                id(marker): pose
+                for marker, pose in zip(concentric_markers, marker_poses)
+            }
+
         # 每 30 帧打印一次耗时
         if self._frame_count % 30 == 0:
             self.get_logger().info(
@@ -1505,21 +1657,27 @@ class PanelDetectionNode(Node):
             quat = _normal_to_quaternion(normal)
 
         stamp = color_stamp if color_stamp is not None else self.get_clock().now().to_msg()
+        stamp_seconds = stamp.sec + stamp.nanosec * 1e-9
 
         # 构建当前帧的 FrameDetection 列表
         frame_detections = []
+        marker_by_detection_id = {}
         for i, xyxy in enumerate(xyxy_list):
             cls_id = class_id_list[i]
             cls_name = self._class_names[cls_id] if cls_id < len(self._class_names) else 'unknown'
             cx = (xyxy[0] + xyxy[2]) / 2.0
             cy = (xyxy[1] + xyxy[3]) / 2.0
-            frame_detections.append(FrameDetection(
+            frame_detection = FrameDetection(
                 class_name=cls_name,
                 center_x=cx,
                 center_y=cy,
                 bbox=tuple(xyxy[:4]),
                 confidence=float(conf_list[i]),
-            ))
+            )
+            frame_detections.append(frame_detection)
+            if i in marker_by_raw_detection_index:
+                marker_by_detection_id[id(frame_detection)] = (
+                    marker_by_raw_detection_index[i])
 
         if self._active_classes is not None:
             frame_detections = [
@@ -1821,7 +1979,27 @@ class PanelDetectionNode(Node):
                     det.class_name in ('button', 'knob')):
                 continue  # 已在 matched 中处理
 
-            if det.class_name == 'nut':
+            marker = marker_by_detection_id.get(id(det))
+            marker_pose = (
+                marker_pose_by_marker_id.get(id(marker))
+                if marker is not None else None)
+            if marker is not None:
+                ux = int(round(marker.center[0]))
+                uy = int(round(marker.center[1]))
+                xyz = marker_pose.point_3d if marker_pose is not None else None
+                if not _valid_point_3d(xyz):
+                    cv2.putText(canvas, 'marker plane/depth fail',
+                                (ux + 10, uy + 18), 0, 0.4,
+                                (0, 0, 255), 1, cv2.LINE_AA)
+                    continue
+                angle_text = ('na' if marker.gap_angle_deg is None
+                              else f'{marker.gap_angle_deg:.1f}')
+                cv2.putText(
+                    canvas,
+                    f'bolt_marker conf={marker.confidence:.2f} angle={angle_text}',
+                    (ux + 10, max(15, uy - 8)), 0, 0.4,
+                    (0, 255, 0), 1, cv2.LINE_AA)
+            elif det.class_name == 'nut':
                 loc = nut_localizations.get(det_idx)
                 bbox_cx = int(round(det.center_x))
                 bbox_cy = int(round(det.center_y))
@@ -1887,6 +2065,25 @@ class PanelDetectionNode(Node):
                                     'z': quat[2], 'w': quat[3]},
                     'confidence': round(det.confidence, 3),
                 }
+                if marker is not None and marker_pose is not None:
+                    marker_quat = (
+                        _normal_to_quaternion(apriltag_reference['normal'])
+                        if apriltag_reference is not None else quat)
+                    target_item.update({
+                        'classification_source': 'concentric_bolt_marker',
+                        'depth_source': marker_pose.depth_source,
+                        'orientation': {
+                            'x': marker_quat[0], 'y': marker_quat[1],
+                            'z': marker_quat[2], 'w': marker_quat[3],
+                        },
+                        'marker_angle_deg': (
+                            None if marker.gap_angle_deg is None
+                            else round(marker.gap_angle_deg, 1)),
+                        'marker_direction_3d': (
+                            None if marker_pose.direction_3d is None
+                            else [round(float(value), 6)
+                                  for value in marker_pose.direction_3d]),
+                    })
                 object_targets_output.append(target_item)
                 if det.class_name in ('bolt', 'nut'):
                     fastener_target_items[det_idx] = target_item
@@ -1904,15 +2101,6 @@ class PanelDetectionNode(Node):
                             (ux + 10, uy + 5), 0, 0.4,
                             (225, 255, 255), 1, cv2.LINE_AA)
 
-        apriltag_reference = None
-        if self._process_valves and self._apriltag_reference_enabled:
-            apriltag_reference = detect_apriltag_reference_axis(
-                color_image,
-                filtered_depth,
-                deproj_intrin,
-                depth_scale=self._depth_scale,
-                cfg=self.cfg.get('apriltag_reference', {}),
-            )
         valve_reference_errors = []
 
         # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
@@ -1929,9 +2117,17 @@ class PanelDetectionNode(Node):
         for det_idx, det in enumerate(frame_detections):
             if det.class_name not in axis_target_classes:
                 continue
+            marker = marker_by_detection_id.get(id(det))
+            marker_pose = (
+                marker_pose_by_marker_id.get(id(marker))
+                if marker is not None else None)
             loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
             reliable_nut = loc is not None and loc.confidence >= 0.45
-            if reliable_nut:
+            if marker_pose is not None and marker_pose.point_3d is not None:
+                ux = int(round(marker.center[0]))
+                uy = int(round(marker.center[1]))
+                xyz = marker_pose.point_3d
+            elif reliable_nut:
                 ux, uy, xyz = _estimate_nut_detection_point(
                     loc, filtered_depth, deproj_intrin, self._depth_scale)
             else:
@@ -1955,8 +2151,21 @@ class PanelDetectionNode(Node):
                 n_sides = 8 if det.class_name == 'valve' else 6
                 loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
                 reliable_nut = loc is not None and loc.confidence >= 0.45
+                marker = marker_by_detection_id.get(id(det))
+                marker_pose = (
+                    marker_pose_by_marker_id.get(id(marker))
+                    if marker is not None else None)
 
-                if (det.class_name == 'valve' and not _bbox_inside_image(
+                if (marker is not None and marker_pose is not None
+                        and marker_pose.point_3d is not None
+                        and apriltag_reference is not None):
+                    axis_source = apriltag_reference['source'] + '_marker'
+                    axis_result = (
+                        apriltag_reference['normal'],
+                        marker_pose.point_3d,
+                        len(concentric_markers),
+                    )
+                elif (det.class_name == 'valve' and not _bbox_inside_image(
                         det.bbox, color_image.shape,
                         margin_px=self.cfg.get('valve_axis', {}).get('edge_margin_px', 4))):
                     axis_source = 'valve_incomplete'
@@ -2065,9 +2274,15 @@ class PanelDetectionNode(Node):
                             label=f'{det.class_name}_axis[{axis_source}]',
                             color=(255, 255, 0))
 
-                hex_angle = loc.angle if reliable_nut and loc.angle is not None else None
+                marker_angle = (
+                    marker.gap_angle_deg if marker is not None else None)
+                hex_angle = (
+                    marker_angle % 60.0 if marker_angle is not None
+                    else (loc.angle if reliable_nut and loc.angle is not None else None))
                 if hex_angle is None:
-                    if det.class_name == 'valve':
+                    if marker is not None:
+                        hex_angle = None
+                    elif det.class_name == 'valve':
                         if not _bbox_inside_image(
                                 det.bbox, color_image.shape,
                                 margin_px=self.cfg.get('valve_axis', {}).get(
@@ -2093,6 +2308,16 @@ class PanelDetectionNode(Node):
                     }
                     if det.class_name == 'valve':
                         angle_item['valve_angle'] = round(hex_angle, 1)
+                    if marker_angle is not None:
+                        angle_item.update({
+                            'angle_source': 'concentric_bolt_marker',
+                            'marker_angle_deg': round(marker_angle, 1),
+                            'marker_direction_3d': (
+                                None if marker_pose is None
+                                or marker_pose.direction_3d is None
+                                else [round(float(value), 6)
+                                      for value in marker_pose.direction_3d]),
+                        })
                     hex_angles.append(angle_item)
                     if det.class_name in ('bolt', 'nut'):
                         fastener_geometry_items.setdefault(det_idx, []).append(angle_item)
@@ -2152,6 +2377,9 @@ class PanelDetectionNode(Node):
                 'point_count': apriltag_reference['point_count'],
                 'inlier_ratio': round(float(apriltag_reference['inlier_ratio']), 4),
                 'rms_error_m': round(float(apriltag_reference['rms_error']), 5),
+                'reprojection_error_px': (
+                    None if apriltag_reference.get('reprojection_error_px') is None
+                    else round(float(apriltag_reference['reprojection_error_px']), 4)),
                 'valve_errors': valve_reference_errors,
             }
             _draw_apriltag_reference(canvas, apriltag_reference, valve_reference_errors)
@@ -2204,11 +2432,112 @@ class PanelDetectionNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                             (0, 255, 255), 2, cv2.LINE_AA)
 
+        # 同心圆标记使用稳定 ID 进行时序门控和滤波。这个步骤放在注册器
+        # 分配槽位之后，因此不会因检测顺序变化而把滤波历史串到别的螺栓。
+        self._concentric_marker_stabilizer.prune(self._frame_count)
+        marker_filter_results = {}
+        stable_marker_normal = self._concentric_marker_stabilizer.normal
+        if stable_marker_normal is not None:
+            stable_marker_quat = _normal_to_quaternion(stable_marker_normal)
+            # 即便本帧同心圆的中心深度暂时失败，YOLO 的 bolt fallback
+            # 也沿用同一个经过门控的 Tag 法向，避免输出姿态突然跳回旧平面法向。
+            for target_item in object_targets_output:
+                if target_item.get('class') != 'bolt':
+                    continue
+                target_item['orientation'] = {
+                    'x': stable_marker_quat[0], 'y': stable_marker_quat[1],
+                    'z': stable_marker_quat[2], 'w': stable_marker_quat[3],
+                }
+                target_item.setdefault('stabilization', {})['normal'] = (
+                    marker_normal_status)
+        for det_idx, assignment in assignments.items():
+            target_item = fastener_target_items.get(det_idx)
+            marker = marker_by_detection_id.get(id(frame_detections[det_idx]))
+            marker_pose = (
+                marker_pose_by_marker_id.get(id(marker))
+                if marker is not None else None)
+            if (target_item is None or marker is None or marker_pose is None or
+                    not _valid_point_3d(marker_pose.point_3d)):
+                continue
+            filter_key = (assignment.group_id, assignment.target_id)
+            result = self._concentric_marker_stabilizer.update_marker(
+                filter_key,
+                stamp_seconds,
+                self._frame_count,
+                marker_pose.point_3d,
+                angle_deg=marker.gap_angle_deg,
+                direction=marker_pose.direction_3d,
+            )
+            if result is None:
+                continue
+            marker_filter_results[det_idx] = result
+            xyz = result['position']
+            stable_normal = self._concentric_marker_stabilizer.normal
+            if stable_normal is None and apriltag_reference is not None:
+                stable_normal = apriltag_reference['normal']
+            if stable_normal is not None:
+                stable_quat = _normal_to_quaternion(stable_normal)
+                target_item['orientation'] = {
+                    'x': stable_quat[0], 'y': stable_quat[1],
+                    'z': stable_quat[2], 'w': stable_quat[3],
+                }
+            target_item['position'] = {
+                'x': round(float(xyz[0]), 4),
+                'y': round(float(xyz[1]), 4),
+                'z': round(float(xyz[2]), 4),
+            }
+            target_item['marker_angle_deg'] = (
+                None if result['angle_deg'] is None
+                else round(float(result['angle_deg']), 1))
+            target_item['marker_direction_3d'] = (
+                None if result['direction'] is None
+                else [round(float(value), 6) for value in result['direction']])
+            target_item['marker_angle_observed'] = marker.gap_angle_deg is not None
+            target_item['marker_direction_observed'] = (
+                marker_pose.direction_3d is not None)
+            target_item['stabilization'] = {
+                'position': result['position_status'],
+                'normal': marker_normal_status,
+                'angle': result['angle_status'],
+                'direction': result['direction_status'],
+            }
+            # 在保存的可视化帧中直接标出可用于调试/验收的位姿数值。
+            pose_lines = [
+                f"ID{assignment.target_id} P=({xyz[0] * 1000:.1f},"
+                f"{xyz[1] * 1000:.1f},{xyz[2] * 1000:.1f})mm",
+            ]
+            if stable_normal is not None:
+                pose_lines.append(
+                    f"N=({stable_normal[0]:.2f},{stable_normal[1]:.2f},"
+                    f"{stable_normal[2]:.2f})")
+            if stable_normal is not None:
+                pose_lines.append(
+                    f"Q=({stable_quat[0]:.2f},{stable_quat[1]:.2f},"
+                    f"{stable_quat[2]:.2f},{stable_quat[3]:.2f})")
+            if result['angle_deg'] is not None:
+                pose_lines.append(f"Rgap={result['angle_deg']:.1f}deg")
+            x_text = max(2, int(round(marker.bbox[0])))
+            y_text = int(round(marker.bbox[3])) + 16
+            if y_text + 15 * len(pose_lines) >= canvas.shape[0]:
+                y_text = max(15, int(round(marker.bbox[1])) -
+                             4 - 15 * len(pose_lines))
+            for line_index, text in enumerate(pose_lines):
+                origin = (x_text, y_text + line_index * 15)
+                cv2.putText(canvas, text, origin, 0, 0.38,
+                            (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(canvas, text, origin, 0, 0.38,
+                            (0, 255, 255), 1, cv2.LINE_AA)
+
         fastener_position_keys = {}
         fastener_position_measurements = []
         for det_idx, assignment in assignments.items():
             base = fastener_observation_base.get(det_idx)
             if base is None:
+                continue
+            marker = marker_by_detection_id.get(id(frame_detections[det_idx]))
+            if marker is not None:
+                # 已由 ConcentricMarkerStabilizer 处理，避免再经过基于
+                # “画面静止”判断的旧滤波器而把移动中的相机位置清空。
                 continue
             filter_key = (assignment.group_id, assignment.target_id)
             fastener_position_keys[det_idx] = filter_key
@@ -2224,8 +2553,20 @@ class PanelDetectionNode(Node):
             base = fastener_observation_base.get(det_idx)
             if base is None:
                 continue
-            filter_key = fastener_position_keys.get(det_idx)
-            xyz = stable_fastener_xyz.get(filter_key, base['point_3d'])
+            marker = marker_by_detection_id.get(id(frame_detections[det_idx]))
+            marker_result = marker_filter_results.get(det_idx)
+            if marker is not None and marker_result is not None:
+                xyz = marker_result['position']
+                pose_quat = [
+                    target_item['orientation']['x'],
+                    target_item['orientation']['y'],
+                    target_item['orientation']['z'],
+                    target_item['orientation']['w'],
+                ]
+            else:
+                pose_quat = quat
+                filter_key = fastener_position_keys.get(det_idx)
+                xyz = stable_fastener_xyz.get(filter_key, base['point_3d'])
             target_item['position'] = {
                 'x': round(float(xyz[0]), 4),
                 'y': round(float(xyz[1]), 4),
@@ -2236,7 +2577,7 @@ class PanelDetectionNode(Node):
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
-            _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
+            _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, pose_quat)
 
         # 发布目标结果：面板模式保持原编号格式；对象模式只包含对应类别。
         if self._process_panel_controls and targets_output and self._targets_pub is not None:

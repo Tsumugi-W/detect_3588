@@ -63,6 +63,42 @@ def _normalize_aruco_result(result):
     return corners, ids, rejected
 
 
+def estimate_apriltag_pnp_normal(corners, intrin):
+    """Estimate the Tag plane normal from its four image corners.
+
+    Unit-square coordinates are intentional: orientation does not depend on
+    the printed Tag size. Metric translation continues to come from depth.
+    """
+    pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    object_points = np.array([
+        [-0.5, 0.5, 0.0],
+        [0.5, 0.5, 0.0],
+        [0.5, -0.5, 0.0],
+        [-0.5, -0.5, 0.0],
+    ], dtype=np.float32)
+    camera_matrix = np.array([
+        [intrin.fx, 0.0, intrin.cx],
+        [0.0, intrin.fy, intrin.cy],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    distortion = np.asarray(getattr(intrin, 'coeffs', []), dtype=np.float64)
+    flag = getattr(cv2, 'SOLVEPNP_IPPE_SQUARE', cv2.SOLVEPNP_ITERATIVE)
+    ok, rotation_vector, translation_vector = cv2.solvePnP(
+        object_points, pts, camera_matrix, distortion, flags=flag)
+    if not ok:
+        return None
+    rotation, _ = cv2.Rodrigues(rotation_vector)
+    normal = rotation[:, 2].astype(np.float64)
+    if normal[2] > 0.0:
+        normal = -normal
+    projected, _ = cv2.projectPoints(
+        object_points, rotation_vector, translation_vector,
+        camera_matrix, distortion)
+    reprojection_error = float(np.sqrt(np.mean(np.sum(
+        (projected.reshape(4, 2) - pts) ** 2, axis=1))))
+    return normal, reprojection_error
+
+
 def _detect_tag_like_fallback_corners(gray, cfg=None):
     """Fallback for printed tag boards that are visible but not decodable."""
     cfg = cfg or {}
@@ -132,6 +168,7 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
         return None
     gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = _detect_aruco_markers(gray, dictionary)
+    decoded = ids is not None and len(corners) > 0
     if ids is None or len(corners) == 0:
         if not cfg.get('fallback_enable', True):
             return None
@@ -139,7 +176,7 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
         ids = np.array([[-1]], dtype=np.int32) if corners else None
         source = 'tag_like_depth_plane'
     else:
-        source = 'apriltag_depth_plane'
+        source = 'apriltag_pnp'
     if ids is None or len(corners) == 0:
         return None
 
@@ -152,6 +189,10 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
         pts = corner.reshape(4, 2).astype(np.float32)
         area = abs(float(cv2.contourArea(pts)))
         if area < 100.0:
+            continue
+
+        pnp_result = estimate_apriltag_pnp_normal(pts, intrin) if decoded else None
+        if decoded and pnp_result is None:
             continue
 
         center = np.mean(pts, axis=0)
@@ -186,11 +227,13 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
         )
         if fit is None:
             continue
-        normal, centroid, inlier_count, inlier_ratio, rms_error = fit
+        depth_normal, centroid, inlier_count, inlier_ratio, rms_error = fit
         if float(inlier_ratio) < float(cfg.get('min_inlier_ratio', 0.45)):
             continue
         if float(rms_error) > float(cfg.get('max_rms_m', 0.012)):
             continue
+        normal = pnp_result[0] if pnp_result is not None else depth_normal
+        reprojection_error = pnp_result[1] if pnp_result is not None else None
         if normal[2] > 0:
             normal = -normal
         if abs(float(normal[2])) < float(cfg.get('min_abs_z', 0.50)):
@@ -209,6 +252,7 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
             'point_count': int(inlier_count),
             'inlier_ratio': float(inlier_ratio),
             'rms_error': float(rms_error),
+            'reprojection_error_px': reprojection_error,
             'area': area,
         })
 

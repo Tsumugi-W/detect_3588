@@ -30,6 +30,18 @@ def generate_launch_description():
         'publish_legacy_topics', default_value='false',
         description='是否发布旧 PoseStamped 兼容话题'
     )
+    show_gui_arg = DeclareLaunchArgument(
+        'show_gui', default_value='false',
+        description='是否显示 OpenCV 窗口；无桌面环境必须为 false'
+    )
+    capture_dir_arg = DeclareLaunchArgument(
+        'capture_dir', default_value='',
+        description='保存带检测叠加的可视化帧目录；为空时不保存'
+    )
+    capture_hz_arg = DeclareLaunchArgument(
+        'capture_hz', default_value='1.0',
+        description='可视化帧保存频率（按 bag 时间戳）'
+    )
 
     detect_node = Node(
         package='panel_detection',
@@ -45,10 +57,15 @@ def generate_launch_description():
             'detection_mode': 'fastener',
             'publish_legacy_topics': ParameterValue(
                 LaunchConfiguration('publish_legacy_topics'), value_type=bool),
+            'show_gui': ParameterValue(
+                LaunchConfiguration('show_gui'), value_type=bool),
+            'capture_dir': LaunchConfiguration('capture_dir'),
+            'capture_hz': ParameterValue(
+                LaunchConfiguration('capture_hz'), value_type=float),
         }],
     )
 
     return LaunchDescription([
         use_topic_arg, registered_depth_arg, config_path_arg,
-        publish_legacy_topics_arg, detect_node])
-
+        publish_legacy_topics_arg, show_gui_arg, capture_dir_arg,
+        capture_hz_arg, detect_node])
