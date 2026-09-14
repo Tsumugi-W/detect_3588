@@ -81,6 +81,12 @@ git clone --recursive git@github.com:Tsumugi-W/detect_3588.git .
 > git submodule update --init --recursive
 > ```
 
+应用仓库维护的 Orbbec MJPEG 解码与原始图像发布补丁。脚本可重复执行：
+
+```bash
+./scripts/apply_orbbec_patches.sh
+```
+
 ### 第三步：安装系统依赖
 
 ```bash

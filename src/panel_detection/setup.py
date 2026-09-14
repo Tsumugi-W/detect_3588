@@ -32,6 +32,7 @@ setup(
     entry_points={
         'console_scripts': [
             'panel_detect_node = panel_detection.panel_detect_node:main',
+            'fastener_precision_recorder = panel_detection.fastener_precision_recorder:main',
             'rgb_depth_viewer = panel_detection.rgb_depth_viewer:main',
         ],
     },

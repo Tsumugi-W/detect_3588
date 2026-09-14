@@ -6,6 +6,7 @@ from panel_detection.apriltag_reference import (
     _get_apriltag_dictionary,
     _normalize_aruco_result,
     estimate_apriltag_pnp_normal,
+    estimate_apriltag_pnp_pose,
 )
 
 
@@ -72,3 +73,22 @@ def test_pnp_normal_does_not_require_the_tag_size():
     normal, reprojection_error = result
     assert np.allclose(normal, [0.0, 0.0, -1.0], atol=1e-6)
     assert reprojection_error < 1e-5
+
+
+def test_pnp_pose_provides_right_handed_tag_axes():
+    corners = np.array([
+        [260.0, 300.0],
+        [380.0, 300.0],
+        [380.0, 180.0],
+        [260.0, 180.0],
+    ], dtype=np.float32)
+
+    pose = estimate_apriltag_pnp_pose(corners, _Intrinsics())
+
+    assert pose is not None
+    assert np.allclose(np.linalg.norm(pose['x_axis']), 1.0)
+    assert np.allclose(np.linalg.norm(pose['y_axis']), 1.0)
+    assert np.allclose(np.linalg.norm(pose['normal']), 1.0)
+    assert abs(float(np.dot(pose['x_axis'], pose['normal']))) < 1e-6
+    assert np.allclose(
+        np.cross(pose['x_axis'], pose['y_axis']), pose['normal'], atol=1e-6)

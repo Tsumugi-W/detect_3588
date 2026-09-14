@@ -8,6 +8,7 @@
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -42,6 +43,18 @@ def generate_launch_description():
         'capture_hz', default_value='1.0',
         description='可视化帧保存频率（按 bag 时间戳）'
     )
+    record_precision_arg = DeclareLaunchArgument(
+        'record_precision', default_value='false',
+        description='是否记录螺栓在 AprilTag 坐标系中的重复精度'
+    )
+    precision_output_prefix_arg = DeclareLaunchArgument(
+        'precision_output_prefix', default_value='/tmp/fastener_precision',
+        description='精度记录输出前缀（生成 JSONL、CSV 和 summary.json）'
+    )
+    precision_max_tag_distance_arg = DeclareLaunchArgument(
+        'precision_max_tag_distance_m', default_value='0.20',
+        description='Tag 到螺栓中位距离超过该值时将该帧标记为离群'
+    )
 
     detect_node = Node(
         package='panel_detection',
@@ -65,7 +78,27 @@ def generate_launch_description():
         }],
     )
 
+    precision_node = Node(
+        package='panel_detection',
+        executable='fastener_precision_recorder',
+        name='fastener_precision_recorder',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('record_precision')),
+        parameters=[{
+            'output_prefix': LaunchConfiguration('precision_output_prefix'),
+            'targets_topic': '/fasteners/targets',
+            'geometry_topic': '/fasteners/geometry',
+            'class_filter': 'bolt',
+            'registered_only': True,
+            'key_mode': 'slot',
+            'max_tag_distance_m': ParameterValue(
+                LaunchConfiguration('precision_max_tag_distance_m'),
+                value_type=float),
+        }],
+    )
+
     return LaunchDescription([
         use_topic_arg, registered_depth_arg, config_path_arg,
         publish_legacy_topics_arg, show_gui_arg, capture_dir_arg,
-        capture_hz_arg, detect_node])
+        capture_hz_arg, record_precision_arg, precision_output_prefix_arg,
+        precision_max_tag_distance_arg, detect_node, precision_node])

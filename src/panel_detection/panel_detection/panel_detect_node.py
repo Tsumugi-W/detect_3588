@@ -2361,6 +2361,8 @@ class PanelDetectionNode(Node):
 
         axis_reference = None
         if apriltag_reference is not None:
+            tag_origin = apriltag_reference.get(
+                'origin', apriltag_reference['centroid'])
             axis_reference = {
                 'source': apriltag_reference['source'],
                 'tag_id': apriltag_reference['tag_id'],
@@ -2374,6 +2376,11 @@ class PanelDetectionNode(Node):
                     round(float(apriltag_reference['centroid'][1]), 4),
                     round(float(apriltag_reference['centroid'][2]), 4),
                 ],
+                'origin': [
+                    round(float(tag_origin[0]), 6),
+                    round(float(tag_origin[1]), 6),
+                    round(float(tag_origin[2]), 6),
+                ],
                 'point_count': apriltag_reference['point_count'],
                 'inlier_ratio': round(float(apriltag_reference['inlier_ratio']), 4),
                 'rms_error_m': round(float(apriltag_reference['rms_error']), 5),
@@ -2382,6 +2389,14 @@ class PanelDetectionNode(Node):
                     else round(float(apriltag_reference['reprojection_error_px']), 4)),
                 'valve_errors': valve_reference_errors,
             }
+            for axis_name in ('x_axis', 'y_axis'):
+                axis = apriltag_reference.get(axis_name)
+                if axis is not None:
+                    axis_reference[axis_name] = [
+                        round(float(axis[0]), 8),
+                        round(float(axis[1]), 8),
+                        round(float(axis[2]), 8),
+                    ]
             _draw_apriltag_reference(canvas, apriltag_reference, valve_reference_errors)
             self._write_axis_reference_log(stamp, axis_reference, valve_reference_errors)
 

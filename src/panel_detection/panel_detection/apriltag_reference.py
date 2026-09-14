@@ -63,11 +63,12 @@ def _normalize_aruco_result(result):
     return corners, ids, rejected
 
 
-def estimate_apriltag_pnp_normal(corners, intrin):
-    """Estimate the Tag plane normal from its four image corners.
+def estimate_apriltag_pnp_pose(corners, intrin):
+    """Estimate a metric-size-independent Tag orientation from four corners.
 
-    Unit-square coordinates are intentional: orientation does not depend on
-    the printed Tag size. Metric translation continues to come from depth.
+    The Tag origin is intentionally not taken from ``translation_vector``:
+    unit-square object coordinates make that translation scale-ambiguous.
+    Callers combine these axes with a metric origin estimated from depth.
     """
     pts = np.asarray(corners, dtype=np.float32).reshape(4, 2)
     object_points = np.array([
@@ -88,15 +89,55 @@ def estimate_apriltag_pnp_normal(corners, intrin):
     if not ok:
         return None
     rotation, _ = cv2.Rodrigues(rotation_vector)
+    x_axis = rotation[:, 0].astype(np.float64)
     normal = rotation[:, 2].astype(np.float64)
     if normal[2] > 0.0:
         normal = -normal
+    normal /= np.linalg.norm(normal)
+    x_axis -= np.dot(x_axis, normal) * normal
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm < 1e-9:
+        return None
+    x_axis /= x_norm
+    # Keep a right-handed frame after forcing Z to face the camera.
+    y_axis = np.cross(normal, x_axis)
+    y_axis /= np.linalg.norm(y_axis)
     projected, _ = cv2.projectPoints(
         object_points, rotation_vector, translation_vector,
         camera_matrix, distortion)
     reprojection_error = float(np.sqrt(np.mean(np.sum(
         (projected.reshape(4, 2) - pts) ** 2, axis=1))))
-    return normal, reprojection_error
+    return {
+        'normal': normal,
+        'x_axis': x_axis,
+        'y_axis': y_axis,
+        'reprojection_error_px': reprojection_error,
+    }
+
+
+def estimate_apriltag_pnp_normal(corners, intrin):
+    """Backward-compatible normal-only view of the full PnP pose."""
+    pose = estimate_apriltag_pnp_pose(corners, intrin)
+    if pose is None:
+        return None
+    return pose['normal'], pose['reprojection_error_px']
+
+
+def _intersect_pixel_with_plane(intrin, pixel, normal, point_on_plane):
+    ray = np.array([
+        (float(pixel[0]) - intrin.cx) / intrin.fx,
+        (float(pixel[1]) - intrin.cy) / intrin.fy,
+        1.0,
+    ], dtype=np.float64)
+    plane_normal = np.asarray(normal, dtype=np.float64)
+    plane_point = np.asarray(point_on_plane, dtype=np.float64)
+    denominator = float(np.dot(plane_normal, ray))
+    if abs(denominator) < 1e-9:
+        return None
+    distance = float(np.dot(plane_normal, plane_point)) / denominator
+    if not np.isfinite(distance) or distance <= 0.0:
+        return None
+    return ray * distance
 
 
 def _detect_tag_like_fallback_corners(gray, cfg=None):
@@ -191,8 +232,8 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
         if area < 100.0:
             continue
 
-        pnp_result = estimate_apriltag_pnp_normal(pts, intrin) if decoded else None
-        if decoded and pnp_result is None:
+        pnp_pose = estimate_apriltag_pnp_pose(pts, intrin) if decoded else None
+        if decoded and pnp_pose is None:
             continue
 
         center = np.mean(pts, axis=0)
@@ -232,8 +273,10 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
             continue
         if float(rms_error) > float(cfg.get('max_rms_m', 0.012)):
             continue
-        normal = pnp_result[0] if pnp_result is not None else depth_normal
-        reprojection_error = pnp_result[1] if pnp_result is not None else None
+        normal = pnp_pose['normal'] if pnp_pose is not None else depth_normal
+        reprojection_error = (
+            pnp_pose['reprojection_error_px']
+            if pnp_pose is not None else None)
         if normal[2] > 0:
             normal = -normal
         if abs(float(normal[2])) < float(cfg.get('min_abs_z', 0.50)):
@@ -243,12 +286,19 @@ def detect_apriltag_reference_axis(color_image, depth_image, intrin,
                 continue
             if float(inlier_ratio) < float(cfg.get('fallback_min_inlier_ratio', 0.75)):
                 continue
+        origin = _intersect_pixel_with_plane(
+            intrin, center, depth_normal, centroid)
+        if origin is None:
+            origin = centroid
         candidates.append({
             'tag_id': int(marker_ids[idx]),
             'source': source,
             'corners': pts,
             'normal': normal,
             'centroid': centroid,
+            'origin': origin,
+            'x_axis': None if pnp_pose is None else pnp_pose['x_axis'],
+            'y_axis': None if pnp_pose is None else pnp_pose['y_axis'],
             'point_count': int(inlier_count),
             'inlier_ratio': float(inlier_ratio),
             'rms_error': float(rms_error),
