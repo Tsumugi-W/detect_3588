@@ -19,6 +19,8 @@
   3. 构建当前帧的 (类别, 颜色) 序列
   4. 在完整布局中做子序列匹配，利用 knob 颜色差异（红/黑）作为锚点消歧
 """
+from __future__ import annotations
+
 import numpy as np
 import cv2
 from dataclasses import dataclass

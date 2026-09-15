@@ -232,6 +232,70 @@ def draw_pipe_axis_result(image: np.ndarray,
     return vis
 
 
+def detect_black_marker(image):
+    """Detect black square tape markers on a bright metallic pipe.
+
+    Returns list of (center_x, center_y, bbox, score) sorted by score desc.
+    bbox is (x1, y1, x2, y2).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, w = gray.shape
+    v_channel = hsv[:, :, 2]
+    s_channel = hsv[:, :, 1]
+
+    dark_mask = (v_channel < 70).astype(np.uint8) * 255
+    low_sat = (s_channel < 100).astype(np.uint8) * 255
+    mask = cv2.bitwise_and(dark_mask, low_sat)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 300 or area > 8000:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if x < 30 or y < 30 or x + bw > w - 30 or y + bh > h - 30:
+            continue
+        aspect = max(bw, bh) / max(1, min(bw, bh))
+        if aspect > 2.5:
+            continue
+        solidity = area / max(1, bw * bh)
+
+        pad = max(bw, bh)
+        sx1 = max(0, x - pad)
+        sy1 = max(0, y - pad)
+        sx2 = min(w, x + bw + pad)
+        sy2 = min(h, y + bh + pad)
+        surround_mask = np.ones((sy2 - sy1, sx2 - sx1), dtype=bool)
+        surround_mask[y - sy1:y - sy1 + bh, x - sx1:x - sx1 + bw] = False
+        surround_region = gray[sy1:sy2, sx1:sx2]
+        if surround_mask.sum() == 0:
+            continue
+        surround_mean = float(surround_region[surround_mask].mean())
+
+        tape_mean = float(gray[y:y + bh, x:x + bw].mean())
+        contrast = surround_mean - tape_mean
+
+        if surround_mean < 130 or contrast < 50:
+            continue
+
+        score = contrast * solidity / aspect * (surround_mean / 160.0)
+        cx = x + bw // 2
+        cy = y + bh // 2
+        candidates.append((cx, cy, (x, y, x + bw, y + bh), float(score)))
+
+    candidates.sort(key=lambda c: c[3], reverse=True)
+    return candidates
+
+
 def result_to_dict(result: PipeAxisResult) -> dict:
     return {
         'leak_point_px': list(result.leak_point),

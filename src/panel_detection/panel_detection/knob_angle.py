@@ -8,6 +8,8 @@
     from knob_angle import estimate_knob_angle
     angle = estimate_knob_angle(knob_roi)  # 输入 BGR 裁剪图，返回角度 (°) 或 None
 """
+from __future__ import annotations
+
 import math
 import cv2
 import numpy as np

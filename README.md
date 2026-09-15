@@ -2,7 +2,7 @@
 
 基于 YOLOv5 + 深度相机的操作面板实时 3D 检测系统，封装为标准 ROS2 Humble 功能包。
 
-检测 9 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)。支持目标注册编号、旋钮角度估计和螺栓/螺母/阀门轴线方向估计。
+检测 9 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)。支持目标注册编号、旋钮角度估计、螺栓/螺母/阀门轴线方向估计，以及管道漏点检测与管道轴线方向估计。
 
 ## 系统架构
 
@@ -15,9 +15,10 @@ Orbbec 官方驱动 (独立 launch)
             │
             ▼
 检测节点按任务 launch 拆分
-    ├── panel_controls.launch.py   → /panel/targets, /panel/knob_angles
-    ├── valve_detection.launch.py  → /valve/targets, /valve/geometry
-    └── fastener_detection.launch.py → /fasteners/targets, /fasteners/geometry
+    ├── panel_controls.launch.py     → /panel/targets, /panel/knob_angles
+    ├── valve_detection.launch.py    → /valve/targets, /valve/geometry
+    ├── fastener_detection.launch.py → /fasteners/targets, /fasteners/geometry
+    └── leak_detection.launch.py     → /leak/targets, /leak/pipe_axis
 ```
 
 ## 平台要求
@@ -34,7 +35,7 @@ Orbbec 官方驱动 (独立 launch)
 
 仓库中的 `ros1/panel_detection` 是当前算法的 ROS1 Noetic catkin 版本，默认面向
 Intel RealSense D435 的彩色图、对齐深度图和彩色相机内参，使用同一份
-`0813.onnx` 九类别权重。该版本保留面板、阀门和螺栓/螺母三个独立检测模式及
+`0824.onnx` 九类别权重。该版本保留面板、阀门和螺栓/螺母三个独立检测模式及
 对应 JSON 话题，并通过 `/panel/debug_image` 等图像话题发布 Canvas；无显示环境
 默认不创建 OpenCV 窗口。
 
@@ -175,6 +176,9 @@ ros2 launch panel_detection valve_detection.launch.py
 
 # 或：螺栓/螺母
 ros2 launch panel_detection fastener_detection.launch.py
+
+# 或：管道漏点
+ros2 launch panel_detection leak_detection.launch.py
 ```
 
 **直连模式：检测节点直接打开相机**
@@ -242,6 +246,18 @@ ros2 launch panel_detection panel_controls.launch.py use_constraint:=1
 
 `use_constraint:=1` 为默认模式：只根据旋钮白色手柄线与竖直线的夹角，稳定输出 `0` 或 `90`。旧写法仍兼容：`true` 等价于 `2`，`false` 等价于 `3`。
 
+**管道漏点检测**
+
+```bash
+# 终端2：管道漏点检测
+ros2 launch panel_detection leak_detection.launch.py
+```
+
+Leak 模式不运行 YOLO 推理，工作流程：
+1. 优先使用上游节点通过 `/leak/upstream_point` (PointStamped) 发布的 3D 漏点坐标，投影到图像平面
+2. 上游漏点超过 2 秒未更新时，自动回退到黑色标记检测（在亮色管道上检测暗色方块）
+3. 以漏点为中心，用 Canny + HoughLinesP 提取管道边缘线段，共识聚类后估计管道轴线方向
+
 **离线管道轴线估计脚本**
 
 给定一张图像和一个模拟/实测漏点像素坐标，可以用独立脚本估计漏点附近的 2D 管道轴线方向。该脚本不在任何 launch 中启动。
@@ -269,7 +285,7 @@ src/panel_detection/scripts/estimate_pipe_axis.py \
 | `registered_depth` | `true` | topic 模式下深度图是否已对齐到彩色图 | Orbbec `camera.launch.py` 已设置 `depth_registration=true`，保持 `true` |
 | `use_constraint` | `1` | 面板 launch 的旋钮角度模式：`1`=0/90 稳定输出，`2`=旧物理范围约束，`3`=旧无约束；`use_constrain` 也可作为别名 | 默认保持 `1`；需要旧行为时设为 `2` 或 `3` |
 | `config_path` | 空字符串 | 外部 YAML 配置文件路径；为空使用默认配置 | 需要换模型、阈值、相机后端、推理后端时使用 |
-| `detection_mode` | `all` | `panel_detection.launch.py` 的兼容模式选择：`all` / `panel_controls` / `valve` / `fastener` | 新流程通常不用手动设置，三个任务 launch 已固定 |
+| `detection_mode` | `all` | `panel_detection.launch.py` 的兼容模式选择：`all` / `panel_controls` / `valve` / `fastener` / `leak` | 新流程通常不用手动设置，各任务 launch 已固定 |
 | `publish_legacy_topics` | `false` | 是否发布 `/panel/valves`、`/panel/bolts` 等旧 PoseStamped 兼容话题 | 旧下游仍订阅这些话题时才打开 |
 | `capture_dir` | 空字符串 | 非空时按 ROS 图像时间戳保存完整检测 canvas | bag 批量复核或制作检测截图时设置 |
 | `capture_hz` | `1.0` | `capture_dir` 启用时的输入采样和画面保存频率 | 需要其他采样频率时修改 |
@@ -493,6 +509,35 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 }
 ```
 
+### /leak/targets (String, JSON) — 漏点位置
+
+`leak_detection.launch.py` 发布漏点三维坐标：
+
+```json
+{
+  "stamp": 1716192000.123,
+  "leak_point": {"x": 0.15, "y": -0.02, "z": 0.65},
+  "leak_source": "upstream"
+}
+```
+
+`leak_source` 为 `upstream`（来自上游节点发布的 `/leak/upstream_point`）或 `black_marker`（回退到黑色标记检测）。上游漏点超过 2 秒未更新时自动切换到黑色标记检测。
+
+### /leak/pipe_axis (String, JSON) — 管道轴线方向
+
+```json
+{
+  "stamp": 1716192000.123,
+  "leak_point_px": [640, 360],
+  "leak_source": "black_marker",
+  "pipe_axis_angle_deg": -25.9,
+  "pipe_axis_vector_xy": [0.900, -0.437],
+  "num_segments": 11
+}
+```
+
+管道轴线方向为图像平面 2D 方向，`pipe_axis_angle_deg` 相对图像 x 轴，有 180° 二义性。`num_segments` 为参与估计的 Hough 线段数量。
+
 ### /objects/geometry (String, JSON) — 兼容 all 模式对象几何
 
 ```json
@@ -552,6 +597,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 | `panel_controls.launch.py` | `/panel/status` |
 | `valve_detection.launch.py` | `/valve/status` |
 | `fastener_detection.launch.py` | `/fasteners/status` |
+| `leak_detection.launch.py` | `/leak/status` |
 
 常见状态：
 
@@ -560,6 +606,8 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 - `"no_detection"` — 当前帧没有对应模式的检测结果
 - `"no_targets"` — 有检测但没有可发布目标
 - `"registered"` — 当前模式已有可发布目标；面板模式也表示编号结果可用
+- `"no_leak_point"` — leak 模式：既没有上游漏点，也没有检测到黑色标记
+- `"leak_no_axis"` — leak 模式：漏点已定位，但附近未能估计管道轴线
 
 ### 兼容旧话题 (PoseStamped)
 
@@ -593,6 +641,9 @@ ros2 topic echo /fasteners/targets
 ros2 topic echo /fasteners/status
 ros2 topic echo /panel/distance
 ros2 topic echo /panel/status
+ros2 topic echo /leak/targets
+ros2 topic echo /leak/pipe_axis
+ros2 topic echo /leak/status
 ```
 
 ## 在其他节点中订阅
@@ -652,7 +703,7 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0813.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_model: '0824.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
 onnx_threads: 8
 # rknn_model: '0630.rknn'      # inference_backend='rknn' 时使用
 
@@ -747,11 +798,12 @@ ros2_ws/
         ├── package.xml
         ├── setup.py
         ├── launch/
-        │   ├── camera.launch.py           ← 启动相机
-        │   ├── panel_controls.launch.py   ← 面板按钮/旋钮/指示灯
-        │   ├── valve_detection.launch.py  ← 阀门
+        │   ├── camera.launch.py             ← 启动相机
+        │   ├── panel_controls.launch.py     ← 面板按钮/旋钮/指示灯
+        │   ├── valve_detection.launch.py    ← 阀门
         │   ├── fastener_detection.launch.py ← 螺栓/螺母
-        │   └── panel_detection.launch.py  ← 兼容 all 模式
+        │   ├── leak_detection.launch.py     ← 管道漏点
+        │   └── panel_detection.launch.py    ← 兼容 all 模式
         ├── scripts/
         │   ├── estimate_pipe_axis.py      ← 离线管道轴线估计
         │   └── export_model.py            ← 模型转换 (.pt → .onnx)
@@ -766,7 +818,7 @@ ros2_ws/
             ├── fastener_registry.py       ← 螺栓/螺母分组与槽位编号
             ├── nameplate_ocr.py           ← 已停用的铭牌 OCR 保留实现
             ├── nut_localizer.py           ← nut 外六角 refined 定位
-            ├── pipe_axis.py               ← 管道轴线方向估计
+            ├── pipe_axis.py               ← 管道轴线方向估计 + 黑色标记检测
             ├── panel_apriltag.py           ← 面板 Tag 分类、编号和短时跟踪
             ├── apriltag_reference.py      ← AprilTag 参考轴线
             ├── camera/
@@ -778,12 +830,8 @@ ros2_ws/
             ├── detector_rknn.py
             ├── knob_angle.py
             ├── rgb_depth_viewer.py        ← 彩色/深度同步查看工具
-            ├── 0630.onnx
-            ├── 0630.pt
-            ├── 0727.onnx                  ← 备用权重
-            ├── 0727.pt
-            ├── 0813.onnx                  ← 默认权重
-            └── 0813.pt
+            ├── 0824.onnx                  ← 默认权重
+            └── 0824.pt
 ```
 
 ## 常见问题

@@ -67,6 +67,11 @@ from .panel_apriltag import (
     reclassify_buttons_without_tags,
     redraw_reclassified_detection,
 )
+from .pipe_axis import (
+    detect_black_marker,
+    draw_pipe_axis_result,
+    estimate_pipe_axis_from_image,
+)
 from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
 
@@ -212,6 +217,7 @@ MODE_CLASS_FILTERS = {
     'panel_controls': {'button', 'door_button', 'knob', 'light'},
     'valve': {'valve'},
     'fastener': {'bolt', 'nut'},
+    'leak': None,
     'all': None,
 }
 
@@ -231,6 +237,11 @@ MODE_TOPIC_MAP = {
         'targets': '/fasteners/targets',
         'geometry': '/fasteners/geometry',
         'status': '/fasteners/status',
+    },
+    'leak': {
+        'targets': '/leak/targets',
+        'geometry': '/leak/pipe_axis',
+        'status': '/leak/status',
     },
     'all': {
         'targets': '/panel/targets',
@@ -860,6 +871,7 @@ class PanelDetectionNode(Node):
         self._process_panel_controls = self._detection_mode in ('panel_controls', 'all')
         self._process_valves = self._detection_mode in ('valve', 'all')
         self._process_fasteners = self._detection_mode in ('fastener', 'all')
+        self._process_leak = self._detection_mode == 'leak'
         self.declare_parameter(
             'publish_legacy_topics', self.cfg.get('publish_legacy_topics', False))
         self._publish_legacy_topics = (
@@ -1101,6 +1113,20 @@ class PanelDetectionNode(Node):
                     f'AprilTag 参考轴线日志: {self._axis_ref_log_path}')
             except OSError as exc:
                 self.get_logger().warn(f'无法写入参考轴线日志: {exc}')
+
+        # 漏点管道检测模式
+        self._leak_upstream_point = None
+        self._leak_upstream_stamp = 0.0
+        leak_cfg = self.cfg.get('leak', {})
+        self._leak_upstream_timeout = float(leak_cfg.get('upstream_timeout', 2.0))
+        if self._process_leak:
+            from geometry_msgs.msg import PointStamped
+            self._sub_leak_point = self.create_subscription(
+                PointStamped, '/leak/upstream_point',
+                self._leak_point_callback, 10)
+            self.get_logger().info(
+                '漏点管道检测模式：订阅 /leak/upstream_point，'
+                f'超时 {self._leak_upstream_timeout}s 后回退黑色标记检测')
 
         # 重连
         self._reconnect_interval = 5.0
@@ -1482,6 +1508,120 @@ class PanelDetectionNode(Node):
         msg.data = status
         self._status_pub.publish(msg)
 
+    def _leak_point_callback(self, msg):
+        self._leak_upstream_point = (
+            msg.point.x, msg.point.y, msg.point.z)
+        self._leak_upstream_stamp = time.time()
+
+    def _process_leak_frame(self, color_image, depth_image,
+                            color_intrin, deproj_intrin,
+                            color_stamp, stamp):
+        """Leak mode: detect leak point → estimate pipe axis direction."""
+        stamp_seconds = stamp.sec + stamp.nanosec * 1e-9
+        canvas = color_image.copy()
+        h, w = color_image.shape[:2]
+
+        leak_px = None
+        leak_xyz = None
+        leak_source = None
+
+        # Priority 1: upstream 3D leak point
+        now = time.time()
+        if (self._leak_upstream_point is not None and
+                now - self._leak_upstream_stamp < self._leak_upstream_timeout):
+            xyz = self._leak_upstream_point
+            if xyz[2] > 0:
+                px = int(round(color_intrin.fx * xyz[0] / xyz[2] + color_intrin.cx))
+                py = int(round(color_intrin.fy * xyz[1] / xyz[2] + color_intrin.cy))
+                if 0 <= px < w and 0 <= py < h:
+                    leak_px = (px, py)
+                    leak_xyz = {'x': round(xyz[0], 4),
+                                'y': round(xyz[1], 4),
+                                'z': round(xyz[2], 4)}
+                    leak_source = 'upstream'
+
+        # Priority 2: black marker fallback
+        if leak_px is None:
+            candidates = detect_black_marker(color_image)
+            if candidates:
+                cx, cy, bbox, score = candidates[0]
+                leak_px = (cx, cy)
+                leak_source = 'black_marker'
+                bx1, by1, bx2, by2 = bbox
+                cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+                cv2.putText(canvas, f'black marker (score={score:.0f})',
+                            (bx1, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                            (0, 255, 0), 2, cv2.LINE_AA)
+                depth_val = get_robust_depth(
+                    depth_image, cx, cy,
+                    sample_radius=5, depth_scale=self._depth_scale)
+                if depth_val > 0:
+                    xyz_3d = deproject_pixel_to_point(
+                        deproj_intrin, (cx, cy), depth_val)
+                    if xyz_3d is not None and xyz_3d[2] > 0:
+                        leak_xyz = {'x': round(xyz_3d[0], 4),
+                                    'y': round(xyz_3d[1], 4),
+                                    'z': round(xyz_3d[2], 4)}
+
+        if leak_px is None:
+            self._publish_status('no_leak_point')
+            self._update_display_frame(canvas, color_stamp)
+            return
+
+        result = estimate_pipe_axis_from_image(
+            color_image,
+            leak_point=leak_px,
+            roi_half_size=(200, 100),
+            canny_thresholds=(30, 120),
+            hough_threshold=30,
+            min_line_length=45,
+            max_line_gap=15,
+            max_line_distance=60.0,
+        )
+
+        if result is not None:
+            canvas = draw_pipe_axis_result(canvas, result, output_size=180)
+
+        source_label = leak_source
+        if leak_source == 'upstream':
+            cv2.circle(canvas, leak_px, 8, (0, 0, 255), -1)
+            cv2.putText(canvas, 'upstream leak',
+                        (leak_px[0] + 12, leak_px[1] - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, f'source: {source_label}',
+                    (10, canvas.shape[0] - 15), 0, 0.5,
+                    (0, 255, 0), 1, cv2.LINE_AA)
+
+        self._update_display_frame(canvas, color_stamp)
+
+        if self._targets_pub is not None and leak_xyz is not None:
+            msg = String()
+            msg.data = json.dumps({
+                'stamp': stamp_seconds,
+                'leak_point': leak_xyz,
+                'leak_source': leak_source,
+            }, ensure_ascii=False)
+            self._targets_pub.publish(msg)
+
+        if self._object_geometry_pub is not None and result is not None:
+            msg = String()
+            msg.data = json.dumps({
+                'stamp': stamp_seconds,
+                'leak_point_px': list(leak_px),
+                'leak_source': leak_source,
+                'pipe_axis_angle_deg': round(result.angle_deg, 2),
+                'pipe_axis_vector_xy': [
+                    round(result.vector_xy[0], 4),
+                    round(result.vector_xy[1], 4),
+                ],
+                'num_segments': len(result.segments),
+            }, ensure_ascii=False)
+            self._object_geometry_pub.publish(msg)
+
+        has_result = result is not None
+        self._publish_status('leak_detected' if has_result else 'no_pipe_axis')
+
     def _detection_callback(self):
         if not self._camera_ready:
             self._publish_status('waiting_camera')
@@ -1505,6 +1645,13 @@ class PanelDetectionNode(Node):
             color_stamp = None
 
         if color_image.size == 0 or depth_image.size == 0:
+            return
+
+        if self._process_leak:
+            stamp = color_stamp if color_stamp is not None else self.get_clock().now().to_msg()
+            self._process_leak_frame(
+                color_image, depth_image, color_intrin, deproj_intrin,
+                color_stamp, stamp)
             return
 
         # 直连模式下转发图像话题（仅在有订阅者时发布）
