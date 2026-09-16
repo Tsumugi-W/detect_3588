@@ -2,7 +2,7 @@
 
 基于 YOLOv5 + 深度相机的操作面板实时 3D 检测系统，封装为标准 ROS2 Humble 功能包。
 
-检测 9 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)。支持目标注册编号、旋钮角度估计、螺栓/螺母/阀门轴线方向估计，以及管道漏点检测与管道轴线方向估计。
+检测 9 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)。支持目标注册编号、旋钮角度估计、螺栓/螺母/阀门轴线方向估计，以及管道漏点检测、管道轴线方向估计和 leak_bolt（加固螺栓）定位与位姿估计。
 
 ## 系统架构
 
@@ -35,9 +35,9 @@ Orbbec 官方驱动 (独立 launch)
 
 仓库中的 `ros1/panel_detection` 是当前算法的 ROS1 Noetic catkin 版本，默认面向
 Intel RealSense D435 的彩色图、对齐深度图和彩色相机内参，使用同一份
-`0824.onnx` 九类别权重。该版本保留面板、阀门和螺栓/螺母三个独立检测模式及
-对应 JSON 话题，并通过 `/panel/debug_image` 等图像话题发布 Canvas；无显示环境
-默认不创建 OpenCV 窗口。
+`0824.onnx` 九类别权重和 `leak_bolt.onnx` 漏点螺栓权重。该版本保留面板、阀门、
+螺栓/螺母和漏点管道四个独立检测模式及对应 JSON 话题，并通过 `/panel/debug_image`
+等图像话题发布 Canvas；无显示环境默认不创建 OpenCV 窗口。
 
 ```bash
 mkdir -p ~/panel_ros1_ws/src
@@ -51,6 +51,7 @@ source devel/setup.bash
 roslaunch panel_detection panel_controls.launch
 roslaunch panel_detection valve_detection.launch
 roslaunch panel_detection fastener_detection.launch
+roslaunch panel_detection leak_detection.launch
 ```
 
 完整的 ROS1 输入话题、输出话题和 D435 联合启动方式见
@@ -160,6 +161,25 @@ ros2 launch panel_detection panel_controls.launch.py
 
 ## 启动方式与参数配置
 
+### 快捷启动脚本
+
+仓库根目录提供 `run.sh` 快捷脚本，省去记忆 launch 文件名：
+
+```bash
+./run.sh camera              # 启动相机
+./run.sh panel               # 面板检测 (light/knob/button)
+./run.sh fastener            # 螺栓螺帽检测
+./run.sh valve               # 阀门检测
+./run.sh leak                # 漏点+管道+leak_bolt 检测
+./run.sh all                 # 全部模式
+./run.sh leak --config x.yaml  # 带自定义配置
+./run.sh fastener --direct   # 直连相机模式
+./run.sh record my_bag       # 录制 rosbag
+./run.sh play bags/xx --rate 0.5  # 回放
+./run.sh build               # 编译
+./run.sh --help              # 查看全部命令
+```
+
 ### 常用启动命令
 
 **推荐方式：相机节点 + 检测节点分开启动**
@@ -253,10 +273,11 @@ ros2 launch panel_detection panel_controls.launch.py use_constraint:=1
 ros2 launch panel_detection leak_detection.launch.py
 ```
 
-Leak 模式不运行 YOLO 推理，工作流程：
+Leak 模式工作流程：
 1. 优先使用上游节点通过 `/leak/upstream_point` (PointStamped) 发布的 3D 漏点坐标，投影到图像平面
 2. 上游漏点超过 2 秒未更新时，自动回退到黑色标记检测（在亮色管道上检测暗色方块）
 3. 以漏点为中心，用 Canny + HoughLinesP 提取管道边缘线段，共识聚类后估计管道轴线方向
+4. 使用专用 `leak_bolt.onnx` 模型检测加固螺栓（leak_bolt），计算 3D 位置和表面法向量，发布位姿信息供下游机械臂使用
 
 **离线管道轴线估计脚本**
 
@@ -509,19 +530,30 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 }
 ```
 
-### /leak/targets (String, JSON) — 漏点位置
+### /leak/targets (String, JSON) — 漏点位置与 leak_bolt 位姿
 
-`leak_detection.launch.py` 发布漏点三维坐标：
+`leak_detection.launch.py` 发布漏点三维坐标和加固螺栓位姿：
 
 ```json
 {
   "stamp": 1716192000.123,
   "leak_point": {"x": 0.15, "y": -0.02, "z": 0.65},
-  "leak_source": "upstream"
+  "leak_source": "upstream",
+  "bolt": {
+    "class": "leak_bolt",
+    "bbox": [603, 369, 637, 401],
+    "position": {"x": 0.16, "y": -0.01, "z": 0.64},
+    "orientation": {"x": 0.05, "y": 0.44, "z": 0.0, "w": 0.90},
+    "confidence": 0.85,
+    "axis_direction": [-0.791, 0.098, -0.604],
+    "axis_source": "object_plane"
+  }
 }
 ```
 
 `leak_source` 为 `upstream`（来自上游节点发布的 `/leak/upstream_point`）或 `black_marker`（回退到黑色标记检测）。上游漏点超过 2 秒未更新时自动切换到黑色标记检测。
+
+`bolt` 字段在检测到加固螺栓时出现，格式与 fastener 模式的 bolt 输出一致。`position` 为相机坐标系下的三维坐标（米），`orientation` 为表面法向量对应的四元数，`axis_direction` 为表面法向量（指向相机时 z 为负），`axis_source` 为 `object_plane`（目标表面深度拟合）或 `patch_plane`（周围安装面拟合）。未检测到 bolt 时无此字段。
 
 ### /leak/pipe_axis (String, JSON) — 管道轴线方向
 
@@ -792,6 +824,7 @@ panel_normal_interval: 10
 ros2_ws/
 ├── README.md
 ├── .gitignore
+├── run.sh                         ← 快捷启动脚本
 └── src/
     ├── OrbbecSDK_ROS2/          ← 官方相机驱动 (submodule)
     └── panel_detection/
@@ -830,7 +863,8 @@ ros2_ws/
             ├── detector_rknn.py
             ├── knob_angle.py
             ├── rgb_depth_viewer.py        ← 彩色/深度同步查看工具
-            ├── 0824.onnx                  ← 默认权重
+            ├── 0824.onnx                  ← 默认九类别权重
+            ├── leak_bolt.onnx             ← leak_bolt 专用权重
             └── 0824.pt
 ```
 
