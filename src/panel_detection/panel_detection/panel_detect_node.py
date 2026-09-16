@@ -1119,6 +1119,7 @@ class PanelDetectionNode(Node):
         self._leak_upstream_stamp = 0.0
         leak_cfg = self.cfg.get('leak', {})
         self._leak_upstream_timeout = float(leak_cfg.get('upstream_timeout', 2.0))
+        self._leak_bolt_detector = None
         if self._process_leak:
             from geometry_msgs.msg import PointStamped
             self._sub_leak_point = self.create_subscription(
@@ -1127,6 +1128,7 @@ class PanelDetectionNode(Node):
             self.get_logger().info(
                 '漏点管道检测模式：订阅 /leak/upstream_point，'
                 f'超时 {self._leak_upstream_timeout}s 后回退黑色标记检测')
+            self._leak_bolt_detector = self._create_leak_bolt_detector(leak_cfg)
 
         # 重连
         self._reconnect_interval = 5.0
@@ -1449,6 +1451,37 @@ class PanelDetectionNode(Node):
 
         return None
 
+    def _create_leak_bolt_detector(self, leak_cfg):
+        """为 leak 模式创建 leak_bolt 专用检测器。"""
+        from .detector_onnx import YoloV5ORT
+        import tempfile
+
+        pkg_dir = os.path.dirname(os.path.abspath(__file__))
+        bolt_model = leak_cfg.get('bolt_model', 'leak_bolt.onnx')
+        if not os.path.isabs(bolt_model):
+            bolt_model = os.path.join(pkg_dir, bolt_model)
+        if not os.path.isfile(bolt_model):
+            self.get_logger().warn(f'leak_bolt 模型不存在: {bolt_model}，跳过 bolt 检测')
+            return None
+
+        bolt_cfg = {
+            'input_size': leak_cfg.get('bolt_input_size', 640),
+            'threshold': {
+                'confidence': leak_cfg.get('bolt_conf_thres', 0.5),
+                'iou': leak_cfg.get('bolt_iou_thres', 0.45),
+            },
+            'class_name': ['leak_bolt'],
+        }
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
+        yaml.dump(bolt_cfg, tmp)
+        tmp.close()
+
+        threads = self.cfg.get('onnx_threads', 4)
+        det = YoloV5ORT(onnx_path=bolt_model, config_path=tmp.name, threads=threads)
+        os.unlink(tmp.name)
+        self.get_logger().info(f'leak_bolt 检测器已加载: {bolt_model}')
+        return det
+
     def _publish_camera_topics(self, color_image, depth_image, color_intrin, depth_intrin):
         """直连模式下转发图像和内参话题"""
         stamp = self.get_clock().now().to_msg()
@@ -1582,6 +1615,76 @@ class PanelDetectionNode(Node):
         if result is not None:
             canvas = draw_pipe_axis_result(canvas, result, output_size=180)
 
+        # ── leak_bolt 检测与位姿估计 ──
+        bolt_info = None
+        if self._leak_bolt_detector is not None:
+            _, bolt_cls_ids, bolt_xyxys, bolt_confs = \
+                self._leak_bolt_detector.detect(color_image)
+            if bolt_xyxys:
+                best_idx = int(np.argmax(bolt_confs))
+                bbox = bolt_xyxys[best_idx]
+                x1, y1, x2, y2 = [int(v) for v in bbox]
+                ux = (x1 + x2) // 2
+                uy = (y1 + y2) // 2
+                bolt_conf = bolt_confs[best_idx]
+
+                depth_val = get_robust_depth(
+                    depth_image, ux, uy,
+                    sample_radius=5, depth_scale=self._depth_scale)
+                bolt_xyz = None
+                if depth_val > 0:
+                    bolt_xyz = deproject_pixel_to_point(
+                        deproj_intrin, (ux, uy), depth_val)
+
+                bolt_quat = [0.0, 0.0, 0.0, 1.0]
+                axis_dir = None
+                axis_source = None
+                if _valid_point_3d(bolt_xyz):
+                    axis_result = estimate_object_axis_direction(
+                        depth_image, deproj_intrin, bbox,
+                        depth_scale=self._depth_scale,
+                        object_class='bolt')
+                    if axis_result is None:
+                        axis_result = estimate_fastener_patch_axis_direction(
+                            depth_image, deproj_intrin, bbox,
+                            depth_scale=self._depth_scale)
+                        if axis_result is not None:
+                            axis_source = 'patch_plane'
+                    else:
+                        axis_source = 'object_plane'
+                    if axis_result is not None:
+                        axis_normal = axis_result[0]
+                        bolt_quat = _normal_to_quaternion(axis_normal)
+                        axis_dir = [round(float(v), 6) for v in axis_normal]
+
+                cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 165, 255), 2)
+                cv2.putText(canvas, f'leak_bolt {bolt_conf:.2f}',
+                            (x1, max(15, y1 - 8)), 0, 0.55,
+                            (0, 165, 255), 2, cv2.LINE_AA)
+                if _valid_point_3d(bolt_xyz):
+                    cv2.putText(
+                        canvas,
+                        f'({bolt_xyz[0]:.2f},{bolt_xyz[1]:.2f},{bolt_xyz[2]:.2f})',
+                        (x1, y2 + 18), 0, 0.4,
+                        (0, 165, 255), 1, cv2.LINE_AA)
+                    bolt_info = {
+                        'class': 'leak_bolt',
+                        'bbox': [x1, y1, x2, y2],
+                        'position': {
+                            'x': round(bolt_xyz[0], 4),
+                            'y': round(bolt_xyz[1], 4),
+                            'z': round(bolt_xyz[2], 4),
+                        },
+                        'orientation': {
+                            'x': bolt_quat[0], 'y': bolt_quat[1],
+                            'z': bolt_quat[2], 'w': bolt_quat[3],
+                        },
+                        'confidence': round(bolt_conf, 3),
+                    }
+                    if axis_dir is not None:
+                        bolt_info['axis_direction'] = axis_dir
+                        bolt_info['axis_source'] = axis_source
+
         source_label = leak_source
         if leak_source == 'upstream':
             cv2.circle(canvas, leak_px, 8, (0, 0, 255), -1)
@@ -1596,12 +1699,15 @@ class PanelDetectionNode(Node):
         self._update_display_frame(canvas, color_stamp)
 
         if self._targets_pub is not None and leak_xyz is not None:
-            msg = String()
-            msg.data = json.dumps({
+            targets_payload = {
                 'stamp': stamp_seconds,
                 'leak_point': leak_xyz,
                 'leak_source': leak_source,
-            }, ensure_ascii=False)
+            }
+            if bolt_info is not None:
+                targets_payload['bolt'] = bolt_info
+            msg = String()
+            msg.data = json.dumps(targets_payload, ensure_ascii=False)
             self._targets_pub.publish(msg)
 
         if self._object_geometry_pub is not None and result is not None:

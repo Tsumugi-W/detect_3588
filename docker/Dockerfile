@@ -27,4 +27,4 @@ RUN pip3 install --no-cache-dir \
 RUN echo 'source /opt/ros/humble/setup.bash' >> /root/.bashrc && \
     echo '[ -f /workspace/install/setup.bash ] && source /workspace/install/setup.bash' >> /root/.bashrc
 
-WORKDIR /workspace
+WORKDIR /root
