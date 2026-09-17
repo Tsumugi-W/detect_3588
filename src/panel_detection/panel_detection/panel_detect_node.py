@@ -2401,7 +2401,6 @@ class PanelDetectionNode(Node):
                 x1, y1 = int(det.bbox[0]), int(det.bbox[1])
                 x2, y2 = int(det.bbox[2]), int(det.bbox[3])
                 roi = color_image[y1:y2, x1:x2]
-                n_sides = 8 if det.class_name == 'valve' else 6
                 loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
                 reliable_nut = loc is not None and loc.confidence >= 0.45
                 marker = marker_by_detection_id.get(id(det))
@@ -2527,60 +2526,51 @@ class PanelDetectionNode(Node):
                             label=f'{det.class_name}_axis[{axis_source}]',
                             color=(255, 255, 0))
 
-                marker_angle = (
-                    marker.gap_angle_deg if marker is not None else None)
-                hex_angle = (
-                    marker_angle % 60.0 if marker_angle is not None
-                    else (loc.angle if reliable_nut and loc.angle is not None else None))
-                if hex_angle is None:
-                    if marker is not None:
+                # 螺栓/螺母不再做六边形角度检测，最终方案由螺栓位置推算螺母位置。
+                # 仅保留 valve 八边形角度和同心圆标靶角度。
+                if det.class_name == 'valve':
+                    hex_angle = None
+                    if not _bbox_inside_image(
+                            det.bbox, color_image.shape,
+                            margin_px=self.cfg.get('valve_axis', {}).get(
+                                'edge_margin_px', 4)):
                         hex_angle = None
-                    elif det.class_name == 'valve':
-                        if not _bbox_inside_image(
-                                det.bbox, color_image.shape,
-                                margin_px=self.cfg.get('valve_axis', {}).get(
-                                    'edge_margin_px', 4)):
-                            hex_angle = None
-                        else:
-                            valve_candidates = estimate_valve_angle_candidates(roi)
-                            raw_valve_angle = (
-                                valve_candidates[0] if valve_candidates
-                                else estimate_valve_angle(roi)
-                            )
-                            hex_angle = self._valve_angle_stabilizer.update(
-                                'valve', raw_valve_angle, valve_candidates)
                     else:
-                        hex_angle = estimate_hex_angle(roi, n_sides=n_sides)
-                if hex_angle is not None:
-                    angle_item = {
-                        'class': det.class_name,
-                        'bbox': det.bbox,
-                        'hex_angle': round(hex_angle, 1),
-                        **({'nut_refined_conf': round(loc.confidence, 3)}
-                           if reliable_nut else {}),
-                    }
-                    if det.class_name == 'valve':
-                        angle_item['valve_angle'] = round(hex_angle, 1)
-                    if marker_angle is not None:
-                        angle_item.update({
-                            'angle_source': 'concentric_bolt_marker',
-                            'marker_angle_deg': round(marker_angle, 1),
-                            'marker_direction_3d': (
-                                None if marker_pose is None
-                                or marker_pose.direction_3d is None
-                                else [round(float(value), 6)
-                                      for value in marker_pose.direction_3d]),
-                        })
-                    hex_angles.append(angle_item)
-                    if det.class_name in ('bolt', 'nut'):
-                        fastener_geometry_items.setdefault(det_idx, []).append(angle_item)
-                    if det.class_name == 'valve':
+                        valve_candidates = estimate_valve_angle_candidates(roi)
+                        raw_valve_angle = (
+                            valve_candidates[0] if valve_candidates
+                            else estimate_valve_angle(roi)
+                        )
+                        hex_angle = self._valve_angle_stabilizer.update(
+                            'valve', raw_valve_angle, valve_candidates)
+                    if hex_angle is not None:
+                        angle_item = {
+                            'class': det.class_name,
+                            'bbox': det.bbox,
+                            'hex_angle': round(hex_angle, 1),
+                            'valve_angle': round(hex_angle, 1),
+                        }
+                        hex_angles.append(angle_item)
                         _draw_regular_polygon(
                             canvas, det.bbox, 8, hex_angle,
                             color=(0, 255, 255),
                             angle_mode='vertex')
-                    elif det.class_name != 'nut' or not reliable_nut:
-                        draw_hex_angle(canvas, det.bbox, hex_angle)
+                elif marker is not None and marker.gap_angle_deg is not None:
+                    marker_angle = marker.gap_angle_deg
+                    angle_item = {
+                        'class': det.class_name,
+                        'bbox': det.bbox,
+                        'hex_angle': round(marker_angle % 60.0, 1),
+                        'angle_source': 'concentric_bolt_marker',
+                        'marker_angle_deg': round(marker_angle, 1),
+                        'marker_direction_3d': (
+                            None if marker_pose is None
+                            or marker_pose.direction_3d is None
+                            else [round(float(value), 6)
+                                  for value in marker_pose.direction_3d]),
+                    }
+                    hex_angles.append(angle_item)
+                    fastener_geometry_items.setdefault(det_idx, []).append(angle_item)
 
         fastener_axis_measurements = []
         for det_idx, raw_axis in fastener_axis_by_det_idx.items():
