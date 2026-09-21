@@ -92,6 +92,7 @@ DEFAULT_CONFIG = {
     'knob_angle': {'enable': True, 'binary_thresh': 180,
                    'circle_mask_ratio': 0.85, 'knob_class': 'knob',
                    'use_constraint': 1},
+    'knob_depth': {'quantile': 0.2, 'offset_m': 0.005},
     'position_stabilizer': {'enable': True, 'still_time': 3.0,
                             'pixel_thresh': 5.0, 'window_size': 45,
                             'ema_alpha': 0.25, 'depth_std_thresh': 0.01},
@@ -330,16 +331,26 @@ def _pop_synced_frame_pair(color_queue, depth_queue, max_dt):
     return None
 
 
-def _estimate_detection_point(det, depth_image, intrin, depth_scale):
+def _estimate_detection_point(det, depth_image, intrin, depth_scale,
+                              knob_quantile=0.2, knob_offset_m=0.005):
     """
     估计检测目标中心 3D 点。
 
     话题模式下深度图已通过 depth_registration 对齐到彩色图，采样深度
     应使用检测框原始像素坐标；不在采样前做 undistort，避免取错深度像素。
+
+    旋钮使用较小的 quantile 取手柄近表面深度，再加 offset 让操作点
+    略微深入手柄内部，方便机械臂卡住。
     """
     ux = int(round(det.center_x))
     uy = int(round(det.center_y))
-    if det.class_name in ('button', 'door_button', 'knob'):
+    if det.class_name == 'knob':
+        depth = get_bbox_robust_depth(
+            depth_image, det.bbox, depth_scale=depth_scale,
+            center_ratio=0.45, min_valid=8, quantile=knob_quantile)
+        if depth > 0.0:
+            depth += knob_offset_m
+    elif det.class_name in ('button', 'door_button'):
         depth = get_bbox_robust_depth(
             depth_image, det.bbox, depth_scale=depth_scale,
             center_ratio=0.45, min_valid=8, quantile=0.5)
@@ -375,7 +386,7 @@ def _estimate_bbox_grouping_point(det, depth_image, intrin, depth_scale):
 
 
 def _draw_depth_sample_roi(canvas, det, depth_image, depth_scale,
-                           center_ratio=0.45):
+                           center_ratio=0.45, quantile=0.5, offset_m=0.0):
     """Debug: draw the depth sampling region and per-pixel depth values."""
     h, w = depth_image.shape
     x1, y1, x2, y2 = [float(v) for v in det.bbox]
@@ -407,11 +418,13 @@ def _draw_depth_sample_roi(canvas, det, depth_image, depth_scale,
     lo, hi = np.percentile(valid, [10, 90])
     trimmed = valid[(valid >= lo) & (valid <= hi)]
     if trimmed.size >= 8:
-        depth_m = float(np.percentile(trimmed, 50)) * depth_scale
+        q = float(np.clip(quantile, 0.05, 0.95))
+        surface_m = float(np.percentile(trimmed, q * 100.0)) * depth_scale
         trimmed_count = trimmed.size
     else:
-        depth_m = float(np.median(valid)) * depth_scale
+        surface_m = float(np.median(valid)) * depth_scale
         trimmed_count = valid_count
+    final_m = surface_m + offset_m
 
     overlay = canvas.copy()
     for py in range(sy1, sy2):
@@ -427,10 +440,14 @@ def _draw_depth_sample_roi(canvas, det, depth_image, depth_scale,
                     cv2.rectangle(overlay, (px, py), (px, py), (0, 100, 200), -1)
     cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
 
-    cv2.putText(canvas, f'depth={depth_m:.3f}m ({trimmed_count}/{valid_count}px)',
+    cv2.putText(canvas,
+                f'surface={surface_m:.3f}m  final={final_m:.3f}m '
+                f'(q={quantile} +{offset_m*1000:.1f}mm)',
                 (sx1, sy2 + 14), 0, 0.35,
                 (0, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f'range=[{lo * depth_scale:.3f},{hi * depth_scale:.3f}]m',
+    cv2.putText(canvas,
+                f'range=[{lo * depth_scale:.3f},{hi * depth_scale:.3f}]m '
+                f'({trimmed_count}/{valid_count}px)',
                 (sx1, sy2 + 28), 0, 0.35,
                 (0, 255, 255), 1, cv2.LINE_AA)
 
@@ -1085,6 +1102,13 @@ class PanelDetectionNode(Node):
             switch_margin=angle_cfg.get('discrete_switch_margin', 8.0),
             confirm_frames=angle_cfg.get('discrete_confirm_frames', 3),
         )
+        knob_depth_cfg = self.cfg.get('knob_depth', {})
+        self._knob_depth_quantile = float(knob_depth_cfg.get('quantile', 0.2))
+        self._knob_depth_offset_m = float(knob_depth_cfg.get('offset_m', 0.005))
+        self.get_logger().info(
+            f'旋钮深度: quantile={self._knob_depth_quantile}, '
+            f'offset={self._knob_depth_offset_m * 1000:.1f}mm')
+
         valve_angle_cfg = self.cfg.get('valve_angle_stabilizer', {})
         self._valve_angle_stabilizer = ValveAngleStabilizer(
             enabled=valve_angle_cfg.get('enable', True),
@@ -1621,63 +1645,60 @@ class PanelDetectionNode(Node):
         leak_px = None
         leak_xyz = None
         leak_source = None
+        result = None
 
-        # Priority 1: upstream 3D leak point
-        now = time.time()
-        if (self._leak_upstream_point is not None and
-                now - self._leak_upstream_stamp < self._leak_upstream_timeout):
-            xyz = self._leak_upstream_point
-            if xyz[2] > 0:
-                px = int(round(color_intrin.fx * xyz[0] / xyz[2] + color_intrin.cx))
-                py = int(round(color_intrin.fy * xyz[1] / xyz[2] + color_intrin.cy))
-                if 0 <= px < w and 0 <= py < h:
-                    leak_px = (px, py)
-                    leak_xyz = {'x': round(xyz[0], 4),
-                                'y': round(xyz[1], 4),
-                                'z': round(xyz[2], 4)}
-                    leak_source = 'upstream'
-
-        # Priority 2: black marker fallback
-        if leak_px is None:
-            candidates = detect_black_marker(color_image)
-            if candidates:
-                cx, cy, bbox, score = candidates[0]
-                leak_px = (cx, cy)
-                leak_source = 'black_marker'
-                bx1, by1, bx2, by2 = bbox
-                cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
-                cv2.putText(canvas, f'black marker (score={score:.0f})',
-                            (bx1, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                            (0, 255, 0), 2, cv2.LINE_AA)
-                depth_val = get_robust_depth(
-                    depth_image, cx, cy,
-                    sample_radius=5, depth_scale=self._depth_scale)
-                if depth_val > 0:
-                    xyz_3d = deproject_pixel_to_point(
-                        deproj_intrin, (cx, cy), depth_val)
-                    if xyz_3d is not None and xyz_3d[2] > 0:
-                        leak_xyz = {'x': round(xyz_3d[0], 4),
-                                    'y': round(xyz_3d[1], 4),
-                                    'z': round(xyz_3d[2], 4)}
-
-        if leak_px is None:
-            self._publish_status('no_leak_point')
-            self._update_display_frame(canvas, color_stamp)
-            return
-
-        result = estimate_pipe_axis_from_image(
-            color_image,
-            leak_point=leak_px,
-            roi_half_size=(200, 100),
-            canny_thresholds=(30, 120),
-            hough_threshold=30,
-            min_line_length=45,
-            max_line_gap=15,
-            max_line_distance=60.0,
-        )
-
-        if result is not None:
-            canvas = draw_pipe_axis_result(canvas, result, output_size=180)
+        # ── 漏点检测 + 管道轴线（暂时跳过，只看 leak_bolt）──
+        # # Priority 1: upstream 3D leak point
+        # now = time.time()
+        # if (self._leak_upstream_point is not None and
+        #         now - self._leak_upstream_stamp < self._leak_upstream_timeout):
+        #     xyz = self._leak_upstream_point
+        #     if xyz[2] > 0:
+        #         px = int(round(color_intrin.fx * xyz[0] / xyz[2] + color_intrin.cx))
+        #         py = int(round(color_intrin.fy * xyz[1] / xyz[2] + color_intrin.cy))
+        #         if 0 <= px < w and 0 <= py < h:
+        #             leak_px = (px, py)
+        #             leak_xyz = {'x': round(xyz[0], 4),
+        #                         'y': round(xyz[1], 4),
+        #                         'z': round(xyz[2], 4)}
+        #             leak_source = 'upstream'
+        #
+        # # Priority 2: black marker fallback
+        # if leak_px is None:
+        #     candidates = detect_black_marker(color_image)
+        #     if candidates:
+        #         cx, cy, bbox, score = candidates[0]
+        #         leak_px = (cx, cy)
+        #         leak_source = 'black_marker'
+        #         bx1, by1, bx2, by2 = bbox
+        #         cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+        #         cv2.putText(canvas, f'black marker (score={score:.0f})',
+        #                     (bx1, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+        #                     (0, 255, 0), 2, cv2.LINE_AA)
+        #         depth_val = get_robust_depth(
+        #             depth_image, cx, cy,
+        #             sample_radius=5, depth_scale=self._depth_scale)
+        #         if depth_val > 0:
+        #             xyz_3d = deproject_pixel_to_point(
+        #                 deproj_intrin, (cx, cy), depth_val)
+        #             if xyz_3d is not None and xyz_3d[2] > 0:
+        #                 leak_xyz = {'x': round(xyz_3d[0], 4),
+        #                             'y': round(xyz_3d[1], 4),
+        #                             'z': round(xyz_3d[2], 4)}
+        #
+        # if leak_px is not None:
+        #     result = estimate_pipe_axis_from_image(
+        #         color_image,
+        #         leak_point=leak_px,
+        #         roi_half_size=(200, 100),
+        #         canny_thresholds=(30, 120),
+        #         hough_threshold=30,
+        #         min_line_length=45,
+        #         max_line_gap=15,
+        #         max_line_distance=60.0,
+        #     )
+        #     if result is not None:
+        #         canvas = draw_pipe_axis_result(canvas, result, output_size=180)
 
         # ── leak_bolt 检测与位姿估计 ──
         bolt_info = None
@@ -1725,6 +1746,11 @@ class PanelDetectionNode(Node):
                 cv2.putText(canvas, f'leak_bolt {bolt_conf:.2f}',
                             (x1, max(15, y1 - 8)), 0, 0.55,
                             (0, 165, 255), 2, cv2.LINE_AA)
+                if axis_dir is not None:
+                    _draw_axis_direction(
+                        canvas, bbox, axis_dir,
+                        label=f'bolt_axis[{axis_source}]',
+                        color=(255, 0, 255))
                 if _valid_point_3d(bolt_xyz):
                     cv2.putText(
                         canvas,
@@ -1749,25 +1775,41 @@ class PanelDetectionNode(Node):
                         bolt_info['axis_direction'] = axis_dir
                         bolt_info['axis_source'] = axis_source
 
-        source_label = leak_source
-        if leak_source == 'upstream':
+        source_label = leak_source or 'bolt_only'
+        if leak_source == 'upstream' and leak_px is not None:
             cv2.circle(canvas, leak_px, 8, (0, 0, 255), -1)
             cv2.putText(canvas, 'upstream leak',
                         (leak_px[0] + 12, leak_px[1] - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         (0, 0, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, f'source: {source_label}',
+            if leak_xyz is not None:
+                cv2.putText(canvas,
+                            f'({leak_xyz["x"]:.3f},{leak_xyz["y"]:.3f},{leak_xyz["z"]:.3f})',
+                            (leak_px[0] + 12, leak_px[1] + 8),
+                            0, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
+        if leak_xyz is not None and leak_source == 'black_marker' and leak_px is not None:
+            cv2.putText(canvas,
+                        f'({leak_xyz["x"]:.3f},{leak_xyz["y"]:.3f},{leak_xyz["z"]:.3f})',
+                        (leak_px[0] + 12, leak_px[1] + 8),
+                        0, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f'LEAK MODE  source: {source_label}',
                     (10, canvas.shape[0] - 15), 0, 0.5,
                     (0, 255, 0), 1, cv2.LINE_AA)
 
+        if bolt_info is not None and bolt_info.get('axis_direction') is not None:
+            _draw_axis_3d_view(canvas, [{
+                'class': 'leak_bolt',
+                'source': bolt_info.get('axis_source', ''),
+                'axis_direction': bolt_info['axis_direction'],
+            }])
+
         self._update_display_frame(canvas, color_stamp)
 
-        if self._targets_pub is not None and leak_xyz is not None:
-            targets_payload = {
-                'stamp': stamp_seconds,
-                'leak_point': leak_xyz,
-                'leak_source': leak_source,
-            }
+        if self._targets_pub is not None and (leak_xyz is not None or bolt_info is not None):
+            targets_payload = {'stamp': stamp_seconds}
+            if leak_xyz is not None:
+                targets_payload['leak_point'] = leak_xyz
+                targets_payload['leak_source'] = leak_source
             if bolt_info is not None:
                 targets_payload['bolt'] = bolt_info
             msg = String()
@@ -1789,8 +1831,16 @@ class PanelDetectionNode(Node):
             }, ensure_ascii=False)
             self._object_geometry_pub.publish(msg)
 
-        has_result = result is not None
-        self._publish_status('leak_detected' if has_result else 'no_pipe_axis')
+        has_bolt = bolt_info is not None
+        has_leak = result is not None
+        if has_bolt and has_leak:
+            self._publish_status('leak_detected')
+        elif has_bolt:
+            self._publish_status('bolt_detected')
+        elif has_leak:
+            self._publish_status('leak_detected')
+        else:
+            self._publish_status('no_detection')
 
     def _detection_callback(self):
         if not self._camera_ready:
@@ -2216,7 +2266,9 @@ class PanelDetectionNode(Node):
 
         for target_id, det in matched:
             ux, uy, xyz = _estimate_detection_point(
-                det, filtered_depth, deproj_intrin, self._depth_scale)
+                det, filtered_depth, deproj_intrin, self._depth_scale,
+                knob_quantile=self._knob_depth_quantile,
+                knob_offset_m=self._knob_depth_offset_m)
             matched_xyz[target_id] = xyz
             position_measurements.append((target_id, (ux, uy), xyz))
 
@@ -2977,9 +3029,13 @@ class PanelDetectionNode(Node):
 
             if self._debug_depth_roi and det.class_name in (
                     'button', 'door_button', 'knob'):
+                q = (self._knob_depth_quantile
+                     if det.class_name == 'knob' else 0.5)
+                off = (self._knob_depth_offset_m
+                       if det.class_name == 'knob' else 0.0)
                 _draw_depth_sample_roi(
                     canvas, det, filtered_depth, self._depth_scale,
-                    center_ratio=0.45)
+                    center_ratio=0.45, quantile=q, offset_m=off)
 
         if self._panel_normal_cache is not None:
             n = np.round(self._panel_normal_cache[0], 3).tolist()

@@ -89,6 +89,7 @@ DEFAULT_CONFIG = {
     'knob_angle': {'enable': True, 'binary_thresh': 180,
                    'circle_mask_ratio': 0.85, 'knob_class': 'knob',
                    'use_constraint': 1},
+    'knob_depth': {'quantile': 0.2, 'offset_m': 0.005},
     'position_stabilizer': {'enable': True, 'still_time': 3.0,
                             'pixel_thresh': 5.0, 'window_size': 45,
                             'ema_alpha': 0.25, 'depth_std_thresh': 0.01},
@@ -321,16 +322,26 @@ def _pop_synced_frame_pair(color_queue, depth_queue, max_dt):
     return None
 
 
-def _estimate_detection_point(det, depth_image, intrin, depth_scale):
+def _estimate_detection_point(det, depth_image, intrin, depth_scale,
+                              knob_quantile=0.2, knob_offset_m=0.005):
     """
     估计检测目标中心 3D 点。
 
     话题模式下深度图已通过 depth_registration 对齐到彩色图，采样深度
     应使用检测框原始像素坐标；不在采样前做 undistort，避免取错深度像素。
+
+    旋钮使用较小的 quantile 取手柄近表面深度，再加 offset 让操作点
+    略微深入手柄内部，方便机械臂卡住。
     """
     ux = int(round(det.center_x))
     uy = int(round(det.center_y))
-    if det.class_name in ('button', 'door_button', 'knob'):
+    if det.class_name == 'knob':
+        depth = get_bbox_robust_depth(
+            depth_image, det.bbox, depth_scale=depth_scale,
+            center_ratio=0.45, min_valid=8, quantile=knob_quantile)
+        if depth > 0.0:
+            depth += knob_offset_m
+    elif det.class_name in ('button', 'door_button'):
         depth = get_bbox_robust_depth(
             depth_image, det.bbox, depth_scale=depth_scale,
             center_ratio=0.45, min_valid=8, quantile=0.5)
@@ -1022,6 +1033,13 @@ class PanelDetectionNode(Node):
             switch_margin=angle_cfg.get('discrete_switch_margin', 8.0),
             confirm_frames=angle_cfg.get('discrete_confirm_frames', 3),
         )
+        knob_depth_cfg = self.cfg.get('knob_depth', {})
+        self._knob_depth_quantile = float(knob_depth_cfg.get('quantile', 0.2))
+        self._knob_depth_offset_m = float(knob_depth_cfg.get('offset_m', 0.005))
+        self.get_logger().info(
+            f'旋钮深度: quantile={self._knob_depth_quantile}, '
+            f'offset={self._knob_depth_offset_m * 1000:.1f}mm')
+
         valve_angle_cfg = self.cfg.get('valve_angle_stabilizer', {})
         self._valve_angle_stabilizer = ValveAngleStabilizer(
             enabled=valve_angle_cfg.get('enable', True),
@@ -2075,7 +2093,9 @@ class PanelDetectionNode(Node):
 
         for target_id, det in matched:
             ux, uy, xyz = _estimate_detection_point(
-                det, filtered_depth, deproj_intrin, self._depth_scale)
+                det, filtered_depth, deproj_intrin, self._depth_scale,
+                knob_quantile=self._knob_depth_quantile,
+                knob_offset_m=self._knob_depth_offset_m)
             matched_xyz[target_id] = xyz
             position_measurements.append((target_id, (ux, uy), xyz))
 
