@@ -73,12 +73,13 @@ cmd_detect() {
 
     local launch_file
     case "$mode" in
-        panel)    launch_file="panel_controls.launch.py" ;;
-        fastener) launch_file="fastener_detection.launch.py" ;;
-        valve)    launch_file="valve_detection.launch.py" ;;
-        leak)     launch_file="leak_detection.launch.py" ;;
-        all)      launch_file="panel_detection.launch.py" ;;
-        *)        echo "未知检测模式: $mode"; exit 1 ;;
+        panel)       launch_file="panel_controls.launch.py" ;;
+        panel-debug) launch_file="panel_controls_debug.launch.py" ;;
+        fastener)    launch_file="fastener_detection.launch.py" ;;
+        valve)       launch_file="valve_detection.launch.py" ;;
+        leak)        launch_file="leak_detection.launch.py" ;;
+        all)         launch_file="panel_detection.launch.py" ;;
+        *)           echo "未知检测模式: $mode"; exit 1 ;;
     esac
 
     ros2 launch panel_detection "$launch_file" use_topic:="$use_topic" $config_arg
@@ -132,7 +133,7 @@ fi
 case "$1" in
     -h|--help|help)    _print_help ;;
     camera)            shift; cmd_camera "$@" ;;
-    panel|fastener|valve|leak|all)
+    panel|panel-debug|fastener|valve|leak|all)
                        cmd_detect "$@" ;;
     record)            shift; cmd_record "$@" ;;
     play)              shift; cmd_play "$@" ;;

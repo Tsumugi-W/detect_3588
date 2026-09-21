@@ -374,6 +374,67 @@ def _estimate_bbox_grouping_point(det, depth_image, intrin, depth_scale):
     return ux, uy, deproject_pixel_to_point(intrin, (ux, uy), depth)
 
 
+def _draw_depth_sample_roi(canvas, det, depth_image, depth_scale,
+                           center_ratio=0.45):
+    """Debug: draw the depth sampling region and per-pixel depth values."""
+    h, w = depth_image.shape
+    x1, y1, x2, y2 = [float(v) for v in det.bbox]
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    half_w = max(2.0, bw * center_ratio * 0.5)
+    half_h = max(2.0, bh * center_ratio * 0.5)
+
+    sx1 = max(0, int(round(cx - half_w)))
+    sx2 = min(w, int(round(cx + half_w + 1)))
+    sy1 = max(0, int(round(cy - half_h)))
+    sy2 = min(h, int(round(cy + half_h + 1)))
+    if sx1 >= sx2 or sy1 >= sy2:
+        return
+
+    cv2.rectangle(canvas, (sx1, sy1), (sx2, sy2), (0, 255, 255), 1)
+
+    patch = depth_image[sy1:sy2, sx1:sx2]
+    valid = patch[patch > 0].astype(np.float64)
+    valid_count = valid.size
+    if valid_count == 0:
+        cv2.putText(canvas, 'depth: no valid px',
+                    (sx1, sy2 + 14), 0, 0.35,
+                    (0, 0, 255), 1, cv2.LINE_AA)
+        return
+
+    lo, hi = np.percentile(valid, [10, 90])
+    trimmed = valid[(valid >= lo) & (valid <= hi)]
+    if trimmed.size >= 8:
+        depth_m = float(np.percentile(trimmed, 50)) * depth_scale
+        trimmed_count = trimmed.size
+    else:
+        depth_m = float(np.median(valid)) * depth_scale
+        trimmed_count = valid_count
+
+    overlay = canvas.copy()
+    for py in range(sy1, sy2):
+        for px in range(sx1, sx2):
+            d = depth_image[py, px]
+            if d == 0:
+                cv2.rectangle(overlay, (px, py), (px, py), (0, 0, 180), -1)
+            else:
+                dv = float(d)
+                if lo <= dv <= hi:
+                    cv2.rectangle(overlay, (px, py), (px, py), (0, 200, 0), -1)
+                else:
+                    cv2.rectangle(overlay, (px, py), (px, py), (0, 100, 200), -1)
+    cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
+
+    cv2.putText(canvas, f'depth={depth_m:.3f}m ({trimmed_count}/{valid_count}px)',
+                (sx1, sy2 + 14), 0, 0.35,
+                (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f'range=[{lo * depth_scale:.3f},{hi * depth_scale:.3f}]m',
+                (sx1, sy2 + 28), 0, 0.35,
+                (0, 255, 255), 1, cv2.LINE_AA)
+
+
 def _valid_point_3d(xyz):
     if xyz is None:
         return False
@@ -1136,6 +1197,9 @@ class PanelDetectionNode(Node):
 
         # 可视化
         self.display_frame = None
+        self.declare_parameter('debug_depth_roi', False)
+        self._debug_depth_roi = (
+            self.get_parameter('debug_depth_roi').get_parameter_value().bool_value)
         self.declare_parameter('capture_dir', '')
         self.declare_parameter('capture_hz', 1.0)
         self.declare_parameter('show_gui', True)
@@ -2910,6 +2974,12 @@ class PanelDetectionNode(Node):
             cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
                         (ux + 10, uy + 5), 0, 0.4,
                         (225, 255, 255), 1, cv2.LINE_AA)
+
+            if self._debug_depth_roi and det.class_name in (
+                    'button', 'door_button', 'knob'):
+                _draw_depth_sample_roi(
+                    canvas, det, filtered_depth, self._depth_scale,
+                    center_ratio=0.45)
 
         if self._panel_normal_cache is not None:
             n = np.round(self._panel_normal_cache[0], 3).tolist()
