@@ -1,0 +1,11 @@
+<launch>
+  <arg name="camera_name" default="camera_d435_0"/>
+  <arg name="show_window" default="true"/>
+  <arg name="output_dir" default="rgb_depth_captures"/>
+  <node pkg="panel_detection" type="rgb_depth_viewer.py" name="rgb_depth_viewer" output="screen">
+    <param name="color_topic" value="/$(arg camera_name)/color/image_raw"/>
+    <param name="depth_topic" value="/$(arg camera_name)/aligned_depth_to_color/image_raw"/>
+    <param name="show_window" value="$(arg show_window)"/>
+    <param name="output_dir" value="$(arg output_dir)"/>
+  </node>
+</launch>

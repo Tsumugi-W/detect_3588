@@ -8,10 +8,9 @@ import numpy as np
 
 from .apriltag_reference import _detect_aruco_markers, _get_apriltag_dictionary
 from .target_registry import FrameDetection
+from .panel_scene import resolve_tag_classes
 
 
-BUTTON_TAG_IDS = frozenset((0, 1, 2, 5, 6))
-KNOB_TAG_IDS = frozenset((3, 4))
 PANEL_TAG_ID_MIN = 0
 PANEL_TAG_ID_MAX = 39
 ELIGIBLE_CLASSES = frozenset(('button', 'knob', 'light'))
@@ -30,6 +29,25 @@ def reclassify_buttons_without_tags(detections, assignments):
             detection.class_name = 'light'
             changed.append(detection)
     return changed
+
+
+def apply_panel_tag_rules(detections, markers, tracker):
+    """Shared ROS/offline classification; mutate detections, return assignments/changes.
+
+    Buttons require a directly decoded Tag in the current frame, including
+    buttons initially classified through a cached track. Other classes retain
+    the existing short-gap tracking behavior.
+    """
+    assignments = tracker.update(detections, markers)
+    for index, assignment in assignments.items():
+        detections[index].class_name = assignment.forced_class
+    changed = reclassify_buttons_without_tags(detections, assignments)
+    changed_ids = {id(detection) for detection in changed}
+    assignments = {
+        index: assignment for index, assignment in assignments.items()
+        if id(detections[index]) not in changed_ids
+    }
+    return assignments, changed
 
 
 def redraw_reclassified_detection(canvas, raw_image, detection,
@@ -66,16 +84,9 @@ def redraw_reclassified_detection(canvas, raw_image, detection,
                 color, thickness, cv2.LINE_AA)
 
 
-def forced_class_for_tag(tag_id: int) -> Optional[str]:
-    """Return the authoritative component class encoded by a panel tag."""
-    tag_id = int(tag_id)
-    if tag_id < PANEL_TAG_ID_MIN or tag_id > PANEL_TAG_ID_MAX:
-        return None
-    if tag_id in BUTTON_TAG_IDS:
-        return 'button'
-    if tag_id in KNOB_TAG_IDS:
-        return 'knob'
-    return 'light'
+def forced_class_for_tag(tag_id: int, cfg=None) -> Optional[str]:
+    """Return scene-defined class; unlisted Tags have no authority."""
+    return resolve_tag_classes(cfg).get(int(tag_id))
 
 
 @dataclass(frozen=True)
@@ -140,6 +151,7 @@ def detect_panel_tags(color_image: np.ndarray, cfg=None) -> List[PanelTagMarker]
     if ids is None:
         return []
 
+    tag_classes = resolve_tag_classes(cfg)
     min_id = int(cfg.get('min_id', PANEL_TAG_ID_MIN))
     max_id = int(cfg.get('max_id', PANEL_TAG_ID_MAX))
     min_area = float(cfg.get('min_area_px', 64.0))
@@ -149,7 +161,7 @@ def detect_panel_tags(color_image: np.ndarray, cfg=None) -> List[PanelTagMarker]
         if index >= marker_ids.size:
             break
         tag_id = int(marker_ids[index])
-        if tag_id < min_id or tag_id > max_id:
+        if tag_id < min_id or tag_id > max_id or tag_id not in tag_classes:
             continue
         points = np.asarray(raw_corners, dtype=np.float32).reshape(4, 2)
         area = abs(float(cv2.contourArea(points)))
@@ -172,6 +184,7 @@ class PanelAprilTagTracker:
 
     def __init__(self, cfg=None):
         cfg = cfg or {}
+        self.tag_classes = resolve_tag_classes(cfg)
         self.max_horizontal_ratio = float(cfg.get('max_horizontal_ratio', 1.35))
         self.max_vertical_ratio = float(cfg.get('max_vertical_ratio', 3.0))
         self.overlap_tolerance_ratio = float(
@@ -197,7 +210,7 @@ class PanelAprilTagTracker:
         ]
         candidates = []
         for marker in markers:
-            if forced_class_for_tag(marker.tag_id) is None:
+            if marker.tag_id not in self.tag_classes:
                 continue
             for detection_index in eligible:
                 score = self._direct_score(marker, detections[detection_index])
@@ -251,7 +264,7 @@ class PanelAprilTagTracker:
             detection_index=detection_index,
             tag_id=int(tag_id),
             target_id=int(tag_id) + 1,
-            forced_class=forced_class_for_tag(tag_id),
+            forced_class=self.tag_classes[tag_id],
             source=source,
             marker=marker,
         )

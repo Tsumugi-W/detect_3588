@@ -21,9 +21,10 @@ topic_sync:
   max_dt: 0.05
   registered_depth: true
 panel_apriltag:
+  scene: validation_site
   enable: true
 apriltag_reference:
-  enable: false
+  enable: true
 knob_angle:
   enable: true
   use_constraint: 1

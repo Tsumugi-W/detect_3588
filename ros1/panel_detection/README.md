@@ -78,3 +78,36 @@ Override it with an absolute ONNX path:
 ```bash
 roslaunch panel_detection panel_detection.launch model_path:=/path/model.onnx
 ```
+
+## 面板场景配置（与 ROS2 同步）
+
+默认 `validation_site`：T02/T03 为旋钮，T00/T01/T04/T05/T06/T07 为按钮，
+其他 Tag 不参与关联；目标编号仍为 Tag ID+1。
+`test_site` 保留旧场景：T03/T04 为旋钮，T00/T01/T02/T05/T06 为按钮，T07–39 为灯。
+
+```bash
+# 默认验证场，保留 ROS1 相机配置
+roslaunch panel_detection panel_controls.launch
+# 测试场
+roslaunch panel_detection panel_controls.launch config_file:=$(rospack find panel_detection)/config/test_site.yaml
+# 显示深度采样区域（通过已有 debug_image 话题查看）
+roslaunch panel_detection panel_controls.launch debug_depth_roi:=true
+```
+
+`config_file` 也可指定自定义 YAML。配置递归合并，`panel_apriltag.tag_classes`
+整体替换，规则与 ROS2 一致。验证场关闭旧布局回退，测试场开启。
+本帧没有直接 Tag 对应的 button 仍改为 light；knob 不因缺少 Tag 被改类。
+ROS1 的图像话题参数、Noetic 时间戳、模型查找路径和 debug_image 发布方式保留。
+
+完整检测功能现已与 ROS2 对齐：包括同心紧固件标记、Tag 几何参考、稳定器、
+精度记录器、RGB/深度查看器、RKNN 后端、模型导出与二维管道复核工具。
+算法模块由跨版本测试检查一致性，节点保留 ROS1 时间戳、话题和模型路径适配。
+
+新增入口：`leak_detection.launch`、`panel_controls_debug.launch`、
+`rgb_depth_viewer.launch`、`fastener_precision_recorder.launch`。
+支持 `use_topic:=false` 直接连接已安装 SDK 的相机；相机驱动仍使用各 ROS 版本原生包。
+ROS1 默认 YAML 现在启用 AprilTag 几何参考，与 ROS2 相同。
+
+漏点模式默认开启完整漏点/管道检测和三维轴线拟合。仅检测螺栓时使用
+`config_file:=$(rospack find panel_detection)/config/leak_bolt_only.yaml`。
+三维输出协议和深度要求见仓库根 README 的“管道三维轴线”。

@@ -154,7 +154,7 @@ class FastenerGroupRegistry:
     def __init__(self, min_init_observations=2, max_group_distance_m=0.35,
                  max_slot_distance_m=0.12, slot_match_ratio=0.45,
                  normal_angle_thresh_deg=25.0, ema_alpha=0.35,
-                 stale_frames=120):
+                 stale_frames=120, slot_ambiguity_margin_m=0.008):
         self.min_init_observations = int(min_init_observations)
         self.max_group_distance_m = float(max_group_distance_m)
         self.max_slot_distance_m = float(max_slot_distance_m)
@@ -162,6 +162,7 @@ class FastenerGroupRegistry:
         self.normal_angle_thresh_deg = float(normal_angle_thresh_deg)
         self.ema_alpha = float(ema_alpha)
         self.stale_frames = int(stale_frames)
+        self.slot_ambiguity_margin_m = float(max(0.0, slot_ambiguity_margin_m))
         self._groups: List[_FastenerGroup] = []
         self._next_group_id = 1
 
@@ -386,10 +387,66 @@ class FastenerGroupRegistry:
     def _promote_group(self, group: _FastenerGroup,
                        observations: List[FastenerObservation],
                        frame_index: int) -> Dict[int, FastenerAssignment]:
-        """Replace a provisional two-point layout with a four-slot template."""
+        """Promote a provisional layout without renumbering known slots."""
         selected = sorted(
             observations, key=lambda obs: obs.confidence, reverse=True)[:4]
-        slot_by_det_idx = _assign_slots_by_image(selected)
+        slot_by_det_idx = {}
+        remaining = list(selected)
+        image_slot_by_det_idx = _assign_slots_by_image(selected)
+        prior_matches = []
+        for slot_id, prior_point in sorted(group.slots.items()):
+            if not remaining:
+                break
+            obs = min(
+                remaining,
+                key=lambda item: float(np.linalg.norm(
+                    np.asarray(item.point_3d, dtype=np.float64) - prior_point)),
+            )
+            prior_matches.append((slot_id, obs))
+            remaining.remove(obs)
+
+        # If the provisional points were on an ambiguous image row (for
+        # example two detections with identical y), allow the full observation
+        # set to establish the initial quadrants. Otherwise preserve the known
+        # IDs and never let a later perspective change renumber them.
+        preserve_prior = bool(prior_matches) and all(
+            image_slot_by_det_idx.get(obs.det_idx) == slot_id
+            for slot_id, obs in prior_matches)
+        remaining = list(selected)
+        # Keep the IDs already observed during the two-point cold start. The
+        # previous implementation re-ran the image-quadrant heuristic here,
+        # which could swap bottom-left/bottom-right when perspective changed.
+        if preserve_prior:
+            for slot_id, obs in prior_matches:
+                slot_by_det_idx[obs.det_idx] = slot_id
+                remaining.remove(obs)
+        else:
+            slot_by_det_idx = dict(image_slot_by_det_idx)
+            remaining = []
+
+        if remaining:
+            centers = np.asarray([obs.center_xy for obs in selected], dtype=np.float64)
+            center = np.mean(centers, axis=0)
+            desired = {
+                1: np.array([-1.0, -1.0]),
+                2: np.array([1.0, -1.0]),
+                3: np.array([1.0, 1.0]),
+                4: np.array([-1.0, 1.0]),
+            }
+            available = [slot for slot in sorted(desired)
+                         if slot not in group.slots]
+            for obs in remaining:
+                vec = np.array([
+                    -1.0 if obs.center_xy[0] < center[0] else 1.0,
+                    -1.0 if obs.center_xy[1] < center[1] else 1.0,
+                ])
+                if not available:
+                    break
+                slot_id = min(available,
+                              key=lambda item: float(np.linalg.norm(
+                                  vec - desired[item])))
+                slot_by_det_idx[obs.det_idx] = slot_id
+                available.remove(slot_id)
         group.slots = {
             slot_by_det_idx[obs.det_idx]: np.asarray(obs.point_3d, dtype=np.float64)
             for obs in selected
@@ -437,6 +494,7 @@ class FastenerGroupRegistry:
         gate = self._match_gate(group)
         best = None
         best_score = float('inf')
+        second_score = float('inf')
         match_count = min(len(observations), len(slot_ids))
         observation_subsets = itertools.combinations(observations, match_count)
         for chosen_observations in observation_subsets:
@@ -455,7 +513,14 @@ class FastenerGroupRegistry:
                         score += gate * 0.25
                     score += distance
                     candidate.append((obs, slot_id, distance))
-                if ok and score < best_score:
-                    best_score = score
-                    best = candidate
+                if ok:
+                    if score < best_score:
+                        second_score = best_score
+                        best_score = score
+                        best = candidate
+                    elif score < second_score:
+                        second_score = score
+        if (best is not None and second_score < float('inf') and
+                second_score - best_score < self.slot_ambiguity_margin_m):
+            return []
         return best or []

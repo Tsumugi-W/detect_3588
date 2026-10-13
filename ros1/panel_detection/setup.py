@@ -4,7 +4,7 @@ from catkin_pkg.python_setup import generate_distutils_setup
 
 
 setup_args = generate_distutils_setup(
-    packages=["panel_detection"],
+    packages=["panel_detection", "panel_detection.camera"],
     package_dir={"": "src"},
 )
 

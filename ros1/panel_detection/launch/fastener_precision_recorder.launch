@@ -1,0 +1,6 @@
+<launch>
+  <arg name="output_prefix" default="fastener_precision"/>
+  <node pkg="panel_detection" type="fastener_precision_recorder.py" name="fastener_precision_recorder" output="screen">
+    <param name="output_prefix" value="$(arg output_prefix)"/>
+  </node>
+</launch>

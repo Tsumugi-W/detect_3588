@@ -41,13 +41,13 @@ def _marker(tag_id, center_x, center_y=45.0, size=20.0):
 
 
 def test_tag_class_mapping_matches_panel_definition():
-    assert [forced_class_for_tag(tag_id) for tag_id in range(7)] == [
+    assert [forced_class_for_tag(tag_id, {'scene': 'test_site'}) for tag_id in range(7)] == [
         'button', 'button', 'button', 'knob', 'knob', 'button', 'button',
     ]
-    assert forced_class_for_tag(7) == 'light'
-    assert forced_class_for_tag(39) == 'light'
-    assert forced_class_for_tag(-1) is None
-    assert forced_class_for_tag(40) is None
+    assert forced_class_for_tag(7, {'scene': 'test_site'}) == 'light'
+    assert forced_class_for_tag(39, {'scene': 'test_site'}) == 'light'
+    assert forced_class_for_tag(-1, {'scene': 'test_site'}) is None
+    assert forced_class_for_tag(40, {'scene': 'test_site'}) is None
 
 
 def test_buttons_become_lights_when_current_frame_has_no_tags():
@@ -67,7 +67,7 @@ def test_buttons_become_lights_when_current_frame_has_no_tags():
 
 def test_button_keeps_class_only_when_its_own_tag_is_directly_assigned():
     detections = [_detection('button', 50.0)]
-    assignments = PanelAprilTagTracker().update(
+    assignments = PanelAprilTagTracker({'scene': 'test_site'}).update(
         detections, [_marker(0, 50.0)])
 
     changed = reclassify_buttons_without_tags(detections, assignments)
@@ -78,7 +78,7 @@ def test_button_keeps_class_only_when_its_own_tag_is_directly_assigned():
 
 def test_unassigned_button_becomes_light_even_when_another_tag_is_visible():
     detections = [_detection('button', 50.0), _detection('button', 150.0)]
-    assignments = PanelAprilTagTracker().update(
+    assignments = PanelAprilTagTracker({'scene': 'test_site'}).update(
         detections, [_marker(0, 50.0)])
 
     changed = reclassify_buttons_without_tags(detections, assignments)
@@ -88,7 +88,7 @@ def test_unassigned_button_becomes_light_even_when_another_tag_is_visible():
 
 
 def test_tracked_tag_does_not_keep_button_class_without_current_marker():
-    tracker = PanelAprilTagTracker({'stale_frames': 3})
+    tracker = PanelAprilTagTracker({'scene': 'test_site', 'stale_frames': 3})
     first_detection = _detection('button', 50.0)
     tracker.update([first_detection], [_marker(0, 50.0)])
     current_detection = _detection('button', 52.0)
@@ -127,7 +127,7 @@ def test_tags_above_components_are_associated_one_to_one():
         _detection('button', 150.0),
         _detection('knob', 250.0),
     ]
-    assignments = PanelAprilTagTracker().update(
+    assignments = PanelAprilTagTracker({'scene': 'test_site'}).update(
         detections, [_marker(0, 50.0), _marker(3, 150.0), _marker(12, 250.0)])
 
     assert set(assignments) == {0, 1, 2}
@@ -140,14 +140,14 @@ def test_tags_above_components_are_associated_one_to_one():
 
 def test_tag_below_component_or_far_to_the_side_is_rejected():
     detections = [_detection('button', 60.0)]
-    tracker = PanelAprilTagTracker()
+    tracker = PanelAprilTagTracker({'scene': 'test_site'})
 
     assert tracker.update(detections, [_marker(0, 60.0, center_y=140.0)]) == {}
     assert tracker.update(detections, [_marker(0, 260.0)]) == {}
 
 
 def test_track_bridges_short_tag_gap_but_expires_from_last_real_tag_frame():
-    tracker = PanelAprilTagTracker({'stale_frames': 2, 'track_distance_px': 50.0})
+    tracker = PanelAprilTagTracker({'scene': 'test_site', 'stale_frames': 2, 'track_distance_px': 50.0})
     first = tracker.update([_detection('light', 80.0)], [_marker(3, 80.0)])
     second = tracker.update([_detection('light', 82.0)], [])
     third = tracker.update([_detection('button', 84.0)], [])

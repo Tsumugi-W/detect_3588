@@ -1,12 +1,17 @@
 """Small rclpy-like facade used by the ROS1 Noetic detector port."""
 
 import rospy
+import threading
 
 
 class _ParameterValue:
     def __init__(self, value):
         self.string_value = str(value) if value is not None else ""
         self.bool_value = bool(value)
+        try:
+            self.integer_value = int(value)
+        except (TypeError, ValueError):
+            self.integer_value = 0
         try:
             self.double_value = float(value)
         except (TypeError, ValueError):
@@ -36,6 +41,10 @@ class _Logger:
 
 
 class _Now:
+    @property
+    def nanoseconds(self):
+        return rospy.Time.now().to_nsec()
+
     @staticmethod
     def to_msg():
         return rospy.Time.now()
@@ -64,6 +73,10 @@ class Node:
     def __init__(self, name):
         self._node_name = name
         self._parameter_defaults = {}
+        self._resources = []
+        self._destroyed = False
+        self._callback_lock = threading.RLock()
+        self.context = self
 
     def declare_parameter(self, name, default_value=None):
         self._parameter_defaults[name] = default_value
@@ -86,12 +99,36 @@ class Node:
         return _Publisher(
             rospy.Publisher(topic, message_type, queue_size=int(queue_size)))
 
-    @staticmethod
-    def create_subscription(message_type, topic, callback, qos_profile):
-        del qos_profile
-        return rospy.Subscriber(
-            topic, message_type, callback, queue_size=2,
+    def create_subscription(self, message_type, topic, callback, qos_profile):
+        def serialized(message):
+            with self._callback_lock:
+                if not self._destroyed:
+                    callback(message)
+        subscription = rospy.Subscriber(
+            topic, message_type, serialized, queue_size=int(qos_profile),
             buff_size=16 * 1024 * 1024)
+        self._resources.append(subscription)
+        return subscription
+
+    def create_timer(self, period, callback):
+        def serialized(event):
+            with self._callback_lock:
+                if not self._destroyed:
+                    callback()
+        timer = rospy.Timer(rospy.Duration(period), serialized)
+        self._resources.append(timer)
+        return timer
+
+    @staticmethod
+    def ok():
+        return not rospy.is_shutdown()
 
     def destroy_node(self):
-        return None
+        with self._callback_lock:
+            self._destroyed = True
+        for resource in self._resources:
+            if hasattr(resource, 'shutdown'):
+                resource.shutdown()
+            elif hasattr(resource, 'unregister'):
+                resource.unregister()
+        self._resources.clear()

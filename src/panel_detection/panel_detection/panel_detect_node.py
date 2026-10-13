@@ -62,11 +62,12 @@ from .concentric_bolt_marker import (
 from .concentric_marker_stabilizer import ConcentricMarkerStabilizer
 from .panel_apriltag import (
     PanelAprilTagTracker,
+    apply_panel_tag_rules,
     detect_panel_tags,
     draw_panel_tag_assignments,
-    reclassify_buttons_without_tags,
     redraw_reclassified_detection,
 )
+from .pipe_axis_3d import estimate_pipe_axis_3d
 from .pipe_axis import (
     detect_black_marker,
     draw_pipe_axis_result,
@@ -76,131 +77,9 @@ from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
 
 # ─── 配置 ─────────────────────────────────────────────────────────────────────
-DEFAULT_CONFIG = {
-    'camera_backend': 'orbbec',
-    'camera': {'color_width': 1280, 'color_height': 720,
-               'depth_width': 1280, 'depth_height': 720, 'fps': 30},
-    'inference_backend': 'onnx',
-    'onnx_model': '0824.onnx',
-    'onnx_threads': 8,
-    'weight': '0824.pt',
-    'input_size': 640,
-    'class_num': 9,
-    'class_name': ['light', 'knob', 'bolt', 'nut', 'valve', 'pump',
-                   'button', 'door_button', 'air_switch'],
-    'threshold': {'iou': 0.01, 'confidence': 0.3},
-    'knob_angle': {'enable': True, 'binary_thresh': 180,
-                   'circle_mask_ratio': 0.85, 'knob_class': 'knob',
-                   'use_constraint': 1},
-    'knob_depth': {'quantile': 0.2, 'offset_m': 0.005},
-    'position_stabilizer': {'enable': True, 'still_time': 3.0,
-                            'pixel_thresh': 5.0, 'window_size': 45,
-                            'ema_alpha': 0.25, 'depth_std_thresh': 0.01},
-    'panel_line': {'initial_dist_ratio': 1.1, 'dist_ratio': 0.85,
-                   'min_dist': 45.0, 'max_dist': 110.0,
-                   'proj_margin_ratio': 3.0,
-                   'min_proj_margin': 450.0},
-    'panel_apriltag': {
-        'enable': True,
-        'dictionary': 'DICT_APRILTAG_36h11',
-        'min_id': 0,
-        'max_id': 39,
-        'min_area_px': 64.0,
-        'max_horizontal_ratio': 1.35,
-        'max_vertical_ratio': 3.0,
-        'overlap_tolerance_ratio': 0.35,
-        'min_horizontal_gate_px': 24.0,
-        'min_vertical_gate_px': 30.0,
-        'track_distance_px': 90.0,
-        'track_size_ratio': 1.3,
-        'stale_frames': 8,
-    },
-    'panel_normal_interval': 10,
-    'topic_sync': {'max_dt': 0.05, 'registered_depth': True},
-    'valve_axis': {
-        'edge_margin_px': 4,
-    },
-    'fastener_registry': {
-        'min_init_observations': 2,
-        'max_group_distance_m': 0.35,
-        'max_slot_distance_m': 0.12,
-        'slot_match_ratio': 0.45,
-        'normal_angle_thresh_deg': 25.0,
-        'ema_alpha': 0.35,
-        'slot_ambiguity_margin_m': 0.008,
-        'stale_frames': 120,
-    },
-    'fastener_axis_stabilizer': {
-        'enable': True,
-        'ema_alpha': 0.18,
-        'max_jump_deg': 12.0,
-        'confirm_frames': 5,
-        'max_output_step_deg': 3.0,
-        'match_distance_px': 60.0,
-        'match_size_ratio': 1.2,
-        'stale_frames': 60,
-    },
-    'fastener_position_stabilizer': {
-        'enable': True,
-        'still_time': 1.0,
-        'pixel_thresh': 5.0,
-        'window_size': 30,
-        'ema_alpha': 0.20,
-        'depth_std_thresh': 0.008,
-    },
-    'concentric_bolt_marker': {
-        'enable': True,
-        'min_area_px': 45.0,
-        'max_area_ratio': 0.04,
-        'min_circularity': 0.72,
-        'min_axis_ratio': 0.60,
-        'min_axis_for_angle_px': 22.0,
-        'min_valid_depth_px': 8,
-        'max_plane_offset_residual_m': 0.008,
-        'reference_cache_frames': 15,
-        'stabilizer_enable': True,
-        'position_ema_alpha': 0.35,
-        'position_jump_thresh_m': 0.03,
-        'position_max_velocity_mps': 1.0,
-        'normal_ema_alpha': 0.25,
-        'normal_max_jump_deg': 12.0,
-        'angle_ema_alpha': 0.30,
-        'angle_max_jump_deg': 30.0,
-        'direction_ema_alpha': 0.30,
-        'direction_max_jump_deg': 20.0,
-        'stabilizer_max_dt': 0.5,
-        'stabilizer_stale_frames': 90,
-    },
-    'valve_angle_stabilizer': {
-        'enable': False,
-        'max_jump_deg': 10.0,
-        'confirm_frames': 5,
-    },
-    # 铭牌 OCR 配置暂停使用。
-    # 'nameplate_ocr': {
-    #     'enable': False,
-    # },
-    'detection_mode': 'all',
-    'publish_legacy_topics': False,
-    'apriltag_reference': {
-        'enable': True,
-        'dictionary': 'DICT_APRILTAG_36h11',
-        'sample_stride': 3,
-        'border_margin_ratio': 0.12,
-        'min_points': 80,
-        'ransac_thresh': 0.008,
-        'min_inlier_ratio': 0.45,
-        'max_rms_m': 0.012,
-        'min_abs_z': 0.50,
-        'fallback_enable': True,
-        'fallback_min_point_count': 2000,
-        'fallback_min_inlier_ratio': 0.75,
-        'fallback_min_white_border_ratio': 0.45,
-        'fallback_white_thresh': 150,
-        'log_enable': True,
-        'log_path': 'axis_reference_log.jsonl',
-    },
-}
+from .default_config import DEFAULT_CONFIG
+from .panel_scene import merge_config, DEFAULT_SCENE
+
 
 CLASS_TOPIC_MAP = {
     'light': '/panel/lights',
@@ -935,10 +814,12 @@ class PanelDetectionNode(Node):
         if config_path and os.path.isfile(config_path):
             self.get_logger().info(f'加载配置: {config_path}')
             with open(config_path, 'r', encoding='utf-8') as f:
-                self.cfg = yaml.load(f.read(), Loader=yaml.SafeLoader)
+                self.cfg = merge_config(DEFAULT_CONFIG, yaml.safe_load(f) or {})
         else:
             self.get_logger().info('使用默认配置')
-            self.cfg = DEFAULT_CONFIG
+            if config_path:
+                raise FileNotFoundError(config_path)
+            self.cfg = merge_config(DEFAULT_CONFIG, {})
 
         self.declare_parameter('detection_mode', self.cfg.get('detection_mode', 'all'))
         mode_param = self.get_parameter('detection_mode').get_parameter_value().string_value
@@ -998,6 +879,8 @@ class PanelDetectionNode(Node):
             self._process_panel_controls and
             self.get_parameter('use_panel_tags').get_parameter_value().bool_value)
         self._panel_tag_cfg = panel_tag_cfg
+        self._panel_layout_fallback = panel_tag_cfg.get(
+            'layout_fallback', panel_tag_cfg.get('scene', DEFAULT_SCENE) == 'test_site')
         self._panel_tag_tracker = PanelAprilTagTracker(panel_tag_cfg)
         if self._panel_tags_enabled:
             if hasattr(cv2, 'aruco'):
@@ -1042,6 +925,7 @@ class PanelDetectionNode(Node):
         self._camera_ready = False
 
         # 话题订阅模式的缓存
+        self._topic_color_frame_id = 'camera_color_optical_frame'
         self._topic_color = None
         self._topic_depth = None
         self._topic_color_stamp = None
@@ -1227,6 +1111,15 @@ class PanelDetectionNode(Node):
         self.declare_parameter('capture_dir', '')
         self.declare_parameter('capture_hz', 1.0)
         self.declare_parameter('show_gui', True)
+        self.declare_parameter('publish_debug_image', False)
+        self.declare_parameter('debug_image_topic', '/panel/debug_image')
+        publish_debug_image = self.get_parameter(
+            'publish_debug_image').get_parameter_value().bool_value
+        debug_image_topic = self.get_parameter(
+            'debug_image_topic').get_parameter_value().string_value
+        self._debug_image_pub = (
+            self.create_publisher(Image, debug_image_topic, 1)
+            if publish_debug_image else None)
         self._capture_dir = self.get_parameter(
             'capture_dir').get_parameter_value().string_value
         capture_hz = self.get_parameter(
@@ -1277,6 +1170,17 @@ class PanelDetectionNode(Node):
 
     def _update_display_frame(self, canvas, stamp=None):
         self.display_frame = canvas
+        if self._debug_image_pub is not None:
+            debug_msg = Image()
+            debug_msg.header.stamp = stamp if stamp is not None else self.get_clock().now().to_msg()
+            debug_msg.header.frame_id = 'camera_color_optical_frame'
+            debug_msg.height, debug_msg.width = canvas.shape[:2]
+            debug_msg.encoding = 'bgr8'
+            debug_msg.is_bigendian = 0
+            debug_msg.step = debug_msg.width * 3
+            debug_msg.data = np.ascontiguousarray(canvas).tobytes()
+            self._debug_image_pub.publish(debug_msg)
+
         if not self._capture_dir or self._capture_interval is None:
             return
 
@@ -1335,6 +1239,7 @@ class PanelDetectionNode(Node):
         if msg.encoding == 'rgb8':
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         with self._topic_frame_lock:
+            self._topic_color_frame_id = msg.header.frame_id or 'camera_color_optical_frame'
             self._topic_color = image
             self._topic_color_stamp = _stamp_to_sec(msg.header.stamp)
             self._topic_color_stamp_msg = msg.header.stamp
@@ -1647,58 +1552,78 @@ class PanelDetectionNode(Node):
         leak_source = None
         result = None
 
-        # ── 漏点检测 + 管道轴线（暂时跳过，只看 leak_bolt）──
-        # # Priority 1: upstream 3D leak point
-        # now = time.time()
-        # if (self._leak_upstream_point is not None and
-        #         now - self._leak_upstream_stamp < self._leak_upstream_timeout):
-        #     xyz = self._leak_upstream_point
-        #     if xyz[2] > 0:
-        #         px = int(round(color_intrin.fx * xyz[0] / xyz[2] + color_intrin.cx))
-        #         py = int(round(color_intrin.fy * xyz[1] / xyz[2] + color_intrin.cy))
-        #         if 0 <= px < w and 0 <= py < h:
-        #             leak_px = (px, py)
-        #             leak_xyz = {'x': round(xyz[0], 4),
-        #                         'y': round(xyz[1], 4),
-        #                         'z': round(xyz[2], 4)}
-        #             leak_source = 'upstream'
-        #
-        # # Priority 2: black marker fallback
-        # if leak_px is None:
-        #     candidates = detect_black_marker(color_image)
-        #     if candidates:
-        #         cx, cy, bbox, score = candidates[0]
-        #         leak_px = (cx, cy)
-        #         leak_source = 'black_marker'
-        #         bx1, by1, bx2, by2 = bbox
-        #         cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
-        #         cv2.putText(canvas, f'black marker (score={score:.0f})',
-        #                     (bx1, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-        #                     (0, 255, 0), 2, cv2.LINE_AA)
-        #         depth_val = get_robust_depth(
-        #             depth_image, cx, cy,
-        #             sample_radius=5, depth_scale=self._depth_scale)
-        #         if depth_val > 0:
-        #             xyz_3d = deproject_pixel_to_point(
-        #                 deproj_intrin, (cx, cy), depth_val)
-        #             if xyz_3d is not None and xyz_3d[2] > 0:
-        #                 leak_xyz = {'x': round(xyz_3d[0], 4),
-        #                             'y': round(xyz_3d[1], 4),
-        #                             'z': round(xyz_3d[2], 4)}
-        #
-        # if leak_px is not None:
-        #     result = estimate_pipe_axis_from_image(
-        #         color_image,
-        #         leak_point=leak_px,
-        #         roi_half_size=(200, 100),
-        #         canny_thresholds=(30, 120),
-        #         hough_threshold=30,
-        #         min_line_length=45,
-        #         max_line_gap=15,
-        #         max_line_distance=60.0,
-        #     )
-        #     if result is not None:
-        #         canvas = draw_pipe_axis_result(canvas, result, output_size=180)
+        if self.cfg.get('leak', {}).get('enable_point_detection', False):
+            # Priority 1: upstream 3D leak point
+            now = time.time()
+            if (self._leak_upstream_point is not None and
+                    now - self._leak_upstream_stamp < self._leak_upstream_timeout):
+                xyz = self._leak_upstream_point
+                if xyz[2] > 0:
+                    px = int(round(color_intrin.fx * xyz[0] / xyz[2] + color_intrin.cx))
+                    py = int(round(color_intrin.fy * xyz[1] / xyz[2] + color_intrin.cy))
+                    if 0 <= px < w and 0 <= py < h:
+                        leak_px = (px, py)
+                        leak_xyz = {'x': round(xyz[0], 4),
+                                    'y': round(xyz[1], 4),
+                                    'z': round(xyz[2], 4)}
+                        leak_source = 'upstream'
+
+            # Priority 2: black marker fallback
+            if leak_px is None:
+                candidates = detect_black_marker(color_image)
+                if candidates:
+                    cx, cy, bbox, score = candidates[0]
+                    leak_px = (cx, cy)
+                    leak_source = 'black_marker'
+                    bx1, by1, bx2, by2 = bbox
+                    cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+                    cv2.putText(canvas, f'black marker (score={score:.0f})',
+                                (bx1, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                (0, 255, 0), 2, cv2.LINE_AA)
+                    depth_val = get_robust_depth(
+                        depth_image, cx, cy,
+                        sample_radius=5, depth_scale=self._depth_scale)
+                    if depth_val > 0:
+                        xyz_3d = deproject_pixel_to_point(
+                            deproj_intrin, (cx, cy), depth_val)
+                        if xyz_3d is not None and xyz_3d[2] > 0:
+                            leak_xyz = {'x': round(xyz_3d[0], 4),
+                                        'y': round(xyz_3d[1], 4),
+                                        'z': round(xyz_3d[2], 4)}
+
+            if leak_px is not None:
+                result = estimate_pipe_axis_from_image(
+                    color_image,
+                    leak_point=leak_px,
+                    roi_half_size=(200, 100),
+                    canny_thresholds=(30, 120),
+                    hough_threshold=30,
+                    min_line_length=45,
+                    max_line_gap=15,
+                    max_line_distance=60.0,
+                )
+                if result is not None:
+                    canvas = draw_pipe_axis_result(canvas, result, output_size=180)
+
+
+        axis_3d = {'valid': False, 'reason': 'no_2d_axis',
+                   'point_xyz_m': None, 'direction_xyz': None,
+                   'endpoints_xyz_m': None}
+        if result is not None:
+            if ((self._use_topic and not self._registered_depth) or
+                    depth_image.shape[:2] != color_image.shape[:2]):
+                axis_3d['reason'] = 'depth_not_registered_to_color'
+            else:
+                axis_3d = estimate_pipe_axis_3d(
+                    result, depth_image, deproj_intrin, self._depth_scale,
+                    self.cfg.get('pipe_axis_3d', {}))
+        axis_frame = (self._topic_color_frame_id if self._use_topic
+                      else 'camera_color_optical_frame')
+        axis_3d['frame_id'] = axis_frame
+        if axis_3d['valid']:
+            vector_text = ','.join(f'{v:.3f}' for v in axis_3d['direction_xyz'])
+            cv2.putText(canvas, 'pipe 3D axis: ' + vector_text,
+                        (10, 108), 0, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
 
         # ── leak_bolt 检测与位姿估计 ──
         bolt_info = None
@@ -1816,18 +1741,20 @@ class PanelDetectionNode(Node):
             msg.data = json.dumps(targets_payload, ensure_ascii=False)
             self._targets_pub.publish(msg)
 
-        if self._object_geometry_pub is not None and result is not None:
+        if self._object_geometry_pub is not None:
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp_seconds,
-                'leak_point_px': list(leak_px),
+                'leak_point_px': list(leak_px) if leak_px is not None else None,
                 'leak_source': leak_source,
-                'pipe_axis_angle_deg': round(result.angle_deg, 2),
+                'pipe_axis_angle_deg': round(result.angle_deg, 2) if result else None,
                 'pipe_axis_vector_xy': [
                     round(result.vector_xy[0], 4),
                     round(result.vector_xy[1], 4),
-                ],
-                'num_segments': len(result.segments),
+                ] if result else None,
+                'num_segments': len(result.segments) if result else 0,
+                'frame_id': axis_frame,
+                'pipe_axis_3d': axis_3d,
             }, ensure_ascii=False)
             self._object_geometry_pub.publish(msg)
 
@@ -2065,21 +1992,9 @@ class PanelDetectionNode(Node):
         tagged_detection_ids = set()
         no_tag_light_ids = set()
         if self._panel_tags_enabled:
-            panel_tag_assignments = self._panel_tag_tracker.update(
-                frame_detections, panel_tag_markers)
-            for det_index, assignment in panel_tag_assignments.items():
-                frame_detections[det_index].class_name = assignment.forced_class
-
-            changed = reclassify_buttons_without_tags(
-                frame_detections, panel_tag_assignments)
+            panel_tag_assignments, changed = apply_panel_tag_rules(
+                frame_detections, panel_tag_markers, self._panel_tag_tracker)
             no_tag_light_ids = {id(detection) for detection in changed}
-            # A stale tracked assignment cannot provide a button ID after the
-            # current frame failed to associate that button with a real Tag.
-            panel_tag_assignments = {
-                det_index: assignment
-                for det_index, assignment in panel_tag_assignments.items()
-                if id(frame_detections[det_index]) not in no_tag_light_ids
-            }
             tagged_detection_ids = {
                 id(frame_detections[det_index])
                 for det_index in panel_tag_assignments
@@ -2245,7 +2160,8 @@ class PanelDetectionNode(Node):
             fallback_matches = self._registry.identify(
                 fallback_detections, color_image,
                 axis_origin=panel_axis_origin,
-                axis_vector=panel_axis_vector)
+                axis_vector=panel_axis_vector) if (
+                    not self._panel_tags_enabled or self._panel_layout_fallback) else []
             direct_target_ids = {target_id for target_id, _ in direct_matches}
             fallback_matches = [
                 item for item in fallback_matches

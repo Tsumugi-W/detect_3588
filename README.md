@@ -897,3 +897,143 @@ sudo pip3 install "numpy<2" -i https://pypi.tuna.tsinghua.edu.cn/simple
 ## 许可证
 
 Apache 2.0
+
+## 离线视频：面板 Tag 与元件对应复核
+
+无需 ROS、相机、深度或内参，直接读取视频。使用现有 `0824.onnx`、
+`detect_panel_tags`、`PanelAprilTagTracker` 和与 ROS 节点共享的
+`apply_panel_tag_rules`。默认配置也与节点共享。原有 launch、话题和深度流程不变。
+
+依赖 Python 3、NumPy、PyYAML、ONNX Runtime、带 aruco 的 OpenCV 以及含 libx264 的 ffmpeg。
+在仓库根目录执行：
+
+```bash
+python3 scripts/review_panel_video.py \
+  /data/little8/1013/*_无损.mp4 \
+  --output-dir /data/little8/1013_panel_review \
+  --crop 176 50 1000 748
+```
+
+`--crop X Y WIDTH HEIGHT` 是这批录屏的相机画面区域；其他视频可省略以处理全图，
+或重新指定裁剪区域。不会修改原视频。已有同名输出目录时拒绝覆盖。
+`--max-frames 30` 用于短片段试跑；`--config FILE` 合并覆盖默认 YAML 配置；
+`--model FILE` 指定 ONNX 权重。每个视频独立重置 Tag 跟踪状态，逐帧处理、不主动跳帧，
+输出保留源视频帧率（无音轨）。
+
+每段视频生成一个子目录：
+
+- `annotated.mp4`：H.264/yuv420p 标注视频，顶部增加 36 像素状态栏。
+- `frames.jsonl`：每帧的时间、Tag 四角、检测框、YOLO 原始类别、最终类别、
+  Tag ID、目标 ID、匹配来源。像素坐标相对于裁剪后的原图，不包含状态栏偏移。
+- `summary.json`：输入、裁剪、实际模型配置、帧数、匹配计数和预览帧号。
+- `preview.jpg`：优先选择直接关联数量较多的帧；每 15 秒另存一张抽帧图。
+
+画面中 `T00` 表示 Tag ID=0，`#1` 表示目标 ID=1（现有规则为 Tag ID+1）。
+连线表示本帧直接识别到的 Tag 与元件的关联；橙色 Tag 框表示没有匹配元件；
+灰色元件框表示没有有效 Tag 关联；`[tracked]` 表示短时跟踪关联，当前帧没有直接连线。
+`YOLO:...` 保留原始分类，主标签显示应用 Tag 规则后的分类。
+
+本工具专用于二维视觉关联复核，不运行布局回退编号、旋钮角度、深度或三维位置发布。
+保持现有节点规则：启用 Tag 时，本帧没有直接 Tag 关联的 button 会改判为 light。
+Tag 识别到了但 YOLO 未检出对应元件时，只画 Tag，不虚构元件框。
+统计是检测/关联次数，不是准确率；真实准确率需要人工标注。
+
+## 场景配置：测试场与验证场
+
+默认场景现为 **验证场 `validation_site`**：T00/T01/T04/T05/T06/T07 为按钮，
+T02/T03 为旋钮；仅 T00–T07 有效，其他 Tag 不参与关联。目标编号仍为 Tag ID+1。
+测试场 `test_site` 保留旧规则：T00/T01/T02/T05/T06 为按钮，T03/T04 为旋钮，
+T07–T39 为指示灯。
+
+配置文件位于 `src/panel_detection/config/`，构建安装时也会进入包的 share/config。
+
+```bash
+# 验证场：不传配置也使用此场景
+./run.sh panel --config src/panel_detection/config/validation_site.yaml
+# 切回测试场
+./run.sh panel --config src/panel_detection/config/test_site.yaml
+# 离线视频采用同一份场景配置
+python3 scripts/review_panel_video.py "/data/little8/1013/Screencast 2026-09-28 203939_无损.mp4" \
+  --config src/panel_detection/config/validation_site.yaml \
+  --output-dir /data/little8/1013_panel_review_validation --crop 176 50 1000 748
+```
+
+ROS launch 也可以使用 `config_path:=配置文件路径`。ROS 使用安装包运行时，
+修改源码后需在现有 ROS 构建环境中重新构建/加载工作空间。
+
+配置逻辑：
+
+- `panel_apriltag.scene` 选择预设，缺省为 `validation_site`；未知名称立即报错。
+- 可选 `panel_apriltag.tag_classes` 为完整 ID→类别映射，**整体替换**预设映射，
+  未列出的 Tag 忽略；支持 `button`、`knob`、`light`，ID 范围 0–39。
+  请用整数键（例如 `2`），不要混用 `2` 与 `"02"`。
+- 部分 YAML 配置递归覆盖默认配置，无需复制模型、阈值等无关参数。
+- `layout_fallback` 控制 ROS 节点的旧七元件布局回退编号：测试场默认开启，
+  验证场默认关闭，避免漏 Tag 时按旧场景分配 ID。离线工具仅复核 Tag 关联，始终不运行布局回退。
+- 没有直接 Tag 关联的 button 改判为 light 的原有规则保持不变；
+  `tag_classes` 只对成功关联到 Tag 的元件生效，不会将所有未匹配目标改成按钮。
+- 场景映射不改变旋钮角度算法；本次视频复核只验证类别和 Tag 关联。
+
+新增其他 Tag 时，在验证场配置的 `tag_classes` 中显式添加其 ID 与类别。
+历史 `1013_panel_review` 输出仍保留旧规则，新默认结果保存到
+`1013_panel_review_validation`，避免覆盖对照结果。
+
+
+## ROS1 / ROS2 功能同步
+
+两端具备相同的面板、阀门、紧固件、漏点和 all 检测流程，包含同心标记检测及其位姿/角度稳定、
+Tag 几何参考、紧固件组编号、旋钮深度修正、场景配置和深度采样调试。
+公共算法文件保持一致，`test_ros_parity.py` 检查模块内容与核心回调 AST，防止再次遗漏同步。
+ROS1 另外保留原生时间戳、可配置相机话题及 models/ 权重查找方式；两端都支持 debug_image 输出，
+ROS2 可传 `-p publish_debug_image:=true -p debug_image_topic:=/panel/debug_image`。
+
+ROS1 新增精度记录器、同步 RGB/深度查看器和对应 launch，安装时包含 camera 子包与工具脚本。
+录屏离线复核使用根目录的 `scripts/review_panel_video.py`，不依赖 ROS 运行时。
+相机驱动使用平台原生驱动，RKNN/相机 SDK/OCR 的可选依赖需要按目标机器安装。
+
+验证环境：ROS1 Noetic、ROS2 Galactic。两端均通过完整单元测试和五种模式的合成 RGB-D
+运行验证；查看器完成同步图像解码与截图，记录器完成初始化及输出文件关闭。
+真实相机及 RK3588 NPU 未接入本轮测试。构建在独立目录验证，不覆盖现有部署。
+LAB 的用户级 setuptools 与系统 packaging 存在版本冲突，ROS2 构建时使用临时
+`packaging==24.2` 路径覆盖；未修改机器全局依赖。
+
+## 管道三维轴线
+
+原 `/leak/pipe_axis` 只有二维角度和图像向量。现在保留这些字段并新增 `pipe_axis_3d`。
+默认开启完整漏点检测；使用 `config/leak_bolt_only.yaml` 可切回仅螺栓模式，
+`config/leak_full.yaml` 显式开启完整模式。
+
+算法沿二维轴线在局部 ROI 内按像素步长取样，对窄条内有效深度取中位数，
+剔除远离漏点局部深度的样本，再用相机内参反投影为三维点，经过 RANSAC 和 SVD 拟合。
+必须使用与彩色图对齐、尺寸一致的深度和对应的针孔/校正图像内参；未注册深度拒绝输出三维方向。
+深度单位由 `depth_scale` 指定，输出距离统一为米。
+
+`pipe_axis_3d` 字段：
+
+- `valid` / `reason`：是否有效及失败原因；缺少二维轴线或深度不足时也发布无效状态。
+- `frame_id`：彩色光学坐标系（x 向右、y 向下、z 向前）；话题模式采用输入彩色图 frame_id。
+- `point_xyz_m`：拟合点云的中心点；这是可见管道表面上的局部轴线参考点，**不是圆柱中心**。
+- `direction_xyz`：三维单位方向向量；有正负二义性，符号按二维轴线方向统一，不代表流向。
+- `endpoints_xyz_m`：有数据支持的拟合线段端点。
+- `point_count`、`inlier_count`、`inlier_ratio`、`rms_error_m`、`span_m`：拟合质量指标。
+
+无效时位置、方向和端点为 null，消费者必须检查 valid，不能沿用上一次结果。
+顶层仍有 `pipe_axis_angle_deg`、`pipe_axis_vector_xy`、`num_segments`，
+没有二维结果时角度/向量为 null、段数为 0。消息仍为 std_msgs/String JSON，未新增自定义消息依赖。
+
+`pipe_axis_3d` 配置可调整采样长度、条带宽度、有效深度范围、离群阈值、最少点数、
+最小支持长度及内点比例。默认半长 100 像素、步长 2 像素、条带半宽 2 像素、
+内点距离阈值 8 mm、至少 12 点、内点比例 0.65、支持长度至少 4 cm。
+本批 MP4 没有原始深度，无法据此验证真实三维精度；已通过已知倾斜方向、异常深度、空洞、
+无效深度和丢失三维结果的合成测试。
+
+## 原始 YOLO 图片复核
+
+```bash
+python3 scripts/annotate_yolo_images.py "/data/little8/1013_frames_1hz/Screencast 2026-09-28 203939_无损" --crop 176 50 1000 748
+```
+
+结果放在输入目录的 `yolo_raw/`（可通过 `--output-dir` 指定新目录），保留原图。
+仅使用 YOLO 原始框、类别和置信度，不经过 Tag、场景类别映射或布局修正。
+`predictions.jsonl` 保存每张图片的预测；坐标相对于原图，输出 PNG 顶部另加 32 像素标题栏。
+`summary.json` 记录模型、阈值、裁剪区域和预测计数；这些不是人工真值，不计算准确率。

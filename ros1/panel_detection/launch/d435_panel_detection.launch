@@ -1,10 +1,12 @@
 <launch>
+  <arg name="registered_depth" default="true"/>
+  <arg name="use_topic" default="true"/>
+  <arg name="config_file" default="$(find panel_detection)/config/panel_detection.yaml"/>
   <arg name="serial_no" default=""/>
   <arg name="camera_name" default="camera_d435_0"/>
   <arg name="detection_mode" default="all"/>
   <arg name="use_constraint" default="1"/>
   <arg name="show_gui" default="false"/>
-
   <include file="$(find realsense2_camera)/launch/rs_camera.launch">
     <arg name="camera" value="$(arg camera_name)"/>
     <arg name="serial_no" value="$(arg serial_no)"/>
@@ -12,11 +14,13 @@
     <arg name="enable_sync" value="true"/>
     <arg name="publish_tf" value="false"/>
   </include>
-
   <include file="$(find panel_detection)/launch/panel_detection.launch">
     <arg name="camera_name" value="$(arg camera_name)"/>
     <arg name="detection_mode" value="$(arg detection_mode)"/>
     <arg name="use_constraint" value="$(arg use_constraint)"/>
     <arg name="show_gui" value="$(arg show_gui)"/>
+    <arg name="config_file" value="$(arg config_file)"/>
+    <arg name="use_topic" value="$(arg use_topic)"/>
+    <arg name="registered_depth" value="$(arg registered_depth)"/>
   </include>
 </launch>

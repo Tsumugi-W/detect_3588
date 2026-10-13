@@ -1,9 +1,11 @@
 <launch>
+  <arg name="registered_depth" default="true"/>
+  <arg name="use_topic" default="true"/>
+  <arg name="config_file" default="$(find panel_detection)/config/panel_detection.yaml"/>
   <arg name="camera_name" default="camera_d435_0"/>
   <arg name="model_path" default="$(find panel_detection)/models/0824.onnx"/>
   <arg name="show_gui" default="false"/>
   <arg name="debug_image_topic" default="/valve/debug_image"/>
-
   <include file="$(find panel_detection)/launch/panel_detection.launch">
     <arg name="camera_name" value="$(arg camera_name)"/>
     <arg name="model_path" value="$(arg model_path)"/>
@@ -12,5 +14,8 @@
     <arg name="use_panel_tags" value="false"/>
     <arg name="show_gui" value="$(arg show_gui)"/>
     <arg name="debug_image_topic" value="$(arg debug_image_topic)"/>
+    <arg name="config_file" value="$(arg config_file)"/>
+    <arg name="use_topic" value="$(arg use_topic)"/>
+    <arg name="registered_depth" value="$(arg registered_depth)"/>
   </include>
 </launch>

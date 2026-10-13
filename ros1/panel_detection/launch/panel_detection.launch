@@ -1,4 +1,8 @@
 <launch>
+  <arg name="depth_scale" default="0.001"/>
+  <arg name="registered_depth" default="true"/>
+  <arg name="use_topic" default="true"/>
+  <arg name="debug_depth_roi" default="false"/>
   <arg name="camera_name" default="camera_d435_0"/>
   <arg name="model_path" default="$(find panel_detection)/models/0824.onnx"/>
   <arg name="config_file" default="$(find panel_detection)/config/panel_detection.yaml"/>
@@ -12,16 +16,13 @@
   <arg name="debug_image_topic" default="/panel/debug_image"/>
   <arg name="capture_dir" default=""/>
   <arg name="capture_hz" default="1.0"/>
-
-  <node pkg="panel_detection"
-        type="panel_detect_node.py"
-        name="$(arg node_name)"
-        output="screen">
+  <node pkg="panel_detection" type="panel_detect_node.py" name="$(arg node_name)" output="screen">
+    <param name="debug_depth_roi" value="$(arg debug_depth_roi)"/>
     <param name="config_path" value="$(arg config_file)"/>
     <param name="onnx_model" value="$(arg model_path)"/>
     <param name="detection_mode" value="$(arg detection_mode)"/>
-    <param name="use_topic" value="true"/>
-    <param name="registered_depth" value="true"/>
+    <param name="use_topic" value="$(arg use_topic)"/>
+    <param name="registered_depth" value="$(arg registered_depth)"/>
     <param name="color_topic" value="/$(arg camera_name)/color/image_raw"/>
     <param name="depth_topic" value="/$(arg camera_name)/aligned_depth_to_color/image_raw"/>
     <param name="color_info_topic" value="/$(arg camera_name)/color/camera_info"/>
@@ -34,5 +35,6 @@
     <param name="debug_image_topic" value="$(arg debug_image_topic)"/>
     <param name="capture_dir" value="$(arg capture_dir)"/>
     <param name="capture_hz" value="$(arg capture_hz)"/>
+    <param name="depth_scale" value="$(arg depth_scale)"/>
   </node>
 </launch>

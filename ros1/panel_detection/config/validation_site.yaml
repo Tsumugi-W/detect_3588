@@ -1,0 +1,13 @@
+# 验证场（默认）。只将列出的 Tag 用于元件关联；目标编号 = Tag ID + 1。
+panel_apriltag:
+  scene: validation_site
+  layout_fallback: false
+  tag_classes:
+    0: button
+    1: button
+    2: knob
+    3: knob
+    4: button
+    5: button
+    6: button
+    7: button
