@@ -2,7 +2,7 @@
 
 This package ports the current ROS2 detector to ROS1 Noetic while keeping the
 same YOLO, target numbering, angle, 3D position and axis-estimation algorithms.
-It consumes color-aligned D435 depth and uses `0813.onnx` by default.
+It consumes color-aligned D435 depth and uses `1013.onnx` by default.
 
 ## Build
 
@@ -69,9 +69,9 @@ All structured results use `std_msgs/String` JSON. Debug images use
 
 ## Model
 
-The bundled model has nine classes:
+The bundled model has ten classes:
 
-`light, knob, bolt, nut, valve, pump, button, door_button, air_switch`
+`light, knob, bolt, nut, valve, pump, button, door_button, air_switch, board_card`
 
 Override it with an absolute ONNX path:
 

@@ -2,7 +2,7 @@
 
 基于 YOLOv5 + 深度相机的操作面板实时 3D 检测系统，封装为标准 ROS2 Humble 功能包。
 
-检测 9 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)。支持目标注册编号、旋钮角度估计、螺栓/螺母/阀门轴线方向估计，以及管道漏点检测、管道轴线方向估计和 leak_bolt（加固螺栓）定位与位姿估计。
+检测 10 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)、板卡(board_card)。支持目标注册编号、旋钮角度估计、螺栓/螺母/阀门轴线方向估计，以及管道漏点检测、管道轴线方向估计和 leak_bolt（加固螺栓）定位与位姿估计。
 
 ## 系统架构
 
@@ -35,7 +35,7 @@ Orbbec 官方驱动 (独立 launch)
 
 仓库中的 `ros1/panel_detection` 是当前算法的 ROS1 Noetic catkin 版本，默认面向
 Intel RealSense D435 的彩色图、对齐深度图和彩色相机内参，使用同一份
-`0824.onnx` 九类别权重和 `leak_bolt.onnx` 漏点螺栓权重。该版本保留面板、阀门、
+`1013.onnx` 十类别权重和 `leak_bolt.onnx` 漏点螺栓权重。该版本保留面板、阀门、
 螺栓/螺母和漏点管道四个独立检测模式及对应 JSON 话题，并通过 `/panel/debug_image`
 等图像话题发布 Canvas；无显示环境默认不创建 OpenCV 窗口。
 
@@ -83,11 +83,8 @@ git clone --recursive git@github.com:Tsumugi-W/detect_3588.git .
 > git submodule update --init --recursive
 > ```
 
-应用仓库维护的 Orbbec MJPEG 解码与原始图像发布补丁。脚本可重复执行：
-
-```bash
-./scripts/apply_orbbec_patches.sh
-```
+源码压缩包已包含 Orbbec 驱动及 SDK，解压后可直接从安装系统依赖开始，
+无需执行 Git 子模块初始化。
 
 ### 第三步：安装系统依赖
 
@@ -715,6 +712,32 @@ class PanelSubscriber(Node):
                 f"{axis['class']} 轴线: ({n[0]:.3f}, {n[1]:.3f}, {n[2]:.3f})")
 ```
 
+## 默认权重与重新转换
+
+默认主检测权重为 `src/panel_detection/panel_detection/1013.pt` 及由它导出的
+`1013.onnx`；ROS1 使用 `ros1/panel_detection/models/1013.onnx` 的同一份模型。
+ONNX 为 FP32、opset 12、固定输入 `[1, 3, 640, 640]`，输出为已解码的
+`[1, 25200, 15]`，NMS 由检测器执行。十类别顺序与下方配置一致，
+新增 `board_card` 的类别索引为 9。`all` 模式的 Canvas 和原始 YOLO 图片标注
+可显示板卡；各专用任务模式沿用原有类别筛选与话题。
+
+运行检测只需 ONNX Runtime；若要重新转换 PT，在转换环境准备 YOLOv5 源码
+及导出依赖。`1013.pt` 训练时的 YOLOv5 提交为
+`781b9d57649da18aa1127707a371a13c5ef8a9ec`：
+
+```bash
+git clone https://github.com/ultralytics/yolov5.git /path/to/yolov5
+git -C /path/to/yolov5 checkout 781b9d57649da18aa1127707a371a13c5ef8a9ec
+python3 -m pip install -r /path/to/yolov5/requirements.txt \
+  'torch>=2.6' onnx==1.17.0 onnxruntime==1.20.1 onnxsim==0.4.36
+
+# 在本仓库根目录执行
+python3 src/panel_detection/scripts/export_model.py \
+  --pt src/panel_detection/panel_detection/1013.pt \
+  --yolov5-dir /path/to/yolov5 --format onnx --img-size 640
+cp src/panel_detection/panel_detection/1013.onnx ros1/panel_detection/models/1013.onnx
+```
+
 ## 配置文件说明
 
 创建 YAML 文件后通过 `config_path` 参数传入：
@@ -735,15 +758,15 @@ camera:
   fps: 30
 
 inference_backend: 'onnx'      # 'onnx' | 'rknn'
-onnx_model: '0824.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
+onnx_model: '1013.onnx'        # 相对 panel_detection 包目录，或填写绝对路径
 onnx_threads: 8
 # rknn_model: '0630.rknn'      # inference_backend='rknn' 时使用
 
 detection_mode: 'all'          # panel_detection.launch.py 兼容模式使用
 publish_legacy_topics: false   # 是否发布旧 PoseStamped 兼容话题
 
-class_num: 9
-class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button', 'door_button', 'air_switch']
+class_num: 10
+class_name: ['light', 'knob', 'bolt', 'nut', 'valve', 'pump', 'button', 'door_button', 'air_switch', 'board_card']
 threshold:
   confidence: 0.3
   iou: 0.01
@@ -863,9 +886,9 @@ ros2_ws/
             ├── detector_rknn.py
             ├── knob_angle.py
             ├── rgb_depth_viewer.py        ← 彩色/深度同步查看工具
-            ├── 0824.onnx                  ← 默认九类别权重
+            ├── 1013.onnx                  ← 默认十类别权重
             ├── leak_bolt.onnx             ← leak_bolt 专用权重
-            └── 0824.pt
+            └── 1013.pt
 ```
 
 ## 常见问题
@@ -900,7 +923,7 @@ Apache 2.0
 
 ## 离线视频：面板 Tag 与元件对应复核
 
-无需 ROS、相机、深度或内参，直接读取视频。使用现有 `0824.onnx`、
+无需 ROS、相机、深度或内参，直接读取视频。使用现有 `1013.onnx`、
 `detect_panel_tags`、`PanelAprilTagTracker` 和与 ROS 节点共享的
 `apply_panel_tag_rules`。默认配置也与节点共享。原有 launch、话题和深度流程不变。
 

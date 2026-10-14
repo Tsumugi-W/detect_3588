@@ -14,7 +14,7 @@ def test_default_validation_and_explicit_scene_files():
     assert resolve_tag_classes(DEFAULT_CONFIG['panel_apriltag']) == resolve_tag_classes(cfg['panel_apriltag'])
     assert resolve_tag_classes(cfg['panel_apriltag']) == {0:'button',1:'button',2:'knob',3:'knob',4:'button',5:'button',6:'button',7:'button'}
     old = merge_config(DEFAULT_CONFIG, yaml.safe_load((config_dir/'test_site.yaml').read_text()))
-    assert old['onnx_model'] == '0824.onnx'
+    assert old['onnx_model'] == DEFAULT_CONFIG['onnx_model']
     assert resolve_tag_classes(old['panel_apriltag'])[2] == 'button'
     assert resolve_tag_classes(old['panel_apriltag'])[4] == 'knob'
     assert resolve_tag_classes(old['panel_apriltag'])[7] == 'light'

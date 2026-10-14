@@ -15,12 +15,18 @@
     # 指定输出目录
     python scripts/export_model.py --pt newckpt/best.pt --output-dir weights/
 
+    # YOLOv5 checkpoint 需要训练时的 models/ 和 utils/ 源码
+    python scripts/export_model.py --pt 1013.pt --yolov5-dir /path/to/yolov5
+
 依赖:
     - torch, torchvision (导出 ONNX)
+    - YOLOv5 源码 (通过 --yolov5-dir 或 PYTHONPATH 提供)
     - onnx, onnxsim (ONNX 验证 + 简化，可选)
     - rknn-toolkit2 (ONNX -> RKNN，仅 x86，可选)
 """
 import argparse
+import hashlib
+import json
 import os
 import sys
 
@@ -33,23 +39,52 @@ def export_onnx(pt_path, onnx_path, img_size=640, simplify=True):
 
     ckpt = torch.load(pt_path, map_location='cpu', weights_only=False)
     model = ckpt.get('ema') or ckpt.get('model')
+    if model is None:
+        raise ValueError('checkpoint 中没有可导出的 model 或 ema')
     model = model.float().eval()
 
     # 打印类别信息
-    if hasattr(model, 'names'):
-        names = model.names
+    names = getattr(model, 'names', None)
+    if names is not None:
         if isinstance(names, dict):
             names = [names[i] for i in sorted(names.keys())]
         print(f'    模型类别 ({len(names)}): {names}')
 
+    # 只导出已解码的预测，与 detector_onnx.py 的后处理输入一致。
+    for module in model.modules():
+        if module.__class__.__name__ == 'Detect':
+            module.inplace = False
+            module.dynamic = False
+            module.export = True
+
+    class DecodedPredictions(torch.nn.Module):
+        """兼容仍返回原始检测头的旧版 YOLOv5。"""
+
+        def __init__(self, detector):
+            super().__init__()
+            self.detector = detector
+
+        def forward(self, images):
+            output = self.detector(images)
+            return output[0] if isinstance(output, (tuple, list)) else output
+
+    export_model = DecodedPredictions(model).eval()
     dummy = torch.zeros(1, 3, img_size, img_size)
+    with torch.no_grad():
+        # 预先建立 Detect 网格，避免 tracing 时改变计算图。
+        for _ in range(2):
+            prediction = export_model(dummy)
+        if prediction.ndim != 3 or (names is not None and
+                                    prediction.shape[-1] != 5 + len(names)):
+            raise ValueError(f'不兼容的 YOLOv5 输出尺寸: {tuple(prediction.shape)}')
 
     torch.onnx.export(
-        model, dummy, onnx_path,
+        export_model, dummy, onnx_path,
         opset_version=12,
         input_names=['images'],
         output_names=['output'],
         dynamic_axes=None,
+        dynamo=False,
     )
     print(f'    ONNX 导出完成: {onnx_path}')
 
@@ -57,7 +92,18 @@ def export_onnx(pt_path, onnx_path, img_size=640, simplify=True):
     try:
         import onnx
         onnx_model = onnx.load(onnx_path)
+        if len(onnx_model.graph.output) != 1:
+            raise ValueError('ONNX 必须只有一个已解码的检测输出')
+        with open(pt_path, 'rb') as pt_file:
+            source_sha256 = hashlib.sha256(pt_file.read()).hexdigest()
+        metadata = {
+            'stride': str(int(model.stride.max())),
+            'names': json.dumps(names, ensure_ascii=False),
+            'source_pt_sha256': source_sha256,
+        }
+        onnx.helper.set_model_props(onnx_model, metadata)
         onnx.checker.check_model(onnx_model)
+        onnx.save(onnx_model, onnx_path)
         print('    ONNX 模型验证通过')
     except ImportError:
         print('    [WARN] onnx 未安装，跳过验证')
@@ -69,6 +115,8 @@ def export_onnx(pt_path, onnx_path, img_size=640, simplify=True):
             onnx_model = onnx.load(onnx_path)
             model_sim, check = onnxsim.simplify(onnx_model)
             if check:
+                onnx.helper.set_model_props(model_sim, metadata)
+                onnx.checker.check_model(model_sim)
                 onnx.save(model_sim, onnx_path)
                 print('    ONNX 模型已简化')
             else:
@@ -128,6 +176,8 @@ def main():
                         help='输入 PyTorch 模型路径 (.pt)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='输出目录（默认与输入文件同目录）')
+    parser.add_argument('--yolov5-dir', type=str, default=None,
+                        help='YOLOv5 源码目录（需包含 models/yolo.py）')
     parser.add_argument('--format', type=str, default='onnx',
                         choices=['onnx', 'rknn', 'both'],
                         help='输出格式: onnx / rknn / both')
@@ -143,6 +193,12 @@ def main():
     parser.add_argument('--dataset', type=str, default=None,
                         help='量化校准数据集（文本文件，每行一个图像路径）')
     args = parser.parse_args()
+
+    if args.yolov5_dir:
+        yolov5_dir = os.path.abspath(args.yolov5_dir)
+        if not os.path.isfile(os.path.join(yolov5_dir, 'models', 'yolo.py')):
+            parser.error('--yolov5-dir 必须指向包含 models/yolo.py 的 YOLOv5 源码目录')
+        sys.path.insert(0, yolov5_dir)
 
     if not os.path.isfile(args.pt):
         print(f'[ERROR] 模型文件不存在: {args.pt}')
@@ -181,16 +237,17 @@ def main():
     print('转换完成！')
     print()
     print('部署步骤:')
-    print(f'  1. 将 {onnx_path} 拷贝到 panel_detection/weights/ 目录')
+    print(f'  1. ROS2: 将 {onnx_path} 放到 src/panel_detection/panel_detection/{basename}.onnx')
+    print(f'  2. ROS1: 同步到 ros1/panel_detection/models/{basename}.onnx')
     if args.format in ('rknn', 'both'):
-        print(f'  2. 将 {rknn_path} 拷贝到 RK3588 设备的 weights/ 目录')
-        print(f'  3. 修改 config/panel_detection.yaml:')
+        print(f'  3. 将 {rknn_path} 拷贝到 RK3588 设备的 weights/ 目录')
+        print(f'  4. 修改检测配置:')
         print(f'       inference_backend: "rknn"')
         print(f'       rknn_model: "weights/{basename}.rknn"')
     else:
-        print(f'  2. 修改 config/panel_detection.yaml:')
+        print(f'  3. 修改检测配置（ROS2 默认配置 / ROS1 config/panel_detection.yaml）:')
         print(f'       inference_backend: "onnx"')
-        print(f'       onnx_model: "weights/{basename}.onnx"')
+        print(f'       onnx_model: "{basename}.onnx"')
     print('=' * 60)
 
 

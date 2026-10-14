@@ -830,7 +830,7 @@ class PanelDetectionNode(Node):
             self.cfg = merge_config(DEFAULT_CONFIG, {})
 
         self.declare_parameter(
-            'onnx_model', self.cfg.get('onnx_model', '0824.onnx'))
+            'onnx_model', self.cfg.get('onnx_model', '1013.onnx'))
         self.declare_parameter(
             'onnx_threads', self.cfg.get('onnx_threads', 8))
         self.cfg['onnx_model'] = self.get_parameter('onnx_model').value
@@ -1440,7 +1440,7 @@ class PanelDetectionNode(Node):
 
         if backend == 'onnx':
             from .detector_onnx import YoloV5ORT
-            onnx_path = self.cfg.get('onnx_model', '0824.onnx')
+            onnx_path = self.cfg.get('onnx_model', '1013.onnx')
             if not os.path.isabs(onnx_path):
                 module_path = os.path.join(pkg_dir, onnx_path)
                 if os.path.isfile(module_path):
