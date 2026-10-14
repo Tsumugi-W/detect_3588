@@ -13,7 +13,7 @@ from .panel_scene import resolve_tag_classes
 
 PANEL_TAG_ID_MIN = 0
 PANEL_TAG_ID_MAX = 39
-ELIGIBLE_CLASSES = frozenset(('button', 'knob', 'light'))
+ELIGIBLE_CLASSES = frozenset(('button', 'knob', 'light', 'board_card'))
 
 
 def reclassify_buttons_without_tags(detections, assignments):
@@ -36,11 +36,14 @@ def apply_panel_tag_rules(detections, markers, tracker):
 
     Buttons require a directly decoded Tag in the current frame, including
     buttons initially classified through a cached track. Other classes retain
-    the existing short-gap tracking behavior.
+    the existing short-gap tracking behavior. Board-card tags only associate
+    with YOLO board cards and never reclassify either board cards or controls.
     """
     assignments = tracker.update(detections, markers)
     for index, assignment in assignments.items():
-        detections[index].class_name = assignment.forced_class
+        # Board tags assign identity only; the YOLO class remains authoritative.
+        if detections[index].class_name != 'board_card':
+            detections[index].class_name = assignment.forced_class
     changed = reclassify_buttons_without_tags(detections, assignments)
     changed_ids = {id(detection) for detection in changed}
     assignments = {
@@ -213,6 +216,8 @@ class PanelAprilTagTracker:
             if marker.tag_id not in self.tag_classes:
                 continue
             for detection_index in eligible:
+                if not self._can_associate(marker.tag_id, detections[detection_index]):
+                    continue
                 score = self._direct_score(marker, detections[detection_index])
                 if score is not None:
                     candidates.append((score, marker.tag_id, detection_index, marker))
@@ -240,6 +245,8 @@ class PanelAprilTagTracker:
             for detection_index in eligible:
                 if detection_index in used_detections:
                     continue
+                if not self._can_associate(tag_id, detections[detection_index]):
+                    continue
                 score = self._track_score(track, detections[detection_index])
                 if score is not None:
                     track_candidates.append((score, tag_id, detection_index))
@@ -258,6 +265,12 @@ class PanelAprilTagTracker:
             if self._frame_index - track.last_tag_frame <= self.stale_frames
         }
         return assignments
+
+    def _can_associate(self, tag_id, detection):
+        expected = self.tag_classes[tag_id]
+        if expected == 'board_card' or detection.class_name == 'board_card':
+            return expected == detection.class_name
+        return True
 
     def _make_assignment(self, detection_index, tag_id, source, marker):
         return PanelTagAssignment(
@@ -388,6 +401,7 @@ def draw_panel_tag_assignments(canvas: np.ndarray,
         'button': (0, 255, 0),
         'knob': (0, 200, 255),
         'light': (255, 255, 0),
+        'board_card': (255, 160, 0),
     }
     for detection_index, assignment in assignments.items():
         if detection_index >= len(detections):

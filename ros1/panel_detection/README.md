@@ -81,7 +81,8 @@ roslaunch panel_detection panel_detection.launch model_path:=/path/model.onnx
 
 ## 面板场景配置（与 ROS2 同步）
 
-默认 `validation_site`：T02/T03 为旋钮，T00/T01/T04/T05/T06/T07 为按钮，
+默认 `validation_site`：T02/T03 为旋钮，T00/T01/T04/T05/T06 为按钮，T07 对应板卡 `board_card`。
+T07 仅给 YOLO 板卡分配编号 8，有无 Tag 均不修改板卡类别；不把其他类别改为板卡。
 其他 Tag 不参与关联；目标编号仍为 Tag ID+1。
 `test_site` 保留旧场景：T03/T04 为旋钮，T00/T01/T02/T05/T06 为按钮，T07–39 为灯。
 
@@ -111,3 +112,19 @@ ROS1 默认 YAML 现在启用 AprilTag 几何参考，与 ROS2 相同。
 漏点模式默认开启完整漏点/管道检测和三维轴线拟合。仅检测螺栓时使用
 `config_file:=$(rospack find panel_detection)/config/leak_bolt_only.yaml`。
 三维输出协议和深度要求见仓库根 README 的“管道三维轴线”。
+
+
+### 板卡检测与位姿发布
+
+- `/panel/board_cards`（`std_msgs/String` JSON）默认发布在 panel_controls/all 模式，
+  包含时间戳、相机坐标系 `frame_id` 和所有 YOLO 板卡的 `targets`。
+  每个目标含 `class: board_card`、框、置信度、`classification_source: yolo`、
+  `id`、`tag_id`、`identity_source`、`position`（米）和 `orientation`（四元数）。
+- 验证场 T07 仅关联已检测为板卡的目标，编号仍为 8；没有 Tag 关联时 id/tag_id 为 null，
+  板卡类别和有效深度位姿仍发布。短暂丢 Tag 时沿用原有跟踪期限。
+- `position_valid` / `orientation_valid` 标明有效性。缺少有效深度时 position 为 null；
+  缺少面板法向时 orientation 为 null。姿态沿用面板法向，不估计板卡面内旋转角。
+  无板卡的帧发布空 targets，避免下游保留旧检测。
+- 有 Tag 编号且深度有效的板卡同时进入 `/panel/targets`。
+  `publish_legacy_topics:=true` 时另发 `/panel/board_card_pose`（`geometry_msgs/PoseStamped`），
+  沿用旧类别位姿接口；区分多个板卡和识别无效姿态时应使用 JSON 话题。

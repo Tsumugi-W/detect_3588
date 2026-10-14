@@ -68,6 +68,7 @@ from .panel_apriltag import (
     redraw_reclassified_detection,
 )
 from .pipe_axis_3d import estimate_pipe_axis_3d
+from .board_card import board_card_target
 from .pipe_axis import (
     detect_black_marker,
     draw_pipe_axis_result,
@@ -91,10 +92,11 @@ CLASS_TOPIC_MAP = {
     'button': '/panel/buttons',
     'door_button': '/panel/door_buttons',
     'air_switch': '/panel/air_switches',
+    'board_card': '/panel/board_card_pose',
 }
 
 MODE_CLASS_FILTERS = {
-    'panel_controls': {'button', 'door_button', 'knob', 'light'},
+    'panel_controls': {'button', 'door_button', 'knob', 'light', 'board_card'},
     'valve': {'valve'},
     'fastener': {'bolt', 'nut'},
     'leak': None,
@@ -861,6 +863,10 @@ class PanelDetectionNode(Node):
             for cls_name, topic in CLASS_TOPIC_MAP.items():
                 if self._active_classes is None or cls_name in self._active_classes:
                     self._pose_pubs[cls_name] = self.create_publisher(PoseStamped, topic, 10)
+
+        self._board_cards_pub = (
+            self.create_publisher(String, '/panel/board_cards', 10)
+            if self._process_panel_controls else None)
 
         self._targets_pub = (
             self.create_publisher(String, topics['targets'], 10)
@@ -1819,6 +1825,30 @@ class PanelDetectionNode(Node):
         else:
             self._publish_status('no_detection')
 
+    def _publish_board_cards(self, detections, assignments, depth_image,
+                             intrin, stamp):
+        if self._board_cards_pub is None:
+            return
+        normal_valid = self._panel_normal_cache is not None
+        quat = (_normal_to_quaternion(self._panel_normal_cache[0])
+                if normal_valid else None)
+        targets = []
+        for index, detection in enumerate(detections):
+            if detection.class_name != 'board_card':
+                continue
+            _, _, xyz = _estimate_detection_point(
+                detection, depth_image, intrin, self._depth_scale)
+            targets.append(board_card_target(
+                detection, assignments.get(index), xyz, quat, normal_valid))
+        msg = String()
+        msg.data = json.dumps({
+            'stamp': stamp.secs + stamp.nsecs * 1e-9,
+            'frame_id': (self._topic_color_frame_id if self._use_topic
+                         else 'camera_color_optical_frame'),
+            'targets': targets,
+        }, ensure_ascii=False)
+        self._board_cards_pub.publish(msg)
+
     def _detection_callback(self):
         if not self._camera_ready:
             self._publish_status('waiting_camera')
@@ -1914,6 +1944,9 @@ class PanelDetectionNode(Node):
                         tipLength=0.3)
 
         if not xyxy_list:
+            self._publish_board_cards([], {}, depth_image, deproj_intrin,
+                                      color_stamp if color_stamp is not None
+                                      else self.get_clock().now().to_msg())
             if self._panel_tags_enabled:
                 self._panel_tag_tracker.update([], panel_tag_markers)
                 draw_panel_tag_assignments(
@@ -2030,6 +2063,7 @@ class PanelDetectionNode(Node):
             ]
         active_xyxy_list = [det.bbox for det in frame_detections]
         if not frame_detections:
+            self._publish_board_cards([], {}, filtered_depth, deproj_intrin, stamp)
             if self._panel_tags_enabled:
                 self._panel_tag_tracker.update([], panel_tag_markers)
                 draw_panel_tag_assignments(
@@ -2055,6 +2089,10 @@ class PanelDetectionNode(Node):
                     old_class='button', color=(255, 255, 0))
             draw_panel_tag_assignments(
                 canvas, panel_tag_markers, panel_tag_assignments, frame_detections)
+
+        self._publish_board_cards(
+            frame_detections, panel_tag_assignments, filtered_depth,
+            deproj_intrin, stamp)
 
         nut_localizations = {}
         for i, det in enumerate(frame_detections):
@@ -2171,7 +2209,8 @@ class PanelDetectionNode(Node):
                 # knob 重叠退化，取所有 button/knob
                 axis_candidates = [
                     d for d in frame_detections
-                    if (not self._panel_tags_enabled or d.class_name != 'light') and
+                    if d.class_name != 'board_card' and
+                (not self._panel_tags_enabled or d.class_name != 'light') and
                     id(d) not in no_tag_light_ids and (
                         id(d) not in tagged_detection_ids or
                         d.class_name in ('button', 'knob'))
@@ -2186,7 +2225,8 @@ class PanelDetectionNode(Node):
             # 没有两个 knob 可见，取所有 button/knob
             axis_candidates = [
                 d for d in frame_detections
-                if (not self._panel_tags_enabled or d.class_name != 'light') and
+                if d.class_name != 'board_card' and
+                (not self._panel_tags_enabled or d.class_name != 'light') and
                 id(d) not in no_tag_light_ids and (
                     id(d) not in tagged_detection_ids or
                     d.class_name in ('button', 'knob'))
@@ -2248,6 +2288,8 @@ class PanelDetectionNode(Node):
         for target_id, det in matched:
             xyz = stable_xyz.get(target_id, matched_xyz[target_id])
             matched_xyz[target_id] = xyz
+            if det.class_name == 'board_card' and not _valid_point_3d(xyz):
+                continue
             tag_assignment = tag_assignment_by_detection.get(id(det))
 
             target_info = {
@@ -2256,6 +2298,7 @@ class PanelDetectionNode(Node):
                 'tag_id': (tag_assignment.tag_id
                            if tag_assignment is not None else None),
                 'classification_source': (
+                    'yolo' if det.class_name == 'board_card' else
                     tag_assignment.source
                     if tag_assignment is not None else 'yolo_layout'),
                 'position': {'x': round(xyz[0], 4),
@@ -2265,6 +2308,10 @@ class PanelDetectionNode(Node):
                                 'z': quat[2], 'w': quat[3]},
                 'confidence': round(det.confidence, 3),
             }
+            if det.class_name == 'board_card':
+                target_info.update(board_card_target(
+                    det, tag_assignment, xyz, quat,
+                    self._panel_normal_cache is not None))
             targets_output.append(target_info)
 
             # 兼容旧话题

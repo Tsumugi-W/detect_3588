@@ -179,3 +179,64 @@ def test_only_decoded_ids_00_to_39_are_returned_from_image():
     markers = detect_panel_tags(image, {'min_area_px': 100.0})
 
     assert [marker.tag_id for marker in markers] == [7]
+
+
+def test_validation_tag07_assigns_board_identity_without_class_correction():
+    from panel_detection.panel_apriltag import apply_panel_tag_rules, draw_panel_tag_assignments
+    detection = _detection('board_card', 100.0)
+    assignments, changed = apply_panel_tag_rules(
+        [detection], [_marker(7, 100.0)], PanelAprilTagTracker())
+    assert detection.class_name == 'board_card'
+    assert changed == []
+    assert assignments[0].tag_id == 7
+    assert assignments[0].target_id == 8
+    canvas = np.zeros((180, 240, 3), dtype=np.uint8)
+    draw_panel_tag_assignments(canvas, [_marker(7, 100.0)], assignments, [detection])
+    assert canvas.any()
+
+
+def test_board_card_keeps_yolo_class_without_tags_and_after_track_expiry():
+    from panel_detection.panel_apriltag import apply_panel_tag_rules
+    tracker = PanelAprilTagTracker({'stale_frames': 1})
+    for markers, expected_assignment in [([], False), ([_marker(7, 100.0)], True),
+                                          ([], True), ([], False)]:
+        detection = _detection('board_card', 100.0)
+        assignments, changed = apply_panel_tag_rules([detection], markers, tracker)
+        assert detection.class_name == 'board_card'
+        assert changed == []
+        assert bool(assignments) == expected_assignment
+
+
+def test_board_tag_cannot_claim_other_classes_or_cached_control():
+    from panel_detection.panel_apriltag import apply_panel_tag_rules
+    for class_name in ['button', 'knob', 'light', 'door_button']:
+        tracker = PanelAprilTagTracker()
+        tracker.update([_detection('board_card', 100.0)], [_marker(7, 100.0)])
+        detection = _detection(class_name, 100.0)
+        assignments, _ = apply_panel_tag_rules([detection], [_marker(7, 100.0)], tracker)
+        assert assignments == {}
+        assert detection.class_name != 'board_card'
+        assert tracker.update([_detection(class_name, 100.0)], []) == {}
+
+
+def test_other_tags_cannot_reclassify_board_cards_directly_or_via_tracking():
+    from panel_detection.panel_apriltag import apply_panel_tag_rules
+    for scene, tag_id in [('validation_site', 0), ('validation_site', 2), ('test_site', 7)]:
+        tracker = PanelAprilTagTracker({'scene': scene})
+        tracker.update([_detection('light', 100.0)], [_marker(tag_id, 100.0)])
+        for markers in [[_marker(tag_id, 100.0)], []]:
+            detection = _detection('board_card', 100.0)
+            assignments, changed = apply_panel_tag_rules([detection], markers, tracker)
+            assert assignments == {}
+            assert changed == []
+            assert detection.class_name == 'board_card'
+
+
+def test_board_tag_matches_board_when_nearer_control_is_present():
+    from panel_detection.panel_apriltag import apply_panel_tag_rules
+    detections = [_detection('knob', 100.0), _detection('board_card', 105.0)]
+    assignments, changed = apply_panel_tag_rules(
+        detections, [_marker(7, 100.0)], PanelAprilTagTracker())
+    assert set(assignments) == {1}
+    assert [d.class_name for d in detections] == ['knob', 'board_card']
+    assert changed == []

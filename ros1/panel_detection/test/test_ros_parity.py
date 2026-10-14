@@ -12,7 +12,7 @@ def test_all_non_ros_modules_identical():
     a,b=roots()
     adapters={'panel_detect_node.py','fastener_precision_recorder.py','rgb_depth_viewer.py'}
     for p in a.rglob('*.py'):
-        if p.name not in adapters:
+        if p.name not in adapters and not p.name.endswith('.launch.py'):
             assert p.read_bytes()==(b/p.relative_to(a)).read_bytes(),str(p)
 
 
@@ -28,7 +28,7 @@ def normalized_method(path, name):
 
 def test_entire_detection_and_leak_algorithms_identical():
     a,b=roots()
-    for name in ['_detection_callback','_process_leak_frame','_publish_camera_topics','_publish_status']:
+    for name in ['_detection_callback','_process_leak_frame','_publish_camera_topics','_publish_status','_publish_board_cards']:
         assert normalized_method(a/'panel_detect_node.py',name)==normalized_method(b/'panel_detect_node.py',name),name
 
 

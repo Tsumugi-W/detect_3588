@@ -10,4 +10,5 @@ panel_apriltag:
     4: button
     5: button
     6: button
-    7: button
+    7: board_card
+# T07 only assigns identity to YOLO board_card detections; no class correction.

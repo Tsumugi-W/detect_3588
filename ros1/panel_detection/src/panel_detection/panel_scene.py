@@ -3,7 +3,8 @@ from copy import deepcopy
 
 DEFAULT_SCENE = 'validation_site'
 SCENE_TAG_CLASSES = {
-    'validation_site': {i: ('knob' if i in (2, 3) else 'button') for i in range(8)},
+    'validation_site': {i: ('board_card' if i == 7 else
+                            'knob' if i in (2, 3) else 'button') for i in range(8)},
     'test_site': {i: ('button' if i in (0, 1, 2, 5, 6) else
                       'knob' if i in (3, 4) else 'light') for i in range(40)},
 }
@@ -24,7 +25,7 @@ def resolve_tag_classes(cfg=None):
         tag_id = int(key)
         if not 0 <= tag_id <= 39 or tag_id in result:
             raise ValueError(f'Invalid or duplicate Tag ID: {key!r}')
-        if value not in ('button', 'knob', 'light'):
+        if value not in ('button', 'knob', 'light', 'board_card'):
             raise ValueError(f'Invalid class for T{tag_id:02d}: {value!r}')
         result[tag_id] = value
     return result

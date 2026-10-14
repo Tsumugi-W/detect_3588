@@ -963,8 +963,8 @@ Tag 识别到了但 YOLO 未检出对应元件时，只画 Tag，不虚构元件
 
 ## 场景配置：测试场与验证场
 
-默认场景现为 **验证场 `validation_site`**：T00/T01/T04/T05/T06/T07 为按钮，
-T02/T03 为旋钮；仅 T00–T07 有效，其他 Tag 不参与关联。目标编号仍为 Tag ID+1。
+默认场景现为 **验证场 `validation_site`**：T00/T01/T04/T05/T06 为按钮，
+T02/T03 为旋钮，T07 对应板卡 `board_card`；仅 T00–T07 有效，其他 Tag 不参与关联。目标编号仍为 Tag ID+1。
 测试场 `test_site` 保留旧规则：T00/T01/T02/T05/T06 为按钮，T03/T04 为旋钮，
 T07–T39 为指示灯。
 
@@ -988,13 +988,16 @@ ROS launch 也可以使用 `config_path:=配置文件路径`。ROS 使用安装�
 
 - `panel_apriltag.scene` 选择预设，缺省为 `validation_site`；未知名称立即报错。
 - 可选 `panel_apriltag.tag_classes` 为完整 ID→类别映射，**整体替换**预设映射，
-  未列出的 Tag 忽略；支持 `button`、`knob`、`light`，ID 范围 0–39。
+  未列出的 Tag 忽略；支持 `button`、`knob`、`light`、`board_card`，ID 范围 0–39。
   请用整数键（例如 `2`），不要混用 `2` 与 `"02"`。
 - 部分 YAML 配置递归覆盖默认配置，无需复制模型、阈值等无关参数。
 - `layout_fallback` 控制 ROS 节点的旧七元件布局回退编号：测试场默认开启，
   验证场默认关闭，避免漏 Tag 时按旧场景分配 ID。离线工具仅复核 Tag 关联，始终不运行布局回退。
 - 没有直接 Tag 关联的 button 改判为 light 的原有规则保持不变；
   `tag_classes` 只对成功关联到 Tag 的元件生效，不会将所有未匹配目标改成按钮。
+- 板卡以 YOLO 类别为准：T07 仅关联已经检测为 `board_card` 的目标并分配编号 8，
+  不把其他类别改为板卡，也不把板卡改为按钮/旋钮/灯；无 Tag 时仍保留板卡框，
+  没有有效编号的板卡不发布为已编号目标。短暂丢 Tag 可沿用原有跟踪关联。
 - 场景映射不改变旋钮角度算法；本次视频复核只验证类别和 Tag 关联。
 
 新增其他 Tag 时，在验证场配置的 `tag_classes` 中显式添加其 ID 与类别。
@@ -1060,3 +1063,19 @@ python3 scripts/annotate_yolo_images.py "/data/little8/1013_frames_1hz/Screencas
 仅使用 YOLO 原始框、类别和置信度，不经过 Tag、场景类别映射或布局修正。
 `predictions.jsonl` 保存每张图片的预测；坐标相对于原图，输出 PNG 顶部另加 32 像素标题栏。
 `summary.json` 记录模型、阈值、裁剪区域和预测计数；这些不是人工真值，不计算准确率。
+
+
+### 板卡检测与位姿发布
+
+- `/panel/board_cards`（`std_msgs/String` JSON）默认发布在 panel_controls/all 模式，
+  包含时间戳、相机坐标系 `frame_id` 和所有 YOLO 板卡的 `targets`。
+  每个目标含 `class: board_card`、框、置信度、`classification_source: yolo`、
+  `id`、`tag_id`、`identity_source`、`position`（米）和 `orientation`（四元数）。
+- 验证场 T07 仅关联已检测为板卡的目标，编号仍为 8；没有 Tag 关联时 id/tag_id 为 null，
+  板卡类别和有效深度位姿仍发布。短暂丢 Tag 时沿用原有跟踪期限。
+- `position_valid` / `orientation_valid` 标明有效性。缺少有效深度时 position 为 null；
+  缺少面板法向时 orientation 为 null。姿态沿用面板法向，不估计板卡面内旋转角。
+  无板卡的帧发布空 targets，避免下游保留旧检测。
+- 有 Tag 编号且深度有效的板卡同时进入 `/panel/targets`。
+  `publish_legacy_topics:=true` 时另发 `/panel/board_card_pose`（`geometry_msgs/PoseStamped`），
+  沿用旧类别位姿接口；区分多个板卡和识别无效姿态时应使用 JSON 话题。
