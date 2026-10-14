@@ -1,5 +1,51 @@
 # ROS2 面板检测功能包 (RK3588 + Orbbec Gemini 336)
 
+## 快速启动：面板 / 螺栓检测
+
+**每个终端先加载环境**（当前机器工作空间为 `~/project/panel_ws`）：
+
+```bash
+cd ~/project/panel_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+```
+
+**终端 1：启动相机**。相机话题已经运行时可跳过。
+
+```bash
+ros2 launch panel_detection camera.launch.py
+```
+
+**终端 2：启动面板检测（按钮、旋钮、灯、板卡）**：
+
+```bash
+ros2 launch panel_detection panel_controls.launch.py
+```
+
+**终端 3：启动螺栓 / 螺母检测**：
+
+```bash
+ros2 launch panel_detection fastener_detection.launch.py show_gui:=true
+```
+
+两个检测节点可订阅同一套相机话题。面板默认弹出 OpenCV 窗口；上面的紧固件命令通过 `show_gui:=true` 开启窗口，紧固件 launch 默认不显示窗口。按 `q` 或 `Esc` 退出。
+SSH 启动并希望窗口出现在这台机器已登录的显示器上时，先在该终端执行：
+
+```bash
+export DISPLAY=:0
+export XAUTHORITY=/run/user/$(id -u)/gdm/Xauthority
+```
+
+上述显示设置适用于当前机器的 GNOME/X11 会话；其他桌面需使用对应的 DISPLAY 和授权文件。
+无桌面时可使用通用入口关闭窗口：
+
+```bash
+ros2 launch panel_detection panel_detection.launch.py use_topic:=true detection_mode:=panel_controls show_gui:=false
+```
+
+面板结果：`/panel/targets`、`/panel/board_cards`；紧固件结果：`/fasteners/targets`、`/fasteners/geometry`。
+ROS1 命令见 [ROS1 README](ros1/panel_detection/README.md#快速启动面板--螺栓检测)。
+
 基于 YOLOv5 + 深度相机的操作面板实时 3D 检测系统，封装为标准 ROS2 Humble 功能包。
 
 检测 10 类目标：指示灯(light)、旋钮(knob)、螺栓(bolt)、螺母(nut)、阀门(valve)、泵(pump)、按钮(button)、门按钮(door_button)、空气开关(air_switch)、板卡(board_card)。支持目标注册编号、旋钮角度估计、螺栓/螺母/阀门轴线方向估计，以及管道漏点检测、管道轴线方向估计和 leak_bolt（加固螺栓）定位与位姿估计。
@@ -15,7 +61,7 @@ Orbbec 官方驱动 (独立 launch)
             │
             ▼
 检测节点按任务 launch 拆分
-    ├── panel_controls.launch.py     → /panel/targets, /panel/knob_angles
+    ├── panel_controls.launch.py     → /panel/targets, /panel/board_cards, /panel/knob_angles
     ├── valve_detection.launch.py    → /valve/targets, /valve/geometry
     ├── fastener_detection.launch.py → /fasteners/targets, /fasteners/geometry
     └── leak_detection.launch.py     → /leak/targets, /leak/pipe_axis
@@ -154,7 +200,7 @@ ros2 launch panel_detection camera.launch.py
 ros2 launch panel_detection panel_controls.launch.py
 ```
 
-启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 同时运行 YOLO 和 tag36h11 检测，用 Tag 强制区分并编号按钮、旋钮和指示灯；Tag 未关联时保留原有布局编号回退。`valve_detection.launch.py` 直接发布阀门结果；`fastener_detection.launch.py` 会对同一安装面的螺栓/螺母建立局部 4 槽位编号。按 `q` 或 `ESC` 退出。
+启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 同时运行 YOLO 和 tag36h11 检测，默认使用验证场配置：T02/T03 对应旋钮，T00/T01/T04/T05/T06 对应按钮，T07 仅给 YOLO 板卡关联编号 8。板卡类别始终来自 YOLO；验证场默认关闭旧布局编号回退。`valve_detection.launch.py` 直接发布阀门结果；`fastener_detection.launch.py` 会对同一安装面的螺栓/螺母建立局部 4 槽位编号。按 `q` 或 `ESC` 退出。
 
 ## 启动方式与参数配置
 
@@ -164,7 +210,7 @@ ros2 launch panel_detection panel_controls.launch.py
 
 ```bash
 ./run.sh camera              # 启动相机
-./run.sh panel               # 面板检测 (light/knob/button)
+./run.sh panel               # 面板检测 (light/knob/button/board_card)
 ./run.sh fastener            # 螺栓螺帽检测
 ./run.sh valve               # 阀门检测
 ./run.sh leak                # 漏点+管道+leak_bolt 检测
@@ -307,8 +353,8 @@ src/panel_detection/scripts/estimate_pipe_axis.py \
 | `publish_legacy_topics` | `false` | 是否发布 `/panel/valves`、`/panel/bolts` 等旧 PoseStamped 兼容话题 | 旧下游仍订阅这些话题时才打开 |
 | `capture_dir` | 空字符串 | 非空时按 ROS 图像时间戳保存完整检测 canvas | bag 批量复核或制作检测截图时设置 |
 | `capture_hz` | `1.0` | `capture_dir` 启用时的输入采样和画面保存频率 | 需要其他采样频率时修改 |
-| `show_gui` | `true` | 是否显示 OpenCV 检测窗口 | 无桌面批处理时设为 `false` |
-| `use_panel_tags` | `true` | 使用 tag36h11 ID 00-39 强制面板元器件分类和编号 | 临时使用无 Tag 的旧面板时设为 `false` |
+| `show_gui` | 通用入口 `true`；紧固件入口 `false` | 是否显示 OpenCV 检测窗口 | 无桌面批处理时设为 `false` |
+| `use_panel_tags` | `true` | 按场景关联 tag36h11；按钮/旋钮/灯可修正类别，板卡只关联编号 | 临时使用无 Tag 的旧面板时设为 `false` |
 
 ### 指定配置文件
 
@@ -344,23 +390,30 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 本节只适用于 `panel_controls.launch.py`。阀门和螺栓/螺母 launch 不做面板编号注册。
 
-面板元器件上方使用边长 20 mm 的 tag36h11：
+面板元器件上方使用边长 20 mm 的 tag36h11，**默认场景是验证场**：
 
-- Tag 00、01、02、05、06：强制识别为 `button`
-- Tag 03、04：强制识别为 `knob`
-- Tag 07-39：强制识别为 `light`
-- 下游 `id = tag_id + 1`，因此 Tag 00 对应目标 ID 1，Tag 39 对应目标 ID 40
+| Tag ID | 验证场类别 | 关联规则 | 下游目标编号 |
+|--------|------------|----------|--------------|
+| 00、01、04、05、06 | `button` | 成功关联后修正类别 | Tag ID + 1 |
+| 02、03 | `knob` | 成功关联后修正类别 | 3、4 |
+| 07 | `board_card` | 只关联 YOLO 板卡，不修改任何目标类别 | 8 |
+| 08–39 | — | 不参与验证场关联 | — |
 
-每帧先运行 YOLO，再检测成功解码的 Tag。Tag 必须位于元器件 bbox 上方并通过水平距离、垂直间距和一对一关联门控，才能覆盖 YOLO 类别。当前帧仍有其他有效 Tag 时，单个 Tag 的短暂漏检会使用有限帧跟踪结果；超过 `stale_frames` 后自动失效，避免相机移动后继承错误编号。
+测试场 `test_site` 保留旧映射：00/01/02/05/06 为按钮，03/04 为旋钮，07–39 为灯。
+通过 `config_path:=配置文件路径` 切换场景；详见“场景配置：测试场与验证场”。
+
+每帧先运行 YOLO，再解码 Tag。Tag 必须位于目标中心上方，并通过水平距离、垂直间距和
+一对一关联门控。板卡 Tag 只能关联同为 `board_card` 的 YOLO 结果；其他类别的 Tag 不能
+给板卡改类或编号。短暂漏 Tag 可沿用有限帧跟踪，超过 `stale_frames` 后关联失效。
 
 面板模式启用 Tag 识别时，每个最终分类为 `button` 的目标都必须在当前帧直接
 关联到自己的 AprilTag。没有直接关联 Tag 的 YOLO `button` 会强制改为 `light`，
 即使画面中其他位置存在 Tag，或者历史跟踪仍有该目标的 Tag ID，也不能保留为
 `button`；面板行布局同样不能把未关联 Tag 的 `light` 提升为 `button`。该规则
-不影响 `door_button`、`knob` 或其他任务模式；`use_panel_tags:=false` 时仍保留
+不影响 `door_button`、`knob`、`board_card` 或其他任务模式；`use_panel_tags:=false` 时仍保留
 旧的无 Tag 分类和布局回退行为。
 
-没有关联到 Tag 的按钮和旋钮仍使用原有类别、颜色和面板行布局编号作为兼容回退。可视化中 `Txx` 是原始 Tag ID，`#n` 是发布给下游的目标 ID，连线表示 Tag 与元器件的关联。使用无 Tag 的旧面板时可启动：
+验证场默认关闭布局编号回退；测试场开启。关闭 Tag 识别时可使用旧布局编号流程。板卡不参与按钮/旋钮的行布局拟合和回退编号。可视化中 `Txx` 是原始 Tag ID，`#n` 是发布给下游的目标 ID，连线表示 Tag 与元器件的关联。使用无 Tag 的旧面板时可启动：
 
 ```bash
 ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
@@ -398,7 +451,66 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 }
 ```
 
-位置单位：**米 (m)**，相机坐标系。`tag_id` 为成功关联的原始 Tag 编号，无 Tag 回退时为 `null`。`classification_source` 为 `apriltag_36h11`、`apriltag_track` 或 `yolo_layout`。
+位置单位：**米 (m)**，相机坐标系。`tag_id` 为成功关联的原始 Tag 编号，无 Tag 回退时为 `null`。`classification_source` 对原有元件为 `apriltag_36h11`、`apriltag_track` 或 `yolo_layout`。板卡固定为 `yolo`，关联来源另见 `identity_source`；只有已关联编号且深度有效的板卡进入此话题。板卡位姿有效性字段与 `/panel/board_cards` 一致。
+
+### /panel/board_cards (String, JSON) — 板卡检测与位姿
+
+`panel_controls` / `all` 模式默认发布所有 YOLO 板卡，包括没有 Tag 关联的板卡。
+板卡只框固定的白色矩形外框，不扩展到拉手或被抽出的面板。
+
+```json
+{
+  "stamp": 1716192000.123,
+  "frame_id": "camera_color_optical_frame",
+  "targets": [
+    {
+      "id": 8,
+      "tag_id": 7,
+      "class": "board_card",
+      "classification_source": "yolo",
+      "identity_source": "apriltag_36h11",
+      "bbox": [510.0, 92.0, 892.0, 607.0],
+      "confidence": 0.91,
+      "position_valid": true,
+      "orientation_valid": true,
+      "position": {"x": 0.068, "y": -0.057, "z": 1.0},
+      "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+      "orientation_source": "panel_normal"
+    }
+  ]
+}
+```
+
+| 字段 / 情况 | 含义 |
+|-------------|------|
+| `id` / `tag_id` | 验证场 T07 对应编号 8；无有效关联时均为 null |
+| `classification_source` | 固定 `yolo`；有无 Tag 均不改板卡类别 |
+| `identity_source` | 直接 Tag 为 `apriltag_36h11`，短暂丢失跟踪为 `apriltag_track`，无关联为 null |
+| `bbox` | 原图像素坐标 `[x1, y1, x2, y2]` |
+| `position` | 深度反投影得到的检测框中心位置，单位米，坐标系由顶层 `frame_id` 指定 |
+| `position_valid: false` | 有效深度缺失，`position` 为 null，不能作为有效位置使用 |
+| `orientation` | 沿用面板法向形成的四元数，不估计板卡面内旋转角 |
+| `orientation_valid: false` | 面板法向不可用，`orientation` / `orientation_source` 为 null |
+| `targets: []` | 当前帧没有板卡，下游应清空旧检测 |
+
+没有 Tag 关联仍发布板卡框和有效位姿；超过跟踪期限后编号清空，不会改为按钮或灯。
+位置与姿态独立标明有效性：有效深度缺失时，之前获得的面板法向仍可能有效。
+有编号且深度有效的板卡同时进入 `/panel/targets`。
+开启 `publish_legacy_topics:=true` 后另发 `/panel/board_card_pose`（PoseStamped）；
+该兼容话题没有身份和有效性字段，多目标或姿态有效性判断应使用 JSON 话题。
+
+
+**插拔状态对位置的影响**：当前深度取检测框中心附近 7×7 像素的有效值中位数，
+没有单独提取白色外框。插上时可能采到插入件，拔出后可能采到更深的插槽/背景；
+即使框中心不变，深度及反投影位置也可能改变。手部遮挡和框抖动还会改变采样区域。
+`position_valid` 只检查数值有效，不保证采样表面属于固定外框；Tag 07 关联不消除这一影响。
+需要插拔前后位置一致时，应从固定白色外框拟合平面，再求外框中心射线与平面的交点，
+排除中央插槽、插入件及遮挡；当前版本尚未实现该几何定位。
+
+```bash
+ros2 topic echo /panel/board_cards
+ros2 launch panel_detection panel_controls.launch.py publish_legacy_topics:=true
+```
 
 ### /panel/knob_angles (String, JSON) — 面板旋钮角度
 
@@ -416,7 +528,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 }
 ```
 
-面板定义中只有按钮和旋钮；该话题只发布旋钮角度，`knob_angles` 内每个条目的格式保持不变。旋钮 `angle` 以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。
+该话题只发布旋钮角度，不混入板卡信息，`knob_angles` 内每个条目的格式保持不变。旋钮 `angle` 以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。
 
 ### /valve/targets (String, JSON) — 阀门位置
 
@@ -651,6 +763,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 | `/panel/nuts` | 螺母 |
 | `/panel/valves` | 阀门 |
 | `/panel/pumps` | 泵 |
+| `/panel/board_card_pose` | 板卡（有效深度，PoseStamped，不携带 Tag ID 或有效性字段） |
 
 `/panel/nuts` 发布的是 refined 后的螺母操作点：像素中心来自六角螺母外轮廓拟合，深度来自外圈 mask 采样并排除中心螺丝/螺杆。refined 失败或外圈深度无效时不会发布 `/panel/nuts`，避免机械臂拿到错误点。
 
@@ -661,7 +774,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 ros2 topic list
 ros2 topic echo /panel/targets
 ros2 topic echo /panel/knob_angles
-ros2 topic echo /panel/labels
+ros2 topic echo /panel/board_cards
 ros2 topic echo /valve/geometry
 ros2 topic echo /valve/targets
 ros2 topic echo /valve/status
@@ -718,8 +831,9 @@ class PanelSubscriber(Node):
 `1013.onnx`；ROS1 使用 `ros1/panel_detection/models/1013.onnx` 的同一份模型。
 ONNX 为 FP32、opset 12、固定输入 `[1, 3, 640, 640]`，输出为已解码的
 `[1, 25200, 15]`，NMS 由检测器执行。十类别顺序与下方配置一致，
-新增 `board_card` 的类别索引为 9。`all` 模式的 Canvas 和原始 YOLO 图片标注
-可显示板卡；各专用任务模式沿用原有类别筛选与话题。
+新增 `board_card` 的模型类别索引为 9。`panel_controls` 和 `all` 模式都显示板卡，
+默认发布 `/panel/board_cards`；阀门、紧固件和漏点模式仍保持各自类别筛选。
+人工标注数据集的类别编号可能重新排列，评估时应按类别名称映射。
 
 运行检测只需 ONNX Runtime；若要重新转换 PT，在转换环境准备 YOLOv5 源码
 及导出依赖。`1013.pt` 训练时的 YOLOv5 提交为
@@ -855,7 +969,7 @@ ros2_ws/
         ├── setup.py
         ├── launch/
         │   ├── camera.launch.py             ← 启动相机
-        │   ├── panel_controls.launch.py     ← 面板按钮/旋钮/指示灯
+        │   ├── panel_controls.launch.py     ← 面板按钮/旋钮/指示灯/板卡
         │   ├── valve_detection.launch.py    ← 阀门
         │   ├── fastener_detection.launch.py ← 螺栓/螺母
         │   ├── leak_detection.launch.py     ← 管道漏点
@@ -1017,11 +1131,15 @@ ROS1 新增精度记录器、同步 RGB/深度查看器和对应 launch，安装
 录屏离线复核使用根目录的 `scripts/review_panel_video.py`，不依赖 ROS 运行时。
 相机驱动使用平台原生驱动，RKNN/相机 SDK/OCR 的可选依赖需要按目标机器安装。
 
-验证环境：ROS1 Noetic、ROS2 Galactic。两端均通过完整单元测试和五种模式的合成 RGB-D
+初次功能同步验证环境：ROS1 Noetic、ROS2 Galactic。两端均通过完整单元测试和五种模式的合成 RGB-D
 运行验证；查看器完成同步图像解码与截图，记录器完成初始化及输出文件关闭。
 真实相机及 RK3588 NPU 未接入本轮测试。构建在独立目录验证，不覆盖现有部署。
 LAB 的用户级 setuptools 与系统 packaging 存在版本冲突，ROS2 构建时使用临时
 `packaging==24.2` 路径覆盖；未修改机器全局依赖。
+
+板卡关联/话题更新已在 ROS1 Noetic 与 ROS2 Humble 验证：两端各 92 项测试通过，
+catkin/colcon 构建通过；ROS2 实际话题测试使用已有录屏图片和模拟深度，覆盖直接 Tag、
+Tag 丢失、无效深度和空检测。尚未验证真实板卡深度精度及插拔前后的位姿一致性。
 
 ## 管道三维轴线
 
@@ -1063,19 +1181,3 @@ python3 scripts/annotate_yolo_images.py "/data/little8/1013_frames_1hz/Screencas
 仅使用 YOLO 原始框、类别和置信度，不经过 Tag、场景类别映射或布局修正。
 `predictions.jsonl` 保存每张图片的预测；坐标相对于原图，输出 PNG 顶部另加 32 像素标题栏。
 `summary.json` 记录模型、阈值、裁剪区域和预测计数；这些不是人工真值，不计算准确率。
-
-
-### 板卡检测与位姿发布
-
-- `/panel/board_cards`（`std_msgs/String` JSON）默认发布在 panel_controls/all 模式，
-  包含时间戳、相机坐标系 `frame_id` 和所有 YOLO 板卡的 `targets`。
-  每个目标含 `class: board_card`、框、置信度、`classification_source: yolo`、
-  `id`、`tag_id`、`identity_source`、`position`（米）和 `orientation`（四元数）。
-- 验证场 T07 仅关联已检测为板卡的目标，编号仍为 8；没有 Tag 关联时 id/tag_id 为 null，
-  板卡类别和有效深度位姿仍发布。短暂丢 Tag 时沿用原有跟踪期限。
-- `position_valid` / `orientation_valid` 标明有效性。缺少有效深度时 position 为 null；
-  缺少面板法向时 orientation 为 null。姿态沿用面板法向，不估计板卡面内旋转角。
-  无板卡的帧发布空 targets，避免下游保留旧检测。
-- 有 Tag 编号且深度有效的板卡同时进入 `/panel/targets`。
-  `publish_legacy_topics:=true` 时另发 `/panel/board_card_pose`（`geometry_msgs/PoseStamped`），
-  沿用旧类别位姿接口；区分多个板卡和识别无效姿态时应使用 JSON 话题。

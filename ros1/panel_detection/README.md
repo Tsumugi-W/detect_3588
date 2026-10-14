@@ -1,5 +1,38 @@
 # panel_detection (ROS1 Noetic)
 
+## 快速启动：面板 / 螺栓检测
+
+**每个终端先加载 ROS1 工作空间**（路径按实际部署修改）：
+
+```bash
+cd ~/panel_ros1_ws
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+```
+
+**面板检测（相机已单独启动）**：
+
+```bash
+roslaunch panel_detection panel_controls.launch
+```
+
+**螺栓 / 螺母检测（另开终端）**：
+
+```bash
+roslaunch panel_detection fastener_detection.launch
+```
+
+默认订阅 `/camera_d435_0` 的彩色图和对齐深度；相机命名不同可加 `camera_name:=名称`。
+ROS1 默认通过图像话题查看检测画面：
+
+```bash
+rqt_image_view /panel/debug_image
+rqt_image_view /fasteners/debug_image
+```
+
+有桌面时可给检测 launch 加 `show_gui:=true` 弹出 OpenCV 窗口。
+面板结果包含 `/panel/targets`、`/panel/board_cards`；紧固件结果见 `/fasteners/targets`、`/fasteners/geometry`。
+
 This package ports the current ROS2 detector to ROS1 Noetic while keeping the
 same YOLO, target numbering, angle, 3D position and axis-estimation algorithms.
 It consumes color-aligned D435 depth and uses `1013.onnx` by default.
@@ -7,7 +40,7 @@ It consumes color-aligned D435 depth and uses `1013.onnx` by default.
 ## Build
 
 ```bash
-cd ~/panel_ros1_ws_fd7aaef
+cd ~/panel_ros1_ws
 source /opt/ros/noetic/setup.bash
 catkin_make
 source devel/setup.bash
@@ -49,7 +82,7 @@ rqt_image_view /panel/debug_image
 
 Panel mode preserves the existing formats:
 
-- `/panel/targets`, `/panel/knob_angles`, `/panel/status`, `/panel/distance`
+- `/panel/targets`, `/panel/board_cards`, `/panel/knob_angles`, `/panel/status`, `/panel/distance`
 
 Dedicated modes publish only their own object family:
 
@@ -60,12 +93,18 @@ In panel mode, every final `button` must be directly associated with its own
 AprilTag in the current frame. A YOLO `button` without a direct assignment is
 treated as `light`, even when another tag is visible or a stale tracked tag ID
 exists. Layout fallback cannot promote an untagged `light` back to `button`.
-`door_button`, knobs and non-panel modes are unaffected. Set
+`door_button`, knobs, YOLO board cards and non-panel modes are unaffected. Set
 `use_panel_tags:=false` to retain the legacy no-tag classification behavior.
 
 All structured results use `std_msgs/String` JSON. Debug images use
-`sensor_msgs/Image`. Legacy per-class `PoseStamped` topics remain available via
-`publish_legacy_topics:=true`, but are disabled by default.
+`sensor_msgs/Image`. Legacy per-class `PoseStamped` topics are disabled by default.
+For panel mode with legacy topics, use the general launch:
+
+```bash
+roslaunch panel_detection panel_detection.launch detection_mode:=panel_controls publish_legacy_topics:=true
+```
+
+The task-specific ROS1 wrapper does not expose `publish_legacy_topics`.
 
 ## Model
 
@@ -114,7 +153,7 @@ ROS1 默认 YAML 现在启用 AprilTag 几何参考，与 ROS2 相同。
 三维输出协议和深度要求见仓库根 README 的“管道三维轴线”。
 
 
-### 板卡检测与位姿发布
+## 板卡检测与位姿发布
 
 - `/panel/board_cards`（`std_msgs/String` JSON）默认发布在 panel_controls/all 模式，
   包含时间戳、相机坐标系 `frame_id` 和所有 YOLO 板卡的 `targets`。
@@ -126,5 +165,22 @@ ROS1 默认 YAML 现在启用 AprilTag 几何参考，与 ROS2 相同。
   缺少面板法向时 orientation 为 null。姿态沿用面板法向，不估计板卡面内旋转角。
   无板卡的帧发布空 targets，避免下游保留旧检测。
 - 有 Tag 编号且深度有效的板卡同时进入 `/panel/targets`。
-  `publish_legacy_topics:=true` 时另发 `/panel/board_card_pose`（`geometry_msgs/PoseStamped`），
+  通用入口 `panel_detection.launch publish_legacy_topics:=true` 时另发 `/panel/board_card_pose`（`geometry_msgs/PoseStamped`），
   沿用旧类别位姿接口；区分多个板卡和识别无效姿态时应使用 JSON 话题。
+
+
+```bash
+# 默认面板入口已发布板卡 JSON；无需开启旧话题
+rostopic echo /panel/board_cards
+rostopic echo /panel/targets
+# 如需同时发布板卡 PoseStamped，使用通用入口（相机命名保留默认 camera_d435_0）
+roslaunch panel_detection panel_detection.launch detection_mode:=panel_controls publish_legacy_topics:=true
+rostopic echo /panel/board_card_pose
+```
+
+完整 JSON 示例、字段含义和无效位姿处理见[根 README 的板卡话题说明](../../README.md#panelboard_cards-string-json--板卡检测与位姿)。
+板卡只框固定白色矩形外框；位置由检测框中心深度反投影，姿态沿用面板法向，不估计面内旋转。
+`position_valid` 和 `orientation_valid` 需分别检查；目标消失时收到空 `targets`。
+
+当前中心深度采样可能受到插入件、插槽背景和手部遮挡影响；`position_valid` 不保证采样点属于固定外框。
+插拔前后的几何位置一致性尚未验证，限制与改进方向见根 README 板卡话题一节。
