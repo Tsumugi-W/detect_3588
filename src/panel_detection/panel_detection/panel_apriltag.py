@@ -188,7 +188,7 @@ class PanelAprilTagTracker:
     def __init__(self, cfg=None):
         cfg = cfg or {}
         self.tag_classes = resolve_tag_classes(cfg)
-        self.max_horizontal_ratio = float(cfg.get('max_horizontal_ratio', 1.35))
+        self.max_horizontal_ratio = float(cfg.get('max_horizontal_ratio', 0.65))
         self.max_vertical_ratio = float(cfg.get('max_vertical_ratio', 3.0))
         self.overlap_tolerance_ratio = float(
             cfg.get('overlap_tolerance_ratio', 0.35))
@@ -290,31 +290,51 @@ class PanelAprilTagTracker:
         mx1, my1, mx2, my2 = marker.bounds
         marker_width = max(1.0, mx2 - mx1)
         marker_height = max(1.0, my2 - my1)
-        dx = abs(float(marker.center_xy[0]) - detection.center_x)
+        # Compare columns in the tag's local panel axes, not screen X/Y.
+        # Camera roll otherwise moves the intended control sideways while a
+        # neighbouring, larger control can win the old width-normalized score.
+        points = np.asarray(marker.corners, dtype=np.float64).reshape(4, 2)
+        axes = [points[1] - points[0] + points[2] - points[3],
+                points[3] - points[0] + points[2] - points[1]]
+        axes = [axis / max(float(np.linalg.norm(axis)), 1e-9) for axis in axes]
+        # Corner order is decoded, so the second axis remains panel-vertical
+        # when the camera rolls past 45 degrees. Choosing the most screen-
+        # vertical edge would swap rows and columns at that boundary.
+        down = axes[1]
+        if down[1] < 0:
+            down = -down
+        right = np.array([down[1], -down[0]])
+        delta = np.array([detection.center_x, detection.center_y]) - marker.center_xy
+        dx = abs(float(delta @ right))
+        dy = float(delta @ down)
+        marker_width = max(1.0, float(np.ptp(points @ right)))
+        marker_height = max(1.0, float(np.ptp(points @ down)))
+        projected_width = abs(right[0]) * width + abs(right[1]) * height
+        projected_height = abs(down[0]) * width + abs(down[1]) * height
         horizontal_gate = max(
             self.min_horizontal_gate_px,
-            width * self.max_horizontal_ratio,
-            marker_width * 2.5,
+            min(projected_width * self.max_horizontal_ratio, marker_width * 1.5),
+            marker_width * 0.75,
         )
         if dx > horizontal_gate:
             return None
 
         # The tag must be above the component center. A small overlap with the
         # component bbox is allowed for perspective and loose YOLO boxes.
-        if float(marker.center_xy[1]) >= detection.center_y:
+        if dy <= 0:
             return None
-        vertical_gap = y1 - my2
-        overlap_tolerance = height * self.overlap_tolerance_ratio
+        vertical_gap = dy - (projected_height + marker_height) * 0.5
+        overlap_tolerance = projected_height * self.overlap_tolerance_ratio
         vertical_gate = max(
             self.min_vertical_gate_px,
-            height * self.max_vertical_ratio,
+            projected_height * self.max_vertical_ratio,
             marker_height * 6.0,
         )
         if vertical_gap < -overlap_tolerance or vertical_gap > vertical_gate:
             return None
         return (
-            dx / horizontal_gate +
-            max(0.0, vertical_gap) / vertical_gate +
+            dx / marker_width +
+            0.25 * max(0.0, vertical_gap) / vertical_gate +
             0.05 * abs(marker_width - marker_height) / max(marker_width, marker_height)
         )
 

@@ -44,7 +44,8 @@ from .depth_utils import (
     estimate_valve_wheel_axis_direction,
 )
 from .knob_angle import (
-    estimate_knob_angle, draw_knob_angle, estimate_hex_angle,
+    estimate_knob_angle, observe_knob, KnobDiscreteAngleStabilizer,
+    draw_knob_angle, estimate_hex_angle,
     estimate_valve_angle, estimate_valve_angle_candidates, draw_hex_angle,
 )
 from .fastener_registry import FastenerGroupRegistry, FastenerObservation
@@ -69,6 +70,8 @@ from .panel_apriltag import (
 )
 from .pipe_axis_3d import estimate_pipe_axis_3d
 from .board_card import board_card_target
+from .board_features import (detect_board_features, add_board_feature_depth,
+                             draw_board_features)
 from .pipe_axis import (
     detect_black_marker,
     draw_pipe_axis_result,
@@ -686,68 +689,6 @@ def _parse_angle_constraint_mode(value):
     return mode if mode in (1, 2, 3) else 1
 
 
-class KnobDiscreteAngleStabilizer:
-    """将白色手柄线方向稳定为 0/90，避免临界帧抖动。"""
-
-    def __init__(self, switch_margin=8.0, confirm_frames=3):
-        self.switch_margin = float(switch_margin)
-        self.confirm_frames = int(confirm_frames)
-        self._stable = {}
-        self._pending = {}
-        self._pending_count = defaultdict(int)
-
-    def update(self, target_id, raw_angle):
-        if raw_angle is None:
-            return self._stable.get(target_id)
-
-        line_angle = float(raw_angle) % 180.0
-        vertical_diff = min(line_angle, 180.0 - line_angle)
-        candidate = 0.0 if vertical_diff <= 45.0 else 90.0
-
-        stable = self._stable.get(target_id)
-        if stable is None:
-            self._stable[target_id] = candidate
-            self._clear_pending(target_id)
-            return candidate
-
-        if candidate == stable:
-            self._clear_pending(target_id)
-            return stable
-
-        if not self._beyond_hysteresis(vertical_diff, stable, candidate):
-            self._clear_pending(target_id)
-            return stable
-
-        if self._pending.get(target_id) != candidate:
-            self._pending[target_id] = candidate
-            self._pending_count[target_id] = 1
-        else:
-            self._pending_count[target_id] += 1
-
-        if self._pending_count[target_id] >= self.confirm_frames:
-            self._stable[target_id] = candidate
-            self._clear_pending(target_id)
-
-        return self._stable[target_id]
-
-    def prune(self, active_ids):
-        active_ids = set(active_ids)
-        for target_id in list(self._stable):
-            if target_id not in active_ids:
-                self._stable.pop(target_id, None)
-                self._clear_pending(target_id)
-
-    def _clear_pending(self, target_id):
-        self._pending.pop(target_id, None)
-        self._pending_count.pop(target_id, None)
-
-    def _beyond_hysteresis(self, vertical_diff, stable, candidate):
-        if stable == 0.0 and candidate == 90.0:
-            return vertical_diff >= 45.0 + self.switch_margin
-        if stable == 90.0 and candidate == 0.0:
-            return vertical_diff <= 45.0 - self.switch_margin
-        return True
-
 
 def _symmetric_angle_diff_deg(a, b, period=45.0):
     return abs(((float(a) - float(b) + period * 0.5) % period) - period * 0.5)
@@ -863,6 +804,10 @@ class PanelDetectionNode(Node):
             for cls_name, topic in CLASS_TOPIC_MAP.items():
                 if self._active_classes is None or cls_name in self._active_classes:
                     self._pose_pubs[cls_name] = self.create_publisher(PoseStamped, topic, 10)
+
+        self._knob_observations_pub = (
+            self.create_publisher(String, '/panel/knob_observations', 10)
+            if self._process_panel_controls else None)
 
         self._board_cards_pub = (
             self.create_publisher(String, '/panel/board_cards', 10)
@@ -1826,20 +1771,29 @@ class PanelDetectionNode(Node):
             self._publish_status('no_detection')
 
     def _publish_board_cards(self, detections, assignments, depth_image,
-                             intrin, stamp):
+                             intrin, stamp, color_image=None, canvas=None):
         if self._board_cards_pub is None:
-            return
+            return {}
         normal_valid = self._panel_normal_cache is not None
         quat = (_normal_to_quaternion(self._panel_normal_cache[0])
                 if normal_valid else None)
         targets = []
+        details = {}
         for index, detection in enumerate(detections):
             if detection.class_name != 'board_card':
                 continue
             _, _, xyz = _estimate_detection_point(
                 detection, depth_image, intrin, self._depth_scale)
-            targets.append(board_card_target(
-                detection, assignments.get(index), xyz, quat, normal_valid))
+            features = detect_board_features(
+                color_image, detection.bbox, self.cfg.get('board_features', {}))
+            add_board_feature_depth(features, depth_image, intrin, self._depth_scale)
+            payload = board_card_target(
+                detection, assignments.get(index), xyz, quat, normal_valid)
+            payload.update(features)
+            targets.append(payload)
+            details[id(detection)] = features
+            if canvas is not None:
+                draw_board_features(canvas, features, detection.bbox)
         msg = String()
         msg.data = json.dumps({
             'stamp': stamp.secs + stamp.nsecs * 1e-9,
@@ -1848,6 +1802,7 @@ class PanelDetectionNode(Node):
             'targets': targets,
         }, ensure_ascii=False)
         self._board_cards_pub.publish(msg)
+        return details
 
     def _detection_callback(self):
         if not self._camera_ready:
@@ -2090,9 +2045,9 @@ class PanelDetectionNode(Node):
             draw_panel_tag_assignments(
                 canvas, panel_tag_markers, panel_tag_assignments, frame_detections)
 
-        self._publish_board_cards(
+        board_feature_details = self._publish_board_cards(
             frame_detections, panel_tag_assignments, filtered_depth,
-            deproj_intrin, stamp)
+            deproj_intrin, stamp, color_image, canvas)
 
         nut_localizations = {}
         for i, det in enumerate(frame_detections):
@@ -2312,44 +2267,44 @@ class PanelDetectionNode(Node):
                 target_info.update(board_card_target(
                     det, tag_assignment, xyz, quat,
                     self._panel_normal_cache is not None))
+                target_info.update(board_feature_details.get(id(det), {}))
             targets_output.append(target_info)
 
             # 兼容旧话题
             _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
-            # 旋钮角度
-            if det.class_name == self._angle_knob_class and self._angle_enable:
-                x1, y1 = int(det.bbox[0]), int(det.bbox[1])
-                x2, y2 = int(det.bbox[2]), int(det.bbox[3])
-                roi = color_image[y1:y2, x1:x2]
-                # 模式 1 只根据白色手柄线相对竖直线的夹角输出 0/90。
-                # 模式 2/3 保留旧逻辑：红色旋钮可回退到红色长柄，黑色旋钮用白色胶带。
-                mode_0_90 = self._angle_constraint_mode == 1
-                ptr_color = 'white_line' if mode_0_90 else (
-                    'red_handle' if target_id == 4 else 'white_tape')
-                knob_range = None
-                if self._angle_constraint_mode == 2:
-                    knob_range = (180.0, 270.0) if target_id == 4 else (0.0, 90.0)
-                angle = estimate_knob_angle(
-                    roi,
-                    binary_thresh=self._angle_binary_thresh,
-                    circle_mask_ratio=self._angle_circle_mask,
-                    angle_range=knob_range,
-                    pointer_color=ptr_color,
-                )
-                if mode_0_90:
-                    angle = self._knob_angle_stabilizer.update(target_id, angle)
-                if angle is not None:
-                    output_angle = int(angle) if mode_0_90 else round(angle, 1)
-                    knob_angles.append({
-                        'id': target_id,
-                        'position': {'x': round(xyz[0], 4),
-                                     'y': round(xyz[1], 4),
-                                     'z': round(xyz[2], 4)},
-                        'angle': output_angle,
-                        'confidence': round(det.confidence, 3),
-                    })
-
+        # Angle is a visual observation and must not disappear merely because
+        # a Tag is outside the view. Keep the legacy numbered topic unchanged.
+        knob_observations = []
+        if self._process_panel_controls and self._angle_enable:
+            numbered = {id(det): target_id for target_id, det in matched}
+            for det in frame_detections:
+                if det.class_name != self._angle_knob_class:
+                    continue
+                target_id = numbered.get(id(det))
+                observation = observe_knob(
+                    color_image, det, target_id, self._angle_constraint_mode,
+                    self._knob_angle_stabilizer, self.cfg.get('knob_angle', {}))
+                assignment = tag_assignment_by_detection.get(id(det))
+                observation['tag_id'] = assignment.tag_id if assignment else None
+                xyz = matched_xyz.get(target_id)
+                observation['position_valid'] = bool(_valid_point_3d(xyz)) if xyz is not None else False
+                observation['position'] = (
+                    {axis: round(float(v), 4) for axis, v in zip('xyz', xyz)}
+                    if observation['position_valid'] else None)
+                knob_observations.append(observation)
+                if observation['angle_valid']:
+                    if target_id is not None:
+                        knob_angles.append({key: observation[key] for key in
+                                            ('id', 'position', 'angle', 'confidence')})
+                    else:
+                        draw_knob_angle(canvas, det.bbox, observation['angle'])
+            msg = String()
+            msg.data = json.dumps({
+                'stamp': stamp.secs + stamp.nsecs * 1e-9,
+                'knobs': knob_observations,
+            }, ensure_ascii=False)
+            self._knob_observations_pub.publish(msg)
 
         # 对所有非编号目标计算 3D 坐标并标注。nut 只发布 refined 可靠点。
         object_targets_output = []

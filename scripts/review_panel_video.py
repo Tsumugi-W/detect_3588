@@ -23,16 +23,21 @@ from panel_detection.panel_apriltag import (
 )
 from panel_detection.target_registry import FrameDetection
 
-PANEL_CLASSES = {'button', 'door_button', 'knob', 'light'}
+from panel_detection.knob_angle import observe_knob, KnobDiscreteAngleStabilizer, draw_knob_angle
+from panel_detection.board_features import detect_board_features, draw_board_features
+
+PANEL_CLASSES = {'button', 'door_button', 'knob', 'light', 'board_card'}
 
 
 
 
 class VisualReviewer:
-    def __init__(self, detector, tag_config):
+    def __init__(self, detector, tag_config, config=None):
         self.detector = detector
         self.tag_config = tag_config
         self.tracker = PanelAprilTagTracker(tag_config)
+        self.config = config or DEFAULT_CONFIG
+        self.angle_stabilizer = KnobDiscreteAngleStabilizer()
 
     def process(self, frame):
         _, class_ids, boxes, confidences = self.detector.detect(frame)
@@ -47,6 +52,8 @@ class VisualReviewer:
             raw_classes.append(name)
         markers = detect_panel_tags(frame, self.tag_config)
         assignments, _ = apply_panel_tag_rules(detections, markers, self.tracker)
+        self.angle_stabilizer.prune([a.target_id for i, a in assignments.items()
+                                     if detections[i].class_name == 'knob'])
         canvas = frame.copy()
         records = []
         for i, (det, raw_class) in enumerate(zip(detections, raw_classes)):
@@ -62,12 +69,24 @@ class VisualReviewer:
                 detail += ' [tracked]'
             cv2.putText(canvas, detail, (max(0, x1), min(frame.shape[0] - 6, y2 + 17)),
                         cv2.FONT_HERSHEY_SIMPLEX, .43, (255, 255, 255), 1, cv2.LINE_AA)
+            features = {}
+            if det.class_name == 'knob' and self.config.get('knob_angle', {}).get('enable', True):
+                mode = self.config.get('knob_angle', {}).get('use_constraint', 1)
+                mode = (2 if mode else 3) if isinstance(mode, bool) else int(mode)
+                features = observe_knob(frame, det, assignment.target_id if assignment else None,
+                                        mode, self.angle_stabilizer, self.config.get('knob_angle'))
+                if features['angle_valid']:
+                    draw_knob_angle(canvas, det.bbox, features['angle'])
+            elif det.class_name == 'board_card':
+                features = detect_board_features(frame, det.bbox, self.config.get('board_features'))
+                draw_board_features(canvas, features, det.bbox)
             records.append({
                 'bbox': list(det.bbox), 'raw_class': raw_class,
                 'class': det.class_name, 'confidence': det.confidence,
                 'tag_id': assignment.tag_id if assignment else None,
                 'target_id': assignment.target_id if assignment else None,
                 'source': assignment.source if assignment else 'unmatched',
+                **features,
             })
         draw_panel_tag_assignments(canvas, markers, assignments, detections)
         return canvas, {
@@ -90,7 +109,7 @@ def review(source, destination, detector, cfg, args):
         if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
             raise ValueError(f'Crop {x,y,w,h} exceeds {width}x{height}')
         destination.mkdir(parents=True, exist_ok=False)
-        reviewer = VisualReviewer(detector, cfg['panel_apriltag'])
+        reviewer = VisualReviewer(detector, cfg['panel_apriltag'], cfg)
         # Pad to even dimensions for broadly compatible H.264/yuv420p playback.
         encoder = subprocess.Popen([
             'ffmpeg', '-hide_banner', '-loglevel', 'error', '-n',
@@ -106,7 +125,7 @@ def review(source, destination, detector, cfg, args):
             'frames_with_tags': 0, 'frames_with_direct_match': 0,
             'direct_matches': 0, 'tracked_matches': 0, 'unmatched_detections': 0,
             'reclassified_detections': 0, 'tag_ids': [],
-            'scope': 'YOLO + shared AprilTag rules only; no layout fallback, angles or depth',
+            'scope': 'YOLO + shared AprilTag, knob angle and board features; no depth or layout fallback',
             'config': cfg,
         }
         tag_ids = set()

@@ -146,6 +146,38 @@ def test_tag_below_component_or_far_to_the_side_is_rejected():
     assert tracker.update(detections, [_marker(0, 260.0)]) == {}
 
 
+def test_camera_roll_does_not_assign_tag02_to_neighbouring_large_knob():
+    # Real 1013 frame 720: old screen-coordinate scoring chose the red knob.
+    corners = np.array([[1001, 197], [927, 164], [966, 83], [1039, 117]], np.float32)
+    marker = PanelTagMarker(2, corners, tuple(corners.mean(axis=0)), 7206.5)
+    black = FrameDetection('knob', 880.075, 411.62, (810.2, 344.3, 949.95, 478.92), .95)
+    red = FrameDetection('knob', 1097.85, 522.12, (1015.93, 360.26, 1179.77, 683.99), .91)
+    matches = PanelAprilTagTracker().update([black, red], [marker])
+    assert set(matches) == {0}
+    assert matches[0].tag_id == 2
+
+
+def test_missing_control_does_not_redirect_its_tag_to_neighbour():
+    # A failed YOLO detection must leave the identity unassigned.
+    assert PanelAprilTagTracker().update(
+        [_detection('button', 120., size=60)], [_marker(5, 50.)]) == {}
+
+
+def test_tag_axis_does_not_swap_when_camera_roll_exceeds_45_degrees():
+    import math
+    # Rotate both the printed tag and its control by 60 degrees in the image.
+    rotation = np.array([[math.cos(math.pi/3), -math.sin(math.pi/3)],
+                         [math.sin(math.pi/3), math.cos(math.pi/3)]])
+    marker = _marker(5, 100., center_y=100., size=20.)
+    centre = np.array(marker.center_xy)
+    corners = (marker.corners-centre) @ rotation.T + centre
+    marker = PanelTagMarker(5, corners, tuple(centre), 400.)
+    control = centre + rotation @ np.array([0., 65.])
+    matches = PanelAprilTagTracker().update(
+        [_detection('button', control[0], center_y=control[1])], [marker])
+    assert matches[0].tag_id == 5
+
+
 def test_track_bridges_short_tag_gap_but_expires_from_last_real_tag_frame():
     tracker = PanelAprilTagTracker({'scene': 'test_site', 'stale_frames': 2, 'track_distance_px': 50.0})
     first = tracker.update([_detection('light', 80.0)], [_marker(3, 80.0)])

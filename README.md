@@ -402,7 +402,8 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 测试场 `test_site` 保留旧映射：00/01/02/05/06 为按钮，03/04 为旋钮，07–39 为灯。
 通过 `config_path:=配置文件路径` 切换场景；详见“场景配置：测试场与验证场”。
 
-每帧先运行 YOLO，再解码 Tag。Tag 必须位于目标中心上方，并通过水平距离、垂直间距和
+每帧先运行 YOLO，再解码 Tag。关联使用 Tag 解码后的局部横、竖轴，
+避免相机倾斜超过 45° 时交换行列；Tag 必须位于元件的局部上方，并通过收紧的横向距离、纵向间距和
 一对一关联门控。板卡 Tag 只能关联同为 `board_card` 的 YOLO 结果；其他类别的 Tag 不能
 给板卡改类或编号。短暂漏 Tag 可沿用有限帧跟踪，超过 `stale_frames` 后关联失效。
 
@@ -500,6 +501,25 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 该兼容话题没有身份和有效性字段，多目标或姿态有效性判断应使用 JSON 话题。
 
 
+**插拔状态与操作部位（ROS1/ROS2 同步）**：`board_card` 仍表示固定白色外框；
+新增字段同时出现在 `/panel/board_cards` 和已编号板卡的 `/panel/targets`：
+
+| 字段 | 含义 |
+|------|------|
+| `insertion_state` | `inserted`：检测到白色拉手；`empty`：蓝色槽口暴露；`unknown`：证据不足或遮挡 |
+| `state_source` | `visual`，表示视觉状态；不代表已检测机械锁紧或电气接通 |
+| `handle` | 插入时可见拉手上的夹取区域；不可见时为 null |
+| `slot` | 拔出时可见蓝色连接器的槽口区域；被插入件遮住时为 null |
+| `handle.pixel` / `slot.pixel` | 操作部位的原图像素中心 `[u, v]`；`polygon` 是观察到的区域四角 |
+| `handle.position` / `slot.position` | 对应部位的相机坐标（米），不能用外框中心的 `position` 代替 |
+| `position_valid`（部位内） | 该部位有效深度是否充足；无深度或深度离散过大时为 false，位置为 null |
+
+拉手深度从夹取区域内部采样；槽口深度从可见连接器边缘采样，避开中间孔洞。
+部位 `confidence` 是几何规则分数，未做概率校准。算法针对验证场白色外框、白色拉手、
+蓝色槽口；可通过 `board_features.enable: false` 关闭，蓝色阈值由
+`board_features.slot_hue_min/slot_hue_max` 设置（OpenCV HSV，默认 85/125）。
+拉手退出外框视野后不再追踪；遮挡时不推测隐藏操作点。旧外框位姿字段的取样方式保持不变。
+
 **插拔状态对位置的影响**：当前深度取检测框中心附近 7×7 像素的有效值中位数，
 没有单独提取白色外框。插上时可能采到插入件，拔出后可能采到更深的插槽/背景；
 即使框中心不变，深度及反投影位置也可能改变。手部遮挡和框抖动还会改变采样区域。
@@ -528,7 +548,19 @@ ros2 launch panel_detection panel_controls.launch.py publish_legacy_topics:=true
 }
 ```
 
-该话题只发布旋钮角度，不混入板卡信息，`knob_angles` 内每个条目的格式保持不变。旋钮 `angle` 以 12 点钟方向为 0°，顺时针增加，范围 [0, 360)。
+该话题只发布有编号的旋钮角度，条目字段保持兼容。默认模式 1 输出 `0`（竖直）或 `90`（水平），
+采用白色条纹的无向轴及连续帧确认；过渡方向存在迟滞区。模式 2/3 才输出连续有向角，
+以图像 12 点钟方向为 0°，顺时针增加。角度不是经过面板透视校正的机械关节角。
+条纹拟合排除外圈金属反光，并支持水平/竖直的简单矩形轮廓。
+
+### /panel/knob_observations (String, JSON) — 包含无编号旋钮的视觉角度
+
+新增话题形如 `{"stamp": 1716192000.123, "knobs": [...]}`，每个旋钮包括
+`id`、`tag_id`、`bbox`、`angle`、`raw_angle`、`angle_valid`、`angle_source`、
+`confidence`、`position_valid` 和 `position`。未关联 Tag 的旋钮仍计算并显示角度，
+`id/tag_id` 为 null，不虚构编号，也不写入旧 `/panel/knob_angles`。
+`raw_angle` 是离散化前的图像角度，`angle_source: held` 表示短时保留已有档位。
+深度无效时 `position` 为 null，二维角度不依赖深度。
 
 ### /valve/targets (String, JSON) — 阀门位置
 
@@ -920,7 +952,7 @@ panel_apriltag:
   min_id: 0
   max_id: 39
   min_area_px: 64.0
-  max_horizontal_ratio: 1.35
+  max_horizontal_ratio: 0.65
   max_vertical_ratio: 3.0
   track_distance_px: 90.0
   stale_frames: 8
@@ -1070,7 +1102,8 @@ python3 scripts/review_panel_video.py \
 灰色元件框表示没有有效 Tag 关联；`[tracked]` 表示短时跟踪关联，当前帧没有直接连线。
 `YOLO:...` 保留原始分类，主标签显示应用 Tag 规则后的分类。
 
-本工具专用于二维视觉关联复核，不运行布局回退编号、旋钮角度、深度或三维位置发布。
+本工具复核二维关联、旋钮角度及板卡插拔状态/拉手/槽口位置；使用与 ROS 节点相同的算法。
+不运行布局回退编号、深度或三维位置发布。
 保持现有节点规则：启用 Tag 时，本帧没有直接 Tag 关联的 button 会改判为 light。
 Tag 识别到了但 YOLO 未检出对应元件时，只画 Tag，不虚构元件框。
 统计是检测/关联次数，不是准确率；真实准确率需要人工标注。
@@ -1112,7 +1145,7 @@ ROS launch 也可以使用 `config_path:=配置文件路径`。ROS 使用安装�
 - 板卡以 YOLO 类别为准：T07 仅关联已经检测为 `board_card` 的目标并分配编号 8，
   不把其他类别改为板卡，也不把板卡改为按钮/旋钮/灯；无 Tag 时仍保留板卡框，
   没有有效编号的板卡不发布为已编号目标。短暂丢 Tag 可沿用原有跟踪关联。
-- 场景映射不改变旋钮角度算法；本次视频复核只验证类别和 Tag 关联。
+- 离线复核包含旋钮角度和板卡操作部位；无深度视频只输出二维像素位置。
 
 新增其他 Tag 时，在验证场配置的 `tag_classes` 中显式添加其 ID 与类别。
 历史 `1013_panel_review` 输出仍保留旧规则，新默认结果保存到

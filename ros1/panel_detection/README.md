@@ -184,3 +184,27 @@ rostopic echo /panel/board_card_pose
 
 当前中心深度采样可能受到插入件、插槽背景和手部遮挡影响；`position_valid` 不保证采样点属于固定外框。
 插拔前后的几何位置一致性尚未验证，限制与改进方向见根 README 板卡话题一节。
+
+
+## 验证场编号、旋钮与板卡操作部位
+
+本节点与 ROS2 共用一致的 Tag 局部轴关联、白色旋钮条纹拟合和板卡部位算法。
+目标编号仍为 Tag ID + 1；相机倾斜超过 45° 时不会交换 Tag 的横、竖轴。
+默认旋钮角度为图像竖直/水平的 0°/90°档位。无 Tag 的旋钮仍显示角度，
+另发 `/panel/knob_observations`（String JSON，`knobs` 数组，未知 `id/tag_id` 为 null）；
+旧 `/panel/knob_angles` 只保留有编号旋钮。
+
+`/panel/board_cards` 及 `/panel/targets` 中的板卡新增 `insertion_state`：
+`inserted`（白色拉手可见）、`empty`（蓝色槽口暴露）、`unknown`（证据不足）。
+`handle` / `slot` 分别包含 `pixel`、`polygon`、`confidence`、`position_valid`、`position`。
+插入状态输出拉手夹取区域，拔出状态输出槽口中心；隐藏部位为 null。
+部位位置来自自身有效深度（米），缺失时仍保留二维位置，三维位置为 null。
+这些是验证场颜色/几何规则的视觉观察，不代表机械锁紧或电气连接状态。
+`board_features.enable: false` 可关闭；固定白色外框的原有位姿计算保持不变。
+
+```bash
+rostopic echo /panel/knob_observations
+rostopic echo /panel/board_cards
+```
+
+完整字段和离线视频复核方式见仓库根目录 README。

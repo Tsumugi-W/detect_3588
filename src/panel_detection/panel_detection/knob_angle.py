@@ -11,8 +11,106 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 import cv2
 import numpy as np
+
+
+class KnobDiscreteAngleStabilizer:
+    """将白色手柄线方向稳定为 0/90，避免临界帧抖动。"""
+
+    def __init__(self, switch_margin=8.0, confirm_frames=3):
+        self.switch_margin = float(switch_margin)
+        self.confirm_frames = int(confirm_frames)
+        self._stable = {}
+        self._pending = {}
+        self._pending_count = defaultdict(int)
+
+    def update(self, target_id, raw_angle):
+        if raw_angle is None:
+            return self._stable.get(target_id)
+
+        line_angle = float(raw_angle) % 180.0
+        vertical_diff = min(line_angle, 180.0 - line_angle)
+        candidate = 0.0 if vertical_diff <= 45.0 else 90.0
+
+        stable = self._stable.get(target_id)
+        if stable is None:
+            self._stable[target_id] = candidate
+            self._clear_pending(target_id)
+            return candidate
+
+        if candidate == stable:
+            self._clear_pending(target_id)
+            return stable
+
+        if not self._beyond_hysteresis(vertical_diff, stable, candidate):
+            self._clear_pending(target_id)
+            return stable
+
+        if self._pending.get(target_id) != candidate:
+            self._pending[target_id] = candidate
+            self._pending_count[target_id] = 1
+        else:
+            self._pending_count[target_id] += 1
+
+        if self._pending_count[target_id] >= self.confirm_frames:
+            self._stable[target_id] = candidate
+            self._clear_pending(target_id)
+
+        return self._stable[target_id]
+
+    def prune(self, active_ids):
+        active_ids = set(active_ids)
+        for target_id in list(self._stable):
+            if target_id not in active_ids:
+                self._stable.pop(target_id, None)
+                self._clear_pending(target_id)
+
+    def _clear_pending(self, target_id):
+        self._pending.pop(target_id, None)
+        self._pending_count.pop(target_id, None)
+
+    def _beyond_hysteresis(self, vertical_diff, stable, candidate):
+        if stable == 0.0 and candidate == 90.0:
+            return vertical_diff >= 45.0 + self.switch_margin
+        if stable == 90.0 and candidate == 0.0:
+            return vertical_diff <= 45.0 - self.switch_margin
+        return True
+
+
+def observe_knob(image, detection, target_id, mode, stabilizer, cfg=None):
+    """Measure a visible knob even when its Tag is absent; never invent an ID."""
+    cfg = cfg or {}
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = map(int, detection.bbox)
+    roi = image[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+    pointer = 'white_line' if mode == 1 else (
+        'red_handle' if target_id == 4 else 'white_tape')
+    angle_range = None
+    if mode == 2 and target_id is not None:
+        angle_range = (180., 270.) if target_id == 4 else (0., 90.)
+    raw, debug = estimate_knob_angle(
+        roi, binary_thresh=cfg.get('binary_thresh', 180),
+        circle_mask_ratio=cfg.get('circle_mask_ratio', .85),
+        angle_range=angle_range, pointer_color=pointer, debug=True)
+    angle = raw
+    if mode == 1:
+        if target_id is not None:
+            angle = stabilizer.update(target_id, raw)
+        elif raw is not None:
+            line = float(raw) % 180.
+            angle = 0. if min(line, 180.-line) <= 45. else 90.
+    return {
+        'id': target_id, 'bbox': [float(v) for v in detection.bbox],
+        'angle': (int(angle) if mode == 1 else round(float(angle), 1))
+                 if angle is not None else None,
+        'raw_angle': round(float(raw), 2) if raw is not None else None,
+        'angle_valid': angle is not None,
+        'angle_source': debug.get('method') if raw is not None else
+                        ('held' if angle is not None else None),
+        'confidence': round(float(detection.confidence), 3),
+    }
 
 
 def estimate_knob_angle(
@@ -221,7 +319,13 @@ def _try_white_line_axis(color_roi, circle_mask, radius, circle_area,
         if area < min_area or area > max_area:
             continue
 
-        pts = cnt.reshape(-1, 2).astype(np.float64)
+        # Fit the filled stripe, not CHAIN_APPROX_SIMPLE vertices. A perfectly
+        # vertical/horizontal rectangle has only four contour vertices; fitting
+        # those rejected it outright and irregular contours biased the axis.
+        component = np.zeros_like(binary)
+        cv2.drawContours(component, [cnt], -1, 255, -1)
+        ys, xs = np.nonzero(component)
+        pts = np.column_stack((xs, ys)).astype(np.float64)
         fit = _fit_axis_to_points(pts)
         if fit is None:
             continue
@@ -232,15 +336,17 @@ def _try_white_line_axis(color_roi, circle_mask, radius, circle_area,
 
         center_dist = _line_distance_to_point(mean, axis, center)
         radial_dist = float(np.linalg.norm(mean - center))
-        if radial_dist > radius * 1.05:
+        # The shiny metal rim also forms long white arcs. Its tangent lies far
+        # from the knob centre and must not outrank the actual handle stripe.
+        if radial_dist > radius * 0.82 or center_dist > radius * 0.55:
             continue
 
         score = (
-            elongation * 3.0 +
+            min(elongation, 6.0) * 3.0 +
             length / max(radius, 1) * 7.0 +
             min(area / max(circle_area * 0.035, 1.0), 2.0) -
-            center_dist / max(radius, 1) * 0.6 -
-            radial_dist / max(radius, 1) * 0.2
+            center_dist / max(radius, 1) * 4.0 -
+            radial_dist / max(radius, 1) * 2.0
         )
         if best is None or score > best[0]:
             angle = _axis_angle_from_vector(axis)
