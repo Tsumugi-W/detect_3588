@@ -88,6 +88,8 @@ Intel RealSense D435 的彩色图、对齐深度图和彩色相机内参，使�
 ```bash
 mkdir -p ~/panel_ros1_ws/src
 cp -a ros1/panel_detection ~/panel_ros1_ws/src/
+# 更新已有工作区时清除旧版本遗留的忽略标记
+rm -f ~/panel_ros1_ws/src/panel_detection/COLCON_IGNORE
 cd ~/panel_ros1_ws
 source /opt/ros/noetic/setup.bash
 catkin_make

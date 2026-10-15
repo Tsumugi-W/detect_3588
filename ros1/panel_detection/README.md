@@ -39,8 +39,14 @@ It consumes color-aligned D435 depth and uses `1013.onnx` by default.
 
 ## Build
 
+Place this package in `~/panel_ros1_ws/src/panel_detection`. The repository's
+`COLCON_IGNORE` belongs in the parent `ros1/` directory, outside this package:
+recent `catkin_pkg` also honors that marker and would silently skip the package.
+When updating an older copy, remove its leftover marker before building.
+
 ```bash
 cd ~/panel_ros1_ws
+rm -f src/panel_detection/COLCON_IGNORE
 source /opt/ros/noetic/setup.bash
 catkin_make
 source devel/setup.bash
