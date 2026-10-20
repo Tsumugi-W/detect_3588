@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <package format="2">
   <name>panel_detection</name>
-  <version>2.0.0</version>
-  <description>ROS1 Noetic port of panel, valve and fastener detection using YOLOv5 ONNX and aligned depth.</description>
-  <maintainer email="zile@todo.todo">zile</maintainer>
+  <version>1.1.0</version>
+  <description>ROS1 Noetic panel and button detection using YOLOv5 ONNX and aligned depth.</description>
+  <maintainer email="gzq@todo.todo">gzq</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>catkin</buildtool_depend>

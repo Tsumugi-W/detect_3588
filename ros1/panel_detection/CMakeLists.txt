@@ -16,10 +16,6 @@ catkin_package()
 
 catkin_install_python(PROGRAMS
   scripts/panel_detect_node.py
-  scripts/fastener_precision_recorder.py
-  scripts/rgb_depth_viewer.py
-  scripts/estimate_pipe_axis.py
-  scripts/export_model.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

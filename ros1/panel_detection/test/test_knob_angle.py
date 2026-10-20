@@ -1,73 +1,88 @@
-import builtins
+#!/usr/bin/env python3
+"""Regression tests for ROS-independent knob angle estimation."""
+
+import unittest
 
 import cv2
 import numpy as np
 
 from panel_detection.knob_angle import (
-    _try_color_handle, estimate_knob_angle, observe_knob, KnobDiscreteAngleStabilizer,
+    DiscreteAngleStabilizer,
+    estimate_knob_angle,
 )
 
 
-def test_radial_scan_does_not_import_scipy(monkeypatch):
-    real_import = builtins.__import__
-
-    def guarded_import(name, *args, **kwargs):
-        if name.startswith('scipy'):
-            raise AssertionError('knob angle estimation must not import scipy')
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, '__import__', guarded_import)
-    roi = np.zeros((80, 80, 3), dtype=np.uint8)
-    cv2.line(roi, (40, 40), (40, 10), (255, 255, 255), 5)
-    circle_mask = np.zeros((80, 80), dtype=np.uint8)
-    cv2.circle(circle_mask, (40, 40), 34, 255, -1)
-
-    angle, contour, binary = _try_color_handle(
-        roi, circle_mask, np.pi * 34 ** 2, 0.01, 0.25, 40, 40)
-
-    assert angle is not None
-    assert contour is None
-    assert binary is None
+def _marked_knob(first, second, brightness=255):
+    image = np.full((120, 120, 3), 30, dtype=np.uint8)
+    marker = (brightness, brightness, brightness)
+    cv2.line(image, first, second, marker, 8, cv2.LINE_AA)
+    return image
 
 
-def test_axis_aligned_four_vertex_stripes_are_measured():
-    for vertical in [True, False]:
-        roi = np.zeros((120, 120, 3), np.uint8)
-        bounds = ((55, 35), (65, 90)) if vertical else ((35, 55), (90, 65))
-        cv2.rectangle(roi, *bounds, (235, 235, 235), -1)
-        angle, debug = estimate_knob_angle(roi, pointer_color='white_line', debug=True)
-        assert debug['method'] == 'white_line_axis'
-        distance = min(angle % 180, 180-angle % 180)
-        assert distance < 3 if vertical else abs(distance-90) < 3
+class KnobAngleTest(unittest.TestCase):
+    def test_vertical_marker_is_zero_degrees(self):
+        angle = estimate_knob_angle(
+            _marked_knob((60, 20), (60, 100)),
+            pointer_color="white_line",
+        )
+        self.assertIsNotNone(angle)
+        # An unoriented vertical axis may be represented as either 0 or 180
+        # before the ROS2-compatible stabilizer maps it to discrete 0.
+        normalized = float(angle) % 180.0
+        vertical_difference = min(normalized, 180.0 - normalized)
+        self.assertAlmostEqual(vertical_difference, 0.0, delta=2.0)
+        self.assertEqual(DiscreteAngleStabilizer().update(4, angle), 0.0)
+
+    def test_horizontal_marker_is_ninety_degrees(self):
+        angle = estimate_knob_angle(
+            _marked_knob((20, 60), (100, 60)),
+            pointer_color="white_line",
+        )
+        self.assertIsNotNone(angle)
+        self.assertAlmostEqual(angle, 90.0, delta=2.0)
+
+    def test_marker_survives_lower_camera_exposure(self):
+        angle = estimate_knob_angle(
+            _marked_knob((60, 20), (60, 100), brightness=160),
+            pointer_color="white_line",
+        )
+        self.assertIsNotNone(angle)
+        self.assertAlmostEqual(angle, 0.0, delta=2.0)
+
+    def test_discrete_change_requires_confirmed_frames(self):
+        stabilizer = DiscreteAngleStabilizer(
+            switch_margin=8.0, confirm_frames=2
+        )
+        self.assertEqual(stabilizer.update(4, 5.0), 0.0)
+        self.assertEqual(stabilizer.update(4, 70.0), 0.0)
+        self.assertEqual(stabilizer.update(4, 70.0), 90.0)
+
+    def test_red_handle_mode_detects_downward_handle(self):
+        image = np.full((160, 160, 3), 25, dtype=np.uint8)
+        cv2.circle(image, (80, 70), 32, (0, 0, 210), -1)
+        cv2.rectangle(image, (70, 70), (90, 145), (0, 0, 210), -1)
+        angle = estimate_knob_angle(
+            image,
+            pointer_color="red_handle",
+            angle_range=(180.0, 270.0),
+        )
+        self.assertIsNotNone(angle)
+        self.assertAlmostEqual(angle, 180.0, delta=3.0)
+        self.assertEqual(DiscreteAngleStabilizer().update(4, angle), 0.0)
+
+    def test_red_handle_unconstrained_mode_is_available(self):
+        image = np.full((160, 160, 3), 25, dtype=np.uint8)
+        cv2.circle(image, (80, 80), 32, (0, 0, 210), -1)
+        handle = np.asarray([[80, 80], [145, 95], [141, 111]], np.int32)
+        cv2.fillConvexPoly(image, handle, (0, 0, 210))
+        angle = estimate_knob_angle(
+            image,
+            pointer_color="red_handle",
+            angle_range=None,
+        )
+        self.assertIsNotNone(angle)
+        self.assertAlmostEqual(angle, 112.0, delta=3.0)
 
 
-def test_metal_rim_does_not_override_vertical_stripe():
-    roi = np.zeros((140, 140, 3), np.uint8)
-    cv2.ellipse(roi, (70, 70), (55, 55), 0, 220, 320, (255, 255, 255), 6)
-    cv2.rectangle(roi, (65, 45), (76, 105), (230, 230, 230), -1)
-    angle, debug = estimate_knob_angle(roi, pointer_color='white_line', debug=True)
-    assert debug['method'] == 'white_line_axis'
-    assert min(angle % 180, 180-angle % 180) < 5
-
-
-def test_untagged_knob_still_has_visual_angle_without_invented_id():
-    from types import SimpleNamespace
-    image = np.zeros((120, 120, 3), np.uint8)
-    cv2.rectangle(image, (55, 35), (65, 90), (235, 235, 235), -1)
-    detection = SimpleNamespace(bbox=(0, 0, 120, 120), confidence=.9)
-    observation = observe_knob(image, detection, None, 1, KnobDiscreteAngleStabilizer())
-    assert observation['id'] is None
-    assert observation['angle_valid'] and observation['angle'] == 0
-
-
-def test_real_video_vertical_and_horizontal_knobs():
-    from pathlib import Path
-    from types import SimpleNamespace
-    for name, expected in [('knob_vertical', 0), ('knob_horizontal', 90)]:
-        image = cv2.imread(str(Path(__file__).parent/'fixtures'/'board'/(name+'.png')))
-        assert image is not None
-        h, w = image.shape[:2]
-        detection = SimpleNamespace(bbox=(0, 0, w, h), confidence=.95)
-        result = observe_knob(image, detection, 3, 1, KnobDiscreteAngleStabilizer())
-        assert result['angle'] == expected and result['angle_valid']
-        assert result['angle_source'] == 'white_line_axis'
+if __name__ == "__main__":
+    unittest.main()

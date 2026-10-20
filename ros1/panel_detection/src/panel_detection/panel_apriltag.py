@@ -132,53 +132,60 @@ class _TagTrack:
 
 
 def detect_panel_tags(color_image: np.ndarray, cfg=None) -> List[PanelTagMarker]:
-    """Detect decoded tag36h11 markers reserved for panel control IDs."""
+    """Detect decoded panel tags from one or more ArUco/AprilTag families."""
     cfg = cfg or {}
     if color_image is None or color_image.size == 0 or not hasattr(cv2, 'aruco'):
         return []
-    dictionary = _get_apriltag_dictionary(
-        cfg.get('dictionary', 'DICT_APRILTAG_36h11'))
-    if dictionary is None:
+
+    dictionary_names = cfg.get('dictionary', 'DICT_APRILTAG_36h11')
+    if isinstance(dictionary_names, str):
+        dictionary_names = [dictionary_names]
+    if not isinstance(dictionary_names, (list, tuple)) or not dictionary_names:
         return []
 
     if color_image.ndim == 2:
         gray = color_image
     else:
         gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-    try:
-        corners, ids, _ = _detect_aruco_markers(gray, dictionary)
-    except (AttributeError, TypeError, ValueError, cv2.error):
-        # Tag support is auxiliary and must never terminate the detection node
-        # when OpenCV's optional aruco API differs between deployments.
-        return []
-    if ids is None:
-        return []
 
     tag_classes = resolve_tag_classes(cfg)
     min_id = int(cfg.get('min_id', PANEL_TAG_ID_MIN))
     max_id = int(cfg.get('max_id', PANEL_TAG_ID_MAX))
     min_area = float(cfg.get('min_area_px', 64.0))
-    marker_ids = np.asarray(ids, dtype=np.int32).reshape(-1)
     markers_by_id: Dict[int, PanelTagMarker] = {}
-    for index, raw_corners in enumerate(corners):
-        if index >= marker_ids.size:
-            break
-        tag_id = int(marker_ids[index])
-        if tag_id < min_id or tag_id > max_id or tag_id not in tag_classes:
+    for dictionary_name in dictionary_names:
+        dictionary = _get_apriltag_dictionary(dictionary_name)
+        if dictionary is None:
             continue
-        points = np.asarray(raw_corners, dtype=np.float32).reshape(4, 2)
-        area = abs(float(cv2.contourArea(points)))
-        if area < min_area:
+        try:
+            corners, ids, _ = _detect_aruco_markers(gray, dictionary)
+        except (AttributeError, TypeError, ValueError, cv2.error):
+            # Tag support is auxiliary and must never terminate the detection
+            # node when OpenCV's optional aruco API differs between deployments.
             continue
-        marker = PanelTagMarker(
-            tag_id=tag_id,
-            corners=points,
-            center_xy=tuple(float(value) for value in np.mean(points, axis=0)),
-            area=area,
-        )
-        previous = markers_by_id.get(tag_id)
-        if previous is None or marker.area > previous.area:
-            markers_by_id[tag_id] = marker
+        if ids is None:
+            continue
+
+        marker_ids = np.asarray(ids, dtype=np.int32).reshape(-1)
+        for index, raw_corners in enumerate(corners):
+            if index >= marker_ids.size:
+                break
+            tag_id = int(marker_ids[index])
+            if tag_id < min_id or tag_id > max_id or tag_id not in tag_classes:
+                continue
+            points = np.asarray(raw_corners, dtype=np.float32).reshape(4, 2)
+            area = abs(float(cv2.contourArea(points)))
+            if area < min_area:
+                continue
+            marker = PanelTagMarker(
+                tag_id=tag_id,
+                corners=points,
+                center_xy=tuple(float(value) for value in np.mean(points, axis=0)),
+                area=area,
+            )
+            previous = markers_by_id.get(tag_id)
+            if previous is None or marker.area > previous.area:
+                markers_by_id[tag_id] = marker
     return sorted(markers_by_id.values(), key=lambda marker: marker.tag_id)
 
 

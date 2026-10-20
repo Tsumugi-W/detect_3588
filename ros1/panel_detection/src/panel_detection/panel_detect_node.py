@@ -1,686 +1,104 @@
-"""
-ROS1 Noetic 面板检测节点
+#!/usr/bin/env python3
+"""ROS1 Noetic panel detector.
 
-两阶段工作流：
-  1. 注册阶段：积累多帧检测结果，按 x 坐标排序 + 类别/颜色验证后为 7 个目标分配编号 1-7
-  2. 跟踪阶段：每帧检测结果匹配注册表，发布带编号的检测结果
-
-话题:
-  /panel/targets   (String, JSON) — 带编号的检测结果（位置 + 类别 + ID）
-  /panel/knob_angles (String, JSON) — 旋钮角度信息（带编号）
-  /objects/geometry (String, JSON) — 非面板目标角度与轴线方向（阀门/螺栓/螺母）
-  /panel/distance  (String, JSON) — 相机到操作面板平面的垂直距离
-  /panel/status    (String)       — 注册状态（registering / registered）
+The node consumes a color image, depth registered to that color image and the
+color CameraInfo. It publishes the same JSON contract used by the ROS2
+visual-servo package on ``/panel/targets``.
 """
-import os
-import math
 import json
-import time
+import os
 import threading
-from collections import defaultdict, deque
+import time
+from dataclasses import replace
 
-import yaml
-import numpy as np
 import cv2
+import message_filters
+import numpy as np
+import rospkg
 import rospy
-from .ros1_compat import Node
-from geometry_msgs.msg import PoseStamped
+from cv_bridge import CvBridge, CvBridgeError
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
-from sensor_msgs.msg import Image, CameraInfo
 
-from .apriltag_reference import (
-    angle_between_normals_deg,
-    detect_apriltag_reference_axis,
+from panel_detection.detector_onnx import YoloV5Onnx
+from panel_detection.frame_processing import LatestFrameProcessor
+from panel_detection.image_message import bgr8_image_message
+from panel_detection.knob_angle import (
+    DiscreteAngleStabilizer,
+    draw_knob_angle,
+    estimate_knob_angle,
 )
-from .camera import create_backend
-from .camera.base import CameraIntrinsics
-from .depth_utils import (
-    deproject_pixel_to_point,
-    filter_depth, get_robust_depth, get_bbox_robust_depth, get_masked_robust_depth,
-    compute_panel_normal, estimate_fastener_group_axis_direction,
-    estimate_fastener_line_constrained_axis,
-    estimate_fastener_patch_axis_direction,
-    estimate_object_axis_direction,
-    estimate_valve_wheel_axis_direction,
+from panel_detection.position_stabilizer import PositionStabilizer
+from panel_detection.target_registry import (
+    FrameDetection,
+    PersistentPanelAxis,
+    TargetRegistry,
 )
-from .knob_angle import (
-    estimate_knob_angle, observe_knob, KnobDiscreteAngleStabilizer,
-    draw_knob_angle, estimate_hex_angle,
-    estimate_valve_angle, estimate_valve_angle_candidates, draw_hex_angle,
-)
-from .fastener_registry import FastenerGroupRegistry, FastenerObservation
-from .fastener_axis_stabilizer import (
-    FastenerAxisMeasurement,
-    FastenerAxisStabilizer,
-)
-# 铭牌 OCR 暂停使用。保留 nameplate_ocr.py，后续需要时再恢复接入。
-# from .nameplate_ocr import NameplateRecognizer
-from .nut_localizer import localize_nut
-from .concentric_bolt_marker import (
-    detect_concentric_bolt_markers,
-    estimate_concentric_bolt_poses,
-)
-from .concentric_marker_stabilizer import ConcentricMarkerStabilizer
-from .panel_apriltag import (
+from panel_detection.panel_apriltag import (
     PanelAprilTagTracker,
-    apply_panel_tag_rules,
     detect_panel_tags,
     draw_panel_tag_assignments,
-    redraw_reclassified_detection,
 )
-from .pipe_axis_3d import estimate_pipe_axis_3d
-from .board_card import board_card_target
-from .board_features import (detect_board_features, add_board_feature_depth,
-                             draw_board_features)
-from .pipe_axis import (
-    detect_black_marker,
-    draw_pipe_axis_result,
-    estimate_pipe_axis_from_image,
-)
-from .target_registry import PersistentPanelAxis, TargetRegistry, FrameDetection
 
 
-# ─── 配置 ─────────────────────────────────────────────────────────────────────
-from .default_config import DEFAULT_CONFIG
-from .panel_scene import merge_config, DEFAULT_SCENE
-
-
-CLASS_TOPIC_MAP = {
-    'light': '/panel/lights',
-    'knob': '/panel/knobs',
-    'bolt': '/panel/bolts',
-    'nut': '/panel/nuts',
-    'valve': '/panel/valves',
-    'pump': '/panel/pumps',
-    'button': '/panel/buttons',
-    'door_button': '/panel/door_buttons',
-    'air_switch': '/panel/air_switches',
-    'board_card': '/panel/board_card_pose',
-}
-
-MODE_CLASS_FILTERS = {
-    'panel_controls': {'button', 'door_button', 'knob', 'light', 'board_card'},
-    'valve': {'valve'},
-    'fastener': {'bolt', 'nut'},
-    'leak': None,
-    'all': None,
-}
-
-MODE_TOPIC_MAP = {
-    'panel_controls': {
-        'targets': '/panel/targets',
-        'angles': '/panel/knob_angles',
-        'status': '/panel/status',
-        'distance': '/panel/distance',
-    },
-    'valve': {
-        'targets': '/valve/targets',
-        'geometry': '/valve/geometry',
-        'status': '/valve/status',
-    },
-    'fastener': {
-        'targets': '/fasteners/targets',
-        'geometry': '/fasteners/geometry',
-        'status': '/fasteners/status',
-    },
-    'leak': {
-        'targets': '/leak/targets',
-        'geometry': '/leak/pipe_axis',
-        'status': '/leak/status',
-    },
-    'all': {
-        'targets': '/panel/targets',
-        'angles': '/panel/knob_angles',
-        'geometry': '/objects/geometry',
-        'status': '/panel/status',
-        'distance': '/panel/distance',
-    },
+CLASS_TOPICS = {
+    "light": "/panel/lights",
+    "knob": "/panel/knobs",
+    "bolt": "/panel/bolts",
+    "nut": "/panel/nuts",
+    "valve": "/panel/valves",
+    "pump": "/panel/pumps",
+    "button": "/panel/buttons",
 }
 
 
-class AsyncCamera:
-    def __init__(self, cam):
-        self._cam = cam
-        self._frame = (None, None, None, None)
-        self._lock = threading.Lock()
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+def _is_button_like_detection(detection):
+    """Allow square/circular light detections to recover a missed button."""
 
-    def _loop(self):
-        while self._running:
-            try:
-                result = self._cam.get_aligned_frames()
-                if result[0] is not None:
-                    with self._lock:
-                        self._frame = result
-            except Exception:
-                time.sleep(0.1)
-
-    def get_aligned_frames(self):
-        with self._lock:
-            return self._frame
-
-    def get_depth_scale(self):
-        return self._cam.get_depth_scale()
-
-    def stop(self):
-        self._running = False
-        self._thread.join(timeout=2)
-        self._cam.stop()
-
-
-def _normal_to_quaternion(normal):
-    """将法向量转换为四元数 (x, y, z, w)"""
-    n = np.array(normal, dtype=np.float64)
-    n = n / np.linalg.norm(n)
-    ref = np.array([0.0, 0.0, -1.0])
-    cross = np.cross(ref, n)
-    cross_norm = np.linalg.norm(cross)
-    if cross_norm < 1e-10:
-        return [0.0, 0.0, 0.0, 1.0] if np.dot(ref, n) > 0 else [1.0, 0.0, 0.0, 0.0]
-    axis = cross / cross_norm
-    angle = math.acos(np.clip(np.dot(ref, n), -1.0, 1.0))
-    s = math.sin(angle / 2)
-    return [axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2)]
-
-
-def _panel_plane_distance(normal, centroid):
-    """计算相机原点到面板平面的垂直距离，单位米。"""
-    n = np.array(normal, dtype=np.float64)
-    p = np.array(centroid, dtype=np.float64)
-    n_norm = np.linalg.norm(n)
-    if n_norm < 1e-10:
-        return None
-    n = n / n_norm
-    return float(abs(np.dot(n, p)))
-
-
-def _stamp_to_sec(stamp):
-    sec, nanosec = _stamp_parts(stamp)
-    return float(sec) + float(nanosec) * 1e-9
-
-
-def _stamp_parts(stamp):
-    """Return (seconds, nanoseconds) for ROS1 or ROS2 time objects."""
-    sec = getattr(stamp, 'sec', getattr(stamp, 'secs', 0))
-    nanosec = getattr(stamp, 'nanosec', getattr(stamp, 'nsecs', 0))
-    return int(sec), int(nanosec)
-
-
-def _pop_synced_frame_pair(color_queue, depth_queue, max_dt):
-    """Pop the oldest timestamp-compatible color/depth pair."""
-    while color_queue and depth_queue:
-        color_item = color_queue[0]
-        depth_item = depth_queue[0]
-        delta = color_item[0] - depth_item[0]
-        if abs(delta) <= max_dt:
-            return color_queue.popleft(), depth_queue.popleft()
-        if delta < 0.0:
-            color_queue.popleft()
-        else:
-            depth_queue.popleft()
-    return None
-
-
-def _estimate_detection_point(det, depth_image, intrin, depth_scale,
-                              knob_quantile=0.2, knob_offset_m=0.005):
-    """
-    估计检测目标中心 3D 点。
-
-    话题模式下深度图已通过 depth_registration 对齐到彩色图，采样深度
-    应使用检测框原始像素坐标；不在采样前做 undistort，避免取错深度像素。
-
-    旋钮使用较小的 quantile 取手柄近表面深度，再加 offset 让操作点
-    略微深入手柄内部，方便机械臂卡住。
-    """
-    ux = int(round(det.center_x))
-    uy = int(round(det.center_y))
-    if det.class_name == 'knob':
-        depth = get_bbox_robust_depth(
-            depth_image, det.bbox, depth_scale=depth_scale,
-            center_ratio=0.45, min_valid=8, quantile=knob_quantile)
-        if depth > 0.0:
-            depth += knob_offset_m
-    elif det.class_name in ('button', 'door_button'):
-        depth = get_bbox_robust_depth(
-            depth_image, det.bbox, depth_scale=depth_scale,
-            center_ratio=0.45, min_valid=8, quantile=0.5)
-    else:
-        depth = get_robust_depth(
-            depth_image, ux, uy, sample_radius=3, depth_scale=depth_scale)
-    xyz = deproject_pixel_to_point(intrin, (ux, uy), depth)
-    return ux, uy, xyz
-
-
-def _estimate_nut_detection_point(localization, depth_image, intrin, depth_scale):
-    ux = int(round(localization.center[0]))
-    uy = int(round(localization.center[1]))
-    depth = get_masked_robust_depth(
-        depth_image, localization.depth_mask,
-        depth_scale=depth_scale, min_valid=12, quantile=0.5)
-    if depth <= 0.0:
-        return ux, uy, None
-    xyz = deproject_pixel_to_point(intrin, (ux, uy), depth)
-    return ux, uy, xyz
-
-
-def _estimate_bbox_grouping_point(det, depth_image, intrin, depth_scale):
-    """Estimate a robust center point used only for fastener grouping."""
-    ux = int(round(det.center_x))
-    uy = int(round(det.center_y))
-    depth = get_bbox_robust_depth(
-        depth_image, det.bbox, depth_scale=depth_scale,
-        center_ratio=0.70, min_valid=12, quantile=0.5)
-    if depth <= 0.0:
-        return ux, uy, None
-    return ux, uy, deproject_pixel_to_point(intrin, (ux, uy), depth)
-
-
-def _draw_depth_sample_roi(canvas, det, depth_image, depth_scale,
-                           center_ratio=0.45, quantile=0.5, offset_m=0.0):
-    """Debug: draw the depth sampling region and per-pixel depth values."""
-    h, w = depth_image.shape
-    x1, y1, x2, y2 = [float(v) for v in det.bbox]
-    cx = (x1 + x2) * 0.5
-    cy = (y1 + y2) * 0.5
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-    half_w = max(2.0, bw * center_ratio * 0.5)
-    half_h = max(2.0, bh * center_ratio * 0.5)
-
-    sx1 = max(0, int(round(cx - half_w)))
-    sx2 = min(w, int(round(cx + half_w + 1)))
-    sy1 = max(0, int(round(cy - half_h)))
-    sy2 = min(h, int(round(cy + half_h + 1)))
-    if sx1 >= sx2 or sy1 >= sy2:
-        return
-
-    cv2.rectangle(canvas, (sx1, sy1), (sx2, sy2), (0, 255, 255), 1)
-
-    patch = depth_image[sy1:sy2, sx1:sx2]
-    valid = patch[patch > 0].astype(np.float64)
-    valid_count = valid.size
-    if valid_count == 0:
-        cv2.putText(canvas, 'depth: no valid px',
-                    (sx1, sy2 + 14), 0, 0.35,
-                    (0, 0, 255), 1, cv2.LINE_AA)
-        return
-
-    lo, hi = np.percentile(valid, [10, 90])
-    trimmed = valid[(valid >= lo) & (valid <= hi)]
-    if trimmed.size >= 8:
-        q = float(np.clip(quantile, 0.05, 0.95))
-        surface_m = float(np.percentile(trimmed, q * 100.0)) * depth_scale
-        trimmed_count = trimmed.size
-    else:
-        surface_m = float(np.median(valid)) * depth_scale
-        trimmed_count = valid_count
-    final_m = surface_m + offset_m
-
-    overlay = canvas.copy()
-    for py in range(sy1, sy2):
-        for px in range(sx1, sx2):
-            d = depth_image[py, px]
-            if d == 0:
-                cv2.rectangle(overlay, (px, py), (px, py), (0, 0, 180), -1)
-            else:
-                dv = float(d)
-                if lo <= dv <= hi:
-                    cv2.rectangle(overlay, (px, py), (px, py), (0, 200, 0), -1)
-                else:
-                    cv2.rectangle(overlay, (px, py), (px, py), (0, 100, 200), -1)
-    cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
-
-    cv2.putText(canvas,
-                f'surface={surface_m:.3f}m  final={final_m:.3f}m '
-                f'(q={quantile} +{offset_m*1000:.1f}mm)',
-                (sx1, sy2 + 14), 0, 0.35,
-                (0, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(canvas,
-                f'range=[{lo * depth_scale:.3f},{hi * depth_scale:.3f}]m '
-                f'({trimmed_count}/{valid_count}px)',
-                (sx1, sy2 + 28), 0, 0.35,
-                (0, 255, 255), 1, cv2.LINE_AA)
-
-
-def _valid_point_3d(xyz):
-    if xyz is None:
-        return False
-    point = np.asarray(xyz, dtype=np.float64)
-    return point.shape == (3,) and np.all(np.isfinite(point)) and point[2] > 0.0
-
-
-def _is_button_like_detection(det):
-    """允许被当作按钮的几何形状：近似方形/圆形，排除细长指示灯。"""
-    w = max(1.0, det.bbox[2] - det.bbox[0])
-    h = max(1.0, det.bbox[3] - det.bbox[1])
-    aspect = w / h
+    width = max(1.0, detection.bbox[2] - detection.bbox[0])
+    height = max(1.0, detection.bbox[3] - detection.bbox[1])
+    aspect = width / height
     return 0.55 <= aspect <= 1.8
 
 
-def _bbox_inside_image(bbox, image_shape, margin_px=4):
-    h, w = image_shape[:2]
-    x1, y1, x2, y2 = [float(v) for v in bbox]
-    margin = float(margin_px)
-    return x1 > margin and y1 > margin and x2 < (w - margin) and y2 < (h - margin)
-
-
-def _publish_pose(pub, stamp, xyz, quat):
-    if pub is None or xyz is None:
-        return
-    msg = PoseStamped()
-    msg.header.stamp = stamp
-    msg.header.frame_id = 'camera_color_optical_frame'
-    msg.pose.position.x = float(xyz[0])
-    msg.pose.position.y = float(xyz[1])
-    msg.pose.position.z = float(xyz[2])
-    msg.pose.orientation.x = quat[0]
-    msg.pose.orientation.y = quat[1]
-    msg.pose.orientation.z = quat[2]
-    msg.pose.orientation.w = quat[3]
-    pub.publish(msg)
-
-
-def _draw_axis_direction(canvas, bbox, normal, label='axis',
-                         color=(255, 255, 0)):
-    x1, y1, x2, y2 = [int(round(v)) for v in bbox]
-    cx = int(round((x1 + x2) * 0.5))
-    cy = int(round((y1 + y2) * 0.5))
-    nx, ny, nz = [float(v) for v in normal]
-
-    scale = max(24.0, min(x2 - x1, y2 - y1) * 0.45)
-    xy_norm = math.hypot(nx, ny)
-    if xy_norm >= 0.03:
-        ex = int(round(cx + nx / xy_norm * scale))
-        ey = int(round(cy + ny / xy_norm * scale))
-        cv2.arrowedLine(canvas, (cx, cy), (ex, ey), color, 2,
-                        cv2.LINE_AA, tipLength=0.25)
-    else:
-        cv2.drawMarker(canvas, (cx, cy), color,
-                       markerType=cv2.MARKER_CROSS, markerSize=16,
-                       thickness=2)
-
-    text = f'{label} n=({nx:.2f},{ny:.2f},{nz:.2f})'
-    text_y = max(15, y1 - 24)
-    cv2.putText(canvas, text, (x1, text_y), 0, 0.42,
-                color, 1, cv2.LINE_AA)
-
-
-def _draw_apriltag_reference(canvas, reference, valve_errors=None):
-    if reference is None:
-        return
-    pts = np.round(reference['corners']).astype(np.int32)
-    cv2.polylines(canvas, [pts], True, (0, 180, 255), 2, cv2.LINE_AA)
-    center = np.mean(pts, axis=0).astype(int)
-    normal = reference['normal']
-    _draw_axis_direction(
-        canvas,
-        (center[0] - 24, center[1] - 24, center[0] + 24, center[1] + 24),
-        normal,
-        label=f"tag_ref[{reference['tag_id']}]",
-        color=(0, 180, 255),
-    )
-    lines = [
-        f"{reference['source']} n=({normal[0]:.2f},{normal[1]:.2f},{normal[2]:.2f})",
-        f"inlier={reference['inlier_ratio']:.2f} rms={reference['rms_error']*1000:.1f}mm",
-    ]
-    for err in valve_errors or []:
-        lines.append(f"valve diff={err['angle_deg']:.1f}deg")
-    x = int(np.min(pts[:, 0]))
-    y = int(np.max(pts[:, 1])) + 18
-    for i, text in enumerate(lines[:5]):
-        cv2.putText(canvas, text, (x, y + i * 16), 0, 0.42,
-                    (0, 180, 255), 1, cv2.LINE_AA)
-
-
-def _regular_polygon_points(bbox, n_sides, angle_deg=0.0, angle_mode='edge'):
-    x1, y1, x2, y2 = [float(v) for v in bbox]
-    cx = (x1 + x2) * 0.5
-    cy = (y1 + y2) * 0.5
-    radius = max(2.0, min(x2 - x1, y2 - y1) * 0.47)
-    if angle_mode == 'vertex':
-        start_deg = angle_deg
-    else:
-        # Offset by half a sector so the fitted angle follows the detected edge
-        # orientation rather than a vertex orientation.
-        start_deg = angle_deg + 180.0 / max(3, n_sides)
-    start = math.radians(start_deg)
-    angles = start + np.arange(n_sides, dtype=np.float64) * (2.0 * math.pi / n_sides)
-    pts = np.column_stack([
-        cx + radius * np.cos(angles),
-        cy + radius * np.sin(angles),
-    ])
-    return np.round(pts).astype(np.int32)
-
-
-def _draw_regular_polygon(canvas, bbox, n_sides, angle, color=(0, 255, 255),
-                          angle_mode='edge'):
-    pts = _regular_polygon_points(bbox, n_sides, angle, angle_mode=angle_mode)
-    cv2.polylines(canvas, [pts], True, color, 2, cv2.LINE_AA)
-    x1, y1 = int(round(bbox[0])), int(round(bbox[1]))
-    cv2.putText(canvas, f'{n_sides}-gon {angle:.1f}deg',
-                (x1, max(15, y1 - 8)), 0, 0.42,
-                color, 1, cv2.LINE_AA)
-
-
-def _draw_axis_3d_view(canvas, axis_directions):
-    if not axis_directions:
-        return
-
-    panel_w = 330
-    panel_h = min(235, max(155, 72 + 24 * min(len(axis_directions), 5)))
-    margin = 10
-    x1 = max(0, canvas.shape[1] - panel_w - margin)
-    y1 = margin
-    x2 = min(canvas.shape[1] - margin, x1 + panel_w)
-    y2 = min(canvas.shape[0] - margin, y1 + panel_h)
-
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.55, canvas, 0.45, 0, canvas)
-    cv2.rectangle(canvas, (x1, y1), (x2, y2), (180, 180, 180), 1)
-    cv2.putText(canvas, 'Camera-facing axis view', (x1 + 10, y1 + 20),
-                0, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
-
-    origin = (x1 + 76, y1 + 92)
-    radius = 54
-    cv2.circle(canvas, origin, radius, (90, 90, 90), 1, cv2.LINE_AA)
-    cv2.circle(canvas, origin, int(radius * 0.5), (65, 65, 65), 1, cv2.LINE_AA)
-    cv2.line(canvas, (origin[0] - radius, origin[1]),
-             (origin[0] + radius, origin[1]), (90, 90, 90), 1, cv2.LINE_AA)
-    cv2.line(canvas, (origin[0], origin[1] - radius),
-             (origin[0], origin[1] + radius), (90, 90, 90), 1, cv2.LINE_AA)
-    cv2.putText(canvas, '+X', (origin[0] + radius + 4, origin[1] + 4),
-                0, 0.36, (80, 180, 255), 1, cv2.LINE_AA)
-    cv2.putText(canvas, '+Y', (origin[0] + 4, origin[1] + radius + 14),
-                0, 0.36, (80, 255, 120), 1, cv2.LINE_AA)
-    cv2.putText(canvas, '-Z to camera', (origin[0] - 43, origin[1] - radius - 8),
-                0, 0.36, (255, 180, 80), 1, cv2.LINE_AA)
-    cv2.drawMarker(canvas, origin, (255, 180, 80),
-                   markerType=cv2.MARKER_CROSS, markerSize=12,
-                   thickness=1)
-
-    shown = axis_directions[:5]
-    for idx, item in enumerate(shown):
-        normal = item.get('axis_direction')
-        if normal is None:
-            continue
-        cls_name = item.get('class', 'axis')
-        source = item.get('source', '')
-        nx, ny, nz = [float(v) for v in normal]
-        align = float(np.clip(-nz, 0.0, 1.0))
-        if align >= 0.9:
-            color = (80, 255, 80)
-        elif align >= 0.65:
-            color = (0, 220, 255)
-        else:
-            color = (0, 80, 255)
-
-        px = int(round(origin[0] + np.clip(nx, -1.0, 1.0) * radius))
-        py = int(round(origin[1] + np.clip(ny, -1.0, 1.0) * radius))
-        cv2.arrowedLine(canvas, origin, (px, py), color, 2,
-                        cv2.LINE_AA, tipLength=0.22)
-        dot_radius = int(round(4 + 7 * align))
-        cv2.circle(canvas, (px, py), dot_radius, color, -1, cv2.LINE_AA)
-        cv2.circle(canvas, (px, py), dot_radius, (20, 20, 20), 1, cv2.LINE_AA)
-
-        tx = x1 + 145
-        ty = y1 + 48 + idx * 24
-        label = f'{cls_name}[{source}] ({nx:.2f},{ny:.2f},{nz:.2f})'
-        cv2.putText(canvas, label, (tx, ty),
-                    0, 0.38, color, 1, cv2.LINE_AA)
-
-    if len(axis_directions) > len(shown):
-        cv2.putText(canvas, f'+{len(axis_directions) - len(shown)} more',
-                    (x1 + 145, y2 - 12), 0, 0.38,
-                    (210, 210, 210), 1, cv2.LINE_AA)
-
-
 def _fit_axis_from_points(points, fallback_axis):
-    """用 PCA 拟合目标行方向，并固定为从左到右。"""
-    pts = np.array(points, dtype=np.float64)
-    if len(pts) < 2:
-        axis = np.array(fallback_axis, dtype=np.float64)
-    else:
-        centered = pts - np.mean(pts, axis=0)
-        _, _, vt = np.linalg.svd(centered, full_matrices=False)
-        axis = vt[0]
+    """Fit the panel row with PCA and orient it from image-left to right."""
 
-    norm = np.linalg.norm(axis)
+    point_array = np.asarray(points, dtype=np.float64)
+    if len(point_array) < 2:
+        axis = np.asarray(fallback_axis, dtype=np.float64)
+    else:
+        centered = point_array - np.mean(point_array, axis=0)
+        _, _, right_vectors = np.linalg.svd(centered, full_matrices=False)
+        axis = right_vectors[0]
+    norm = float(np.linalg.norm(axis))
     if norm < 1e-6:
-        axis = np.array(fallback_axis, dtype=np.float64)
-        norm = np.linalg.norm(axis)
+        axis = np.asarray(fallback_axis, dtype=np.float64)
+        norm = float(np.linalg.norm(axis))
     axis = axis / max(norm, 1e-6)
-    if axis[0] < 0:
+    if axis[0] < 0.0:
         axis = -axis
     return axis
 
 
-class PositionStabilizer:
-    """画面静止后对 3D 坐标做时序滤波，降低 topic 输出跳变。"""
-
-    def __init__(self, enabled=True, still_time=3.0,
-                 pixel_thresh=5.0, window_size=45, ema_alpha=0.25,
-                 depth_std_thresh=0.01):
-        self.enabled = enabled
-        self.still_time = float(still_time)
-        self.pixel_thresh = float(pixel_thresh)
-        self.window_size = int(window_size)
-        self.ema_alpha = float(ema_alpha)
-        self.depth_std_thresh = float(depth_std_thresh)
-        self._last_pixels = {}
-        self._still_since = {}
-        self._histories = defaultdict(lambda: deque(maxlen=self.window_size))
-        self._stable_xyz = {}
-
-    def update(self, measurements, now):
-        """
-        Args:
-            measurements: [(target_id, pixel_xy, xyz), ...]
-            now: time.time() 秒
-
-        Returns:
-            {target_id: filtered_xyz}
-        """
-        raw = {tid: np.array(xyz, dtype=np.float64)
-               for tid, _, xyz in measurements}
-        if not self.enabled or not measurements:
-            return {tid: xyz.tolist() for tid, xyz in raw.items()}
-
-        pixels = {tid: np.array(pixel_xy, dtype=np.float64)
-                  for tid, pixel_xy, _ in measurements}
-        current_ids = set(raw)
-
-        for tid in list(self._last_pixels):
-            if tid not in current_ids:
-                self._last_pixels.pop(tid, None)
-                self._still_since.pop(tid, None)
-
-        filtered = {}
-        for tid, xyz in raw.items():
-            last_pixel = self._last_pixels.get(tid)
-            is_still = (
-                last_pixel is not None and
-                np.linalg.norm(pixels[tid] - last_pixel) <= self.pixel_thresh
-            )
-            if is_still:
-                self._still_since.setdefault(tid, now)
-                self._histories[tid].append(xyz)
-            else:
-                self._still_since[tid] = now
-                self._histories[tid].clear()
-                self._histories[tid].append(xyz)
-                self._stable_xyz.pop(tid, None)
-
-            self._last_pixels[tid] = pixels[tid]
-            history = self._histories[tid]
-            static_ready = (
-                now - self._still_since.get(tid, now) >= self.still_time and
-                len(history) >= 3
-            )
-
-            if static_ready:
-                stacked = np.vstack(history)
-                depth_stable = float(np.std(stacked[:, 2])) <= self.depth_std_thresh
-                if depth_stable:
-                    median_xyz = np.median(stacked, axis=0)
-                    prev = self._stable_xyz.get(tid)
-                    stable = median_xyz if prev is None else (
-                        (1.0 - self.ema_alpha) * prev + self.ema_alpha * median_xyz)
-                    self._stable_xyz[tid] = stable
-                    filtered[tid] = stable.tolist()
-                    continue
-
-            filtered[tid] = self._stable_xyz.get(tid, xyz).tolist()
-
-        return filtered
-
-
-class PlaneStabilizer:
-    """对面板平面结果做确定性时序平滑，减少 /panel/distance 抖动。"""
-
-    def __init__(self, alpha=0.25):
-        self.alpha = float(alpha)
-        self._normal = None
-        self._centroid = None
-
-    def update(self, normal, centroid):
-        normal = np.array(normal, dtype=np.float64)
-        centroid = np.array(centroid, dtype=np.float64)
-        norm = np.linalg.norm(normal)
-        if norm < 1e-10:
-            return None
-        normal = normal / norm
-
-        if self._normal is None:
-            self._normal = normal
-            self._centroid = centroid
-        else:
-            if np.dot(normal, self._normal) < 0:
-                normal = -normal
-            self._normal = (1.0 - self.alpha) * self._normal + self.alpha * normal
-            self._normal = self._normal / max(np.linalg.norm(self._normal), 1e-10)
-            self._centroid = (1.0 - self.alpha) * self._centroid + self.alpha * centroid
-        return self._normal.copy(), self._centroid.copy()
-
-
 def _parse_angle_constraint_mode(value):
+    """Parse the three ROS2-compatible knob-angle modes.
+
+    1: white marker line (ID3 red handle), stabilized discrete 0/90 output.
+    2: red-handle/white-tape detection with physical angle constraints.
+    3: red-handle/white-tape detection without physical constraints.
     """
-    use_constraint 三档模式:
-      1: 默认，白色手柄线方向离散输出 0/90，并做时序稳定
-      2: 兼容旧 true，启用原物理范围约束
-      3: 兼容旧 false，不启用原物理范围约束
-    """
+
     if isinstance(value, bool):
         return 2 if value else 3
     if isinstance(value, (int, float)):
         mode = int(value)
     else:
         text = str(value).strip().lower()
-        if text in ('true', 'yes', 'on'):
+        if text in ("true", "yes", "on"):
             return 2
-        if text in ('false', 'no', 'off'):
+        if text in ("false", "no", "off"):
             return 3
         try:
             mode = int(text)
@@ -689,2373 +107,1223 @@ def _parse_angle_constraint_mode(value):
     return mode if mode in (1, 2, 3) else 1
 
 
-
-def _symmetric_angle_diff_deg(a, b, period=45.0):
-    return abs(((float(a) - float(b) + period * 0.5) % period) - period * 0.5)
-
-
-class ValveAngleStabilizer:
-    """Select valve angle candidates using temporal continuity."""
-
-    def __init__(self, enabled=True, max_jump_deg=10.0, confirm_frames=5):
-        self.enabled = bool(enabled)
-        self.max_jump_deg = float(max_jump_deg)
-        self.confirm_frames = int(confirm_frames)
-        self._stable = {}
-        self._pending = {}
-        self._pending_count = defaultdict(int)
-
-    def update(self, target_key, raw_angle, candidates=None):
-        if raw_angle is None:
-            return self._stable.get(target_key)
-        if not self.enabled:
-            return float(raw_angle) % 45.0
-
-        options = []
-        for angle in list(candidates or []) + [raw_angle]:
-            if angle is None:
-                continue
-            angle = float(angle) % 45.0
-            if not any(_symmetric_angle_diff_deg(angle, existing) < 1e-3
-                       for existing in options):
-                options.append(angle)
-        if not options:
-            return self._stable.get(target_key)
-
-        stable = self._stable.get(target_key)
-        if stable is None:
-            selected = options[0]
-            self._stable[target_key] = selected
-            self._clear_pending(target_key)
-            return selected
-
-        selected = min(options, key=lambda angle: _symmetric_angle_diff_deg(angle, stable))
-        if _symmetric_angle_diff_deg(selected, stable) <= self.max_jump_deg:
-            self._stable[target_key] = selected
-            self._clear_pending(target_key)
-            return selected
-
-        pending = options[0]
-        if self._pending.get(target_key) is None or (
-                _symmetric_angle_diff_deg(pending, self._pending[target_key]) > self.max_jump_deg):
-            self._pending[target_key] = pending
-            self._pending_count[target_key] = 1
-        else:
-            self._pending[target_key] = pending
-            self._pending_count[target_key] += 1
-
-        if self._pending_count[target_key] >= self.confirm_frames:
-            self._stable[target_key] = pending
-            self._clear_pending(target_key)
-
-        return self._stable[target_key]
-
-    def _clear_pending(self, target_key):
-        self._pending.pop(target_key, None)
-        self._pending_count.pop(target_key, None)
-
-
-class PanelDetectionNode(Node):
+class PanelDetectionNode:
     def __init__(self):
-        super().__init__('panel_detection_node')
+        self.bridge = CvBridge()
+        self.lock = threading.Lock()
+        self.latest_camera_info = None
+        self.last_status = None
+        opencv_threads = int(rospy.get_param("~opencv_threads", 0))
+        if opencv_threads > 0:
+            cv2.setNumThreads(opencv_threads)
 
-        # 加载配置
-        self.declare_parameter('config_path', '')
-        config_path = self.get_parameter('config_path').get_parameter_value().string_value
-        if config_path and os.path.isfile(config_path):
-            self.get_logger().info(f'加载配置: {config_path}')
-            with open(config_path, 'r', encoding='utf-8') as f:
-                self.cfg = merge_config(DEFAULT_CONFIG, yaml.safe_load(f) or {})
-        else:
-            self.get_logger().info('使用默认配置')
-            if config_path:
-                raise FileNotFoundError(config_path)
-            self.cfg = merge_config(DEFAULT_CONFIG, {})
-
-        self.declare_parameter(
-            'onnx_model', self.cfg.get('onnx_model', '1013.onnx'))
-        self.declare_parameter(
-            'onnx_threads', self.cfg.get('onnx_threads', 8))
-        self.cfg['onnx_model'] = self.get_parameter('onnx_model').value
-        self.cfg['onnx_threads'] = int(self.get_parameter('onnx_threads').value)
-
-        self.declare_parameter('detection_mode', self.cfg.get('detection_mode', 'all'))
-        mode_param = self.get_parameter('detection_mode').get_parameter_value().string_value
-        self._detection_mode = mode_param if mode_param in MODE_CLASS_FILTERS else 'all'
-        if mode_param != self._detection_mode:
-            self.get_logger().warn(f'未知 detection_mode={mode_param}, 回退 all')
-        self._active_classes = MODE_CLASS_FILTERS[self._detection_mode]
-        self._process_panel_controls = self._detection_mode in ('panel_controls', 'all')
-        self._process_valves = self._detection_mode in ('valve', 'all')
-        self._process_fasteners = self._detection_mode in ('fastener', 'all')
-        self._process_leak = self._detection_mode == 'leak'
-        self.declare_parameter(
-            'publish_legacy_topics', self.cfg.get('publish_legacy_topics', False))
-        self._publish_legacy_topics = (
-            self.get_parameter('publish_legacy_topics').get_parameter_value().bool_value)
-        self.get_logger().info(
-            f'检测模式: {self._detection_mode}, legacy topics={self._publish_legacy_topics}')
-
-        topics = MODE_TOPIC_MAP[self._detection_mode]
-
-        # 创建话题 publisher (每类一个 PoseStamped，默认关闭，仅兼容旧系统)
-        self._pose_pubs = {}
-        if self._publish_legacy_topics:
-            for cls_name, topic in CLASS_TOPIC_MAP.items():
-                if self._active_classes is None or cls_name in self._active_classes:
-                    self._pose_pubs[cls_name] = self.create_publisher(PoseStamped, topic, 10)
-
-        self._knob_observations_pub = (
-            self.create_publisher(String, '/panel/knob_observations', 10)
-            if self._process_panel_controls else None)
-
-        self._board_cards_pub = (
-            self.create_publisher(String, '/panel/board_cards', 10)
-            if self._process_panel_controls else None)
-
-        self._targets_pub = (
-            self.create_publisher(String, topics['targets'], 10)
-            if 'targets' in topics else None)
-        self._status_pub = (
-            self.create_publisher(String, topics['status'], 10)
-            if 'status' in topics else None)
-        self._angle_pub = (
-            self.create_publisher(String, topics['angles'], 10)
-            if 'angles' in topics else None)
-        self._object_geometry_pub = (
-            self.create_publisher(String, topics['geometry'], 10)
-            if 'geometry' in topics else None)
-        self._distance_pub = (
-            self.create_publisher(String, topics['distance'], 10)
-            if 'distance' in topics else None)
-        # 铭牌 OCR 暂停使用，不创建 /panel/labels publisher。
-        self._labels_pub = None
-
-        # 目标注册器
-        reg_cfg = self.cfg.get('registry', {})
-        self._registry = TargetRegistry(
-            stable_frames=reg_cfg.get('stable_frames', 15),
-            green_hue_range=tuple(reg_cfg.get('green_hue_range', [35, 85])),
-            match_distance_thresh=reg_cfg.get('match_distance_thresh', 80),
+        self.color_topic = rospy.get_param(
+            "~color_topic", "/camera_d435_0/color/image_raw"
         )
-        panel_tag_cfg = self.cfg.get('panel_apriltag', {})
-        self.declare_parameter(
-            'use_panel_tags', panel_tag_cfg.get('enable', True))
-        self._panel_tags_enabled = (
-            self._process_panel_controls and
-            self.get_parameter('use_panel_tags').get_parameter_value().bool_value)
-        self._panel_tag_cfg = panel_tag_cfg
-        self._panel_layout_fallback = panel_tag_cfg.get(
-            'layout_fallback', panel_tag_cfg.get('scene', DEFAULT_SCENE) == 'test_site')
-        self._panel_tag_tracker = PanelAprilTagTracker(panel_tag_cfg)
-        if self._panel_tags_enabled:
-            if hasattr(cv2, 'aruco'):
-                self.get_logger().info(
-                    '面板 AprilTag 编号已启用 (tag36h11, ID 00-39)')
-            else:
-                self.get_logger().warn(
-                    '当前 OpenCV 不包含 aruco，面板 AprilTag 编号不可用')
-        fastener_reg_cfg = self.cfg.get('fastener_registry', {})
-        self._fastener_registry = FastenerGroupRegistry(
-            min_init_observations=fastener_reg_cfg.get('min_init_observations', 2),
-            max_group_distance_m=fastener_reg_cfg.get('max_group_distance_m', 0.35),
-            max_slot_distance_m=fastener_reg_cfg.get('max_slot_distance_m', 0.12),
-            slot_match_ratio=fastener_reg_cfg.get('slot_match_ratio', 0.45),
-            normal_angle_thresh_deg=fastener_reg_cfg.get(
-                'normal_angle_thresh_deg', 25.0),
-            ema_alpha=fastener_reg_cfg.get('ema_alpha', 0.35),
-            slot_ambiguity_margin_m=fastener_reg_cfg.get(
-                'slot_ambiguity_margin_m', 0.008),
-            stale_frames=fastener_reg_cfg.get('stale_frames', 120),
+        self.depth_topic = rospy.get_param(
+            "~depth_topic", "/camera_d435_0/aligned_depth_to_color/image_raw"
         )
-        fastener_axis_cfg = self.cfg.get('fastener_axis_stabilizer', {})
-        self._fastener_axis_stabilizer = FastenerAxisStabilizer(
-            enabled=fastener_axis_cfg.get('enable', True),
-            ema_alpha=fastener_axis_cfg.get('ema_alpha', 0.18),
-            max_jump_deg=fastener_axis_cfg.get('max_jump_deg', 12.0),
-            confirm_frames=fastener_axis_cfg.get('confirm_frames', 5),
-            max_output_step_deg=fastener_axis_cfg.get(
-                'max_output_step_deg', 3.0),
-            match_distance_px=fastener_axis_cfg.get('match_distance_px', 60.0),
-            match_size_ratio=fastener_axis_cfg.get('match_size_ratio', 1.2),
-            stale_frames=fastener_axis_cfg.get('stale_frames', 60),
+        self.camera_info_topic = rospy.get_param(
+            "~camera_info_topic", "/camera_d435_0/color/camera_info"
         )
-
-        # 相机来源：直接连接 or 话题订阅
-        self.declare_parameter('use_topic', True)
-        self._use_topic = self.get_parameter('use_topic').get_parameter_value().bool_value
-
-        self._camera = None
-        # Orbbec 官方驱动深度图单位为 mm，× 0.001 转米
-        self.declare_parameter('depth_scale', self.cfg.get('depth_scale', 0.001))
-        self._depth_scale = float(self.get_parameter('depth_scale').value)
-        self._camera_ready = False
-
-        # 话题订阅模式的缓存
-        self._topic_color_frame_id = 'camera_color_optical_frame'
-        self._topic_color = None
-        self._topic_depth = None
-        self._topic_color_stamp = None
-        self._topic_depth_stamp = None
-        self._topic_color_stamp_msg = None
-        self._topic_depth_stamp_msg = None
-        self._topic_color_queue = deque(maxlen=10)
-        self._topic_depth_queue = deque(maxlen=10)
-        self._topic_pair_queue = deque(maxlen=10)
-        self._last_topic_enqueue_stamp = None
-        self._topic_color_intrin = None
-        self._topic_depth_intrin = None
-        self._topic_frame_lock = threading.Lock()
-        sync_cfg = self.cfg.get('topic_sync', {})
-        self.declare_parameter('registered_depth', sync_cfg.get('registered_depth', True))
-        self._registered_depth = (
-            self.get_parameter('registered_depth').get_parameter_value().bool_value)
-        self._topic_sync_max_dt = float(sync_cfg.get('max_dt', 0.05))
-        self._last_sync_warn = 0.0
-        self._intrinsics_checked = False
-
-        # 直连模式下转发图像话题，供其他节点使用
-        self._color_pub = None
-        self._depth_pub = None
-        self._color_info_pub = None
-        self._depth_info_pub = None
-
-        if self._use_topic:
-            self._init_subscribers()
-            self._camera_ready = True
-            self.get_logger().info('使用话题订阅模式')
-        else:
-            self._init_camera()
-            # 直连模式下发布图像话题
-            self._color_pub = self.create_publisher(Image, '/camera/color/image_raw', 5)
-            self._depth_pub = self.create_publisher(Image, '/camera/depth/image_raw', 5)
-            self._color_info_pub = self.create_publisher(CameraInfo, '/camera/color/camera_info', 5)
-            self._depth_info_pub = self.create_publisher(CameraInfo, '/camera/depth/camera_info', 5)
-            self.get_logger().info('直连模式：同时发布相机话题供其他节点使用')
-
-        # 初始化检测器
-        self._detector = self._create_detector()
-        self._class_names = getattr(self._detector, 'class_names', None) or \
-            self.cfg.get('class_name', [])
-
-        # 旋钮角度配置
-        angle_cfg = self.cfg.get('knob_angle', {})
-        self._angle_enable = angle_cfg.get('enable', False)
-        self._angle_binary_thresh = angle_cfg.get('binary_thresh', 180)
-        self._angle_circle_mask = angle_cfg.get('circle_mask_ratio', 0.85)
-        self._angle_knob_class = angle_cfg.get('knob_class', 'knob')
-        self.declare_parameter('use_constraint', str(angle_cfg.get('use_constraint', 1)))
-        self.declare_parameter('use_constrain', '')
-        constraint_alias = self.get_parameter('use_constrain').value
-        constraint_param = constraint_alias or self.get_parameter('use_constraint').value
-        self._angle_constraint_mode = _parse_angle_constraint_mode(constraint_param)
-        self._knob_angle_stabilizer = KnobDiscreteAngleStabilizer(
-            switch_margin=angle_cfg.get('discrete_switch_margin', 8.0),
-            confirm_frames=angle_cfg.get('discrete_confirm_frames', 3),
+        self.camera_frame = rospy.get_param(
+            "~camera_frame", "camera_d435_0_color_optical_frame"
         )
-        knob_depth_cfg = self.cfg.get('knob_depth', {})
-        self._knob_depth_quantile = float(knob_depth_cfg.get('quantile', 0.2))
-        self._knob_depth_offset_m = float(knob_depth_cfg.get('offset_m', 0.005))
-        self.get_logger().info(
-            f'旋钮深度: quantile={self._knob_depth_quantile}, '
-            f'offset={self._knob_depth_offset_m * 1000:.1f}mm')
-
-        valve_angle_cfg = self.cfg.get('valve_angle_stabilizer', {})
-        self._valve_angle_stabilizer = ValveAngleStabilizer(
-            enabled=valve_angle_cfg.get('enable', True),
-            max_jump_deg=valve_angle_cfg.get('max_jump_deg', 10.0),
-            confirm_frames=valve_angle_cfg.get('confirm_frames', 5),
-        )
-        self.get_logger().info(
-            f'旋钮角度模式: {self._angle_constraint_mode} '
-            '(1=0/90稳定输出, 2=旧约束, 3=旧无约束)')
-
-        # 铭牌 OCR 暂停使用，不初始化 RapidOCR/PaddleOCR，也不绘制 OCR ROI。
-        self._nameplate_enable = False
-        self._nameplate_recognizer = None
-
-        pos_cfg = self.cfg.get('position_stabilizer', {})
-        self._position_stabilizer = PositionStabilizer(
-            enabled=pos_cfg.get('enable', True),
-            still_time=pos_cfg.get('still_time', 3.0),
-            pixel_thresh=pos_cfg.get('pixel_thresh', 5.0),
-            window_size=pos_cfg.get('window_size', 45),
-            ema_alpha=pos_cfg.get('ema_alpha', 0.25),
-            depth_std_thresh=pos_cfg.get('depth_std_thresh', 0.01),
-        )
-        fastener_pos_cfg = self.cfg.get('fastener_position_stabilizer', {})
-        self._fastener_position_stabilizer = PositionStabilizer(
-            enabled=fastener_pos_cfg.get('enable', True),
-            still_time=fastener_pos_cfg.get('still_time', 1.0),
-            pixel_thresh=fastener_pos_cfg.get('pixel_thresh', 5.0),
-            window_size=fastener_pos_cfg.get('window_size', 30),
-            ema_alpha=fastener_pos_cfg.get('ema_alpha', 0.20),
-            depth_std_thresh=fastener_pos_cfg.get('depth_std_thresh', 0.008),
-        )
-        self._panel_line_cfg = self.cfg.get('panel_line', {})
-        self._persistent_panel_axis = PersistentPanelAxis(
-            dist_ratio=self._panel_line_cfg.get('dist_ratio', 0.85),
-            min_dist=self._panel_line_cfg.get('min_dist', 45.0),
-            max_dist=self._panel_line_cfg.get('max_dist', 110.0),
-            min_proj_margin=self._panel_line_cfg.get('min_proj_margin', 450.0),
-        )
-
-        # 面板法向量
-        self._panel_normal_cache = None
-        self._panel_plane_stabilizer = PlaneStabilizer(
-            alpha=self.cfg.get('panel_normal_alpha', 0.25))
-        self._frame_count = 0
-        self._normal_interval = self.cfg.get('panel_normal_interval', 10)
-        self._last_status_publish_time = 0.0
-        ref_cfg = self.cfg.get('apriltag_reference', {})
-        self._apriltag_reference_enabled = bool(ref_cfg.get('enable', False))
-        self._apriltag_reference_cache = None
-        self._concentric_marker_cfg = self.cfg.get('concentric_bolt_marker', {})
-        self._concentric_marker_enabled = bool(
-            self._concentric_marker_cfg.get('enable', True))
-        self._concentric_marker_stabilizer = ConcentricMarkerStabilizer(
-            enabled=self._concentric_marker_cfg.get('stabilizer_enable', True),
-            position_ema_alpha=self._concentric_marker_cfg.get(
-                'position_ema_alpha', 0.35),
-            position_jump_thresh_m=self._concentric_marker_cfg.get(
-                'position_jump_thresh_m', 0.03),
-            position_max_velocity_mps=self._concentric_marker_cfg.get(
-                'position_max_velocity_mps', 1.0),
-            normal_ema_alpha=self._concentric_marker_cfg.get(
-                'normal_ema_alpha', 0.25),
-            normal_max_jump_deg=self._concentric_marker_cfg.get(
-                'normal_max_jump_deg', 12.0),
-            angle_ema_alpha=self._concentric_marker_cfg.get(
-                'angle_ema_alpha', 0.30),
-            angle_max_jump_deg=self._concentric_marker_cfg.get(
-                'angle_max_jump_deg', 30.0),
-            direction_ema_alpha=self._concentric_marker_cfg.get(
-                'direction_ema_alpha', 0.30),
-            direction_max_jump_deg=self._concentric_marker_cfg.get(
-                'direction_max_jump_deg', 20.0),
-            max_dt=self._concentric_marker_cfg.get('stabilizer_max_dt', 0.5),
-            stale_frames=self._concentric_marker_cfg.get(
-                'stabilizer_stale_frames', 90),
-        )
-        self._axis_ref_log_fp = None
-        self._axis_ref_log_path = ''
-        if self._apriltag_reference_enabled and ref_cfg.get('log_enable', True):
-            self._axis_ref_log_path = os.path.abspath(
-                ref_cfg.get('log_path', 'axis_reference_log.jsonl'))
-            try:
-                self._axis_ref_log_fp = open(self._axis_ref_log_path, 'w',
-                                             encoding='utf-8', buffering=1)
-                self.get_logger().info(
-                    f'AprilTag 参考轴线日志: {self._axis_ref_log_path}')
-            except OSError as exc:
-                self.get_logger().warn(f'无法写入参考轴线日志: {exc}')
-
-        # 漏点管道检测模式
-        self._leak_upstream_point = None
-        self._leak_upstream_stamp = 0.0
-        leak_cfg = self.cfg.get('leak', {})
-        self._leak_upstream_timeout = float(leak_cfg.get('upstream_timeout', 2.0))
-        self._leak_bolt_detector = None
-        if self._process_leak:
-            from geometry_msgs.msg import PointStamped
-            self._sub_leak_point = self.create_subscription(
-                PointStamped, '/leak/upstream_point',
-                self._leak_point_callback, 10)
-            self.get_logger().info(
-                '漏点管道检测模式：订阅 /leak/upstream_point，'
-                f'超时 {self._leak_upstream_timeout}s 后回退黑色标记检测')
-            self._leak_bolt_detector = self._create_leak_bolt_detector(leak_cfg)
-
-        # 重连
-        self._reconnect_interval = 5.0
-        self._last_reconnect_time = 0.0
-
-        # 可视化
-        self.display_frame = None
-        self.declare_parameter('debug_depth_roi', False)
-        self._debug_depth_roi = (
-            self.get_parameter('debug_depth_roi').get_parameter_value().bool_value)
-        self.declare_parameter('capture_dir', '')
-        self.declare_parameter('capture_hz', 1.0)
-        self.declare_parameter('show_gui', False)
-        self.declare_parameter('publish_debug_image', True)
-        self.declare_parameter('debug_image_topic', '~debug_image')
-        publish_debug_image = self.get_parameter(
-            'publish_debug_image').get_parameter_value().bool_value
-        debug_image_topic = self.get_parameter(
-            'debug_image_topic').get_parameter_value().string_value
-        self._debug_image_pub = (
-            self.create_publisher(Image, debug_image_topic, 1)
-            if publish_debug_image else None)
-        self._capture_dir = self.get_parameter(
-            'capture_dir').get_parameter_value().string_value
-        capture_hz = self.get_parameter(
-            'capture_hz').get_parameter_value().double_value
-        self._capture_interval = 1.0 / capture_hz if capture_hz > 0.0 else None
-        self._last_capture_stamp = None
-        if self._capture_dir:
-            self._capture_dir = os.path.abspath(os.path.expanduser(self._capture_dir))
-            os.makedirs(self._capture_dir, exist_ok=True)
-            self.get_logger().info(
-                f'检测画面保存: {self._capture_dir} ({capture_hz:g} Hz)')
-
-        self._gui_enabled = False
-        if self.get_parameter('show_gui').get_parameter_value().bool_value:
-            try:
-                cv2.namedWindow(
-                    'panel_detection',
-                    cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-                self._gui_enabled = True
-            except cv2.error:
-                self.get_logger().warn('无显示环境，禁用 GUI 可视化')
-
-        status = '运行中' if self._camera_ready else '等待相机'
-        self.get_logger().info(f'面板检测节点已启动 ({status})')
-
-    def _write_axis_reference_log(self, stamp, axis_reference, valve_errors):
-        if self._axis_ref_log_fp is None or axis_reference is None or not valve_errors:
-            return
-        stamp_secs, stamp_nanosecs = _stamp_parts(stamp)
-        stamp_sec = _stamp_to_sec(stamp)
-        for err in valve_errors:
-            record = {
-                'stamp': stamp_sec,
-                'stamp_sec': stamp_secs,
-                'stamp_nanosec': stamp_nanosecs,
-                'frame': int(self._frame_count),
-                'reference': {
-                    'source': axis_reference.get('source'),
-                    'tag_id': axis_reference.get('tag_id'),
-                    'normal': axis_reference.get('normal'),
-                    'centroid': axis_reference.get('centroid'),
-                    'point_count': axis_reference.get('point_count'),
-                    'inlier_ratio': axis_reference.get('inlier_ratio'),
-                    'rms_error_m': axis_reference.get('rms_error_m'),
-                },
-                'valve': err,
-            }
-            self._axis_ref_log_fp.write(json.dumps(record, ensure_ascii=False) + '\n')
-
-    def _update_display_frame(self, canvas, stamp=None):
-        self.display_frame = canvas
-
-        if self._debug_image_pub is not None:
-            debug_msg = Image()
-            debug_msg.header.stamp = stamp if stamp is not None else rospy.Time.now()
-            debug_msg.header.frame_id = 'camera_color_optical_frame'
-            debug_msg.height, debug_msg.width = canvas.shape[:2]
-            debug_msg.encoding = 'bgr8'
-            debug_msg.is_bigendian = 0
-            debug_msg.step = debug_msg.width * 3
-            debug_msg.data = np.ascontiguousarray(canvas).tobytes()
-            self._debug_image_pub.publish(debug_msg)
-
-        if not self._capture_dir or self._capture_interval is None:
-            return
-
-        if stamp is None:
-            stamp_seconds = time.time()
-            stamp_sec = int(stamp_seconds)
-            stamp_nanosec = int(round(
-                (stamp_seconds - stamp_sec) * 1e9))
-        else:
-            stamp_sec, stamp_nanosec = _stamp_parts(stamp)
-            stamp_seconds = stamp_sec + stamp_nanosec * 1e-9
-
-        if (self._last_capture_stamp is not None and
-                stamp_seconds - self._last_capture_stamp <
-                self._capture_interval - 1e-6):
-            return
-
-        filename = f'{stamp_sec}_{stamp_nanosec:09d}.jpg'
-        output_path = os.path.join(self._capture_dir, filename)
-        if cv2.imwrite(
-                output_path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 95]):
-            self._last_capture_stamp = stamp_seconds
-        else:
-            self.get_logger().warn(f'检测画面保存失败: {output_path}')
-
-    def destroy_node(self):
-        if self._axis_ref_log_fp is not None:
-            try:
-                self._axis_ref_log_fp.close()
-            finally:
-                self._axis_ref_log_fp = None
-        super().destroy_node()
-
-    def _init_subscribers(self):
-        """订阅相机话题，检测循环按 header stamp 取近似同步帧。"""
-        self.declare_parameter(
-            'color_topic', '/camera_d435_0/color/image_raw')
-        self.declare_parameter(
-            'depth_topic', '/camera_d435_0/aligned_depth_to_color/image_raw')
-        self.declare_parameter(
-            'color_info_topic', '/camera_d435_0/color/camera_info')
-        self.declare_parameter(
-            'depth_info_topic', '/camera_d435_0/color/camera_info')
-        color_topic = self.get_parameter('color_topic').value
-        depth_topic = self.get_parameter('depth_topic').value
-        color_info_topic = self.get_parameter('color_info_topic').value
-        depth_info_topic = self.get_parameter('depth_info_topic').value
-
-        # 保留短队列，供推理循环按时间戳消费同步帧。
-        self._sub_depth_info = None
-        self._sub_color = self.create_subscription(
-            Image, color_topic, self._color_callback, 10)
-        self._sub_depth = self.create_subscription(
-            Image, depth_topic, self._depth_callback, 10)
-        self._sub_color_info = self.create_subscription(
-            CameraInfo, color_info_topic, self._color_info_callback, 5)
-        if depth_info_topic == color_info_topic and self._registered_depth:
-            self._sub_depth_info = None
-        else:
-            self._sub_depth_info = self.create_subscription(
-                CameraInfo, depth_info_topic, self._depth_info_callback, 5)
-        self.get_logger().info(
-            f'相机话题: color={color_topic}, depth={depth_topic}, '
-            f'camera_info={color_info_topic}')
-
-    def _color_callback(self, msg):
-        image = np.frombuffer(msg.data, dtype=np.uint8).reshape(
-            msg.height, msg.width, 3)
-        # OrbbecSDK_ROS2 发布 rgb8，转换为 BGR 供 OpenCV/YOLO 使用
-        if msg.encoding == 'rgb8':
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        with self._topic_frame_lock:
-            self._topic_color_frame_id = msg.header.frame_id or 'camera_color_optical_frame'
-            self._topic_color = image
-            self._topic_color_stamp = _stamp_to_sec(msg.header.stamp)
-            self._topic_color_stamp_msg = msg.header.stamp
-            self._topic_color_queue.append((
-                self._topic_color_stamp, msg.header.stamp, image))
-            self._queue_synced_pairs_locked()
-
-    def _depth_callback(self, msg):
-        if msg.encoding in ('16UC1', 'mono16'):
-            depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
-        elif msg.encoding == '32FC1':
-            depth_m = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
-            depth = np.nan_to_num(depth_m / max(self._depth_scale, 1e-9)).astype(np.uint16)
-        else:
-            self.get_logger().warn(f'不支持的深度图编码: {msg.encoding}')
-            return
-        with self._topic_frame_lock:
-            self._topic_depth = depth
-            self._topic_depth_stamp = _stamp_to_sec(msg.header.stamp)
-            self._topic_depth_stamp_msg = msg.header.stamp
-            self._topic_depth_queue.append((
-                self._topic_depth_stamp, msg.header.stamp, depth))
-            self._queue_synced_pairs_locked()
-
-    def _color_info_callback(self, msg):
-        matrix = msg.K if hasattr(msg, 'K') else msg.k
-        distortion = msg.D if hasattr(msg, 'D') else msg.d
-        intrin = CameraIntrinsics(
-            fx=matrix[0], fy=matrix[4],
-            cx=matrix[2], cy=matrix[5],
-            width=msg.width, height=msg.height,
-            coeffs=list(distortion) if distortion else [0.0]*5,
-        )
-        with self._topic_frame_lock:
-            self._topic_color_intrin = intrin
-            if self._registered_depth and self._sub_depth_info is None:
-                self._topic_depth_intrin = intrin
-
-    def _depth_info_callback(self, msg):
-        matrix = msg.K if hasattr(msg, 'K') else msg.k
-        distortion = msg.D if hasattr(msg, 'D') else msg.d
-        intrin = CameraIntrinsics(
-            fx=matrix[0], fy=matrix[4],
-            cx=matrix[2], cy=matrix[5],
-            width=msg.width, height=msg.height,
-            coeffs=list(distortion) if distortion else [0.0]*5,
-        )
-        with self._topic_frame_lock:
-            self._topic_depth_intrin = intrin
-
-    def _queue_synced_pairs_locked(self):
-        while True:
-            pair = _pop_synced_frame_pair(
-                self._topic_color_queue,
-                self._topic_depth_queue,
-                self._topic_sync_max_dt,
+        self.depth_scale = float(rospy.get_param("~depth_scale", 0.001))
+        position_config = rospy.get_param("~position_stabilizer", {})
+        if not isinstance(position_config, dict):
+            raise rospy.ROSInitException(
+                "position_stabilizer must be a YAML mapping"
             )
-            if pair is None:
-                return
-            color_item, depth_item = pair
-            if self._capture_dir and self._capture_interval is not None:
-                if (self._last_topic_enqueue_stamp is not None and
-                        color_item[0] - self._last_topic_enqueue_stamp <
-                        self._capture_interval - 1e-6):
-                    continue
-                self._last_topic_enqueue_stamp = color_item[0]
-            else:
-                # Normal live mode prioritizes the freshest complete pair.
-                self._topic_pair_queue.clear()
-            self._topic_pair_queue.append((color_item, depth_item))
-
-    def _get_synced_topic_frames(self):
-        with self._topic_frame_lock:
-            if (self._topic_color_intrin is None or
-                    self._topic_depth_intrin is None or
-                    not self._topic_pair_queue):
-                return None
-            color_item, depth_item = self._topic_pair_queue.popleft()
-            return (
-                self._topic_color_intrin,
-                self._topic_depth_intrin,
-                color_item[2],
-                depth_item[2],
-                color_item[1],
-                depth_item[1],
-            )
-
-    def _select_deprojection_intrin(self, color_intrin, depth_intrin,
-                                    color_shape, depth_shape):
-        if not self._use_topic:
-            return depth_intrin
-        same_size = color_shape[:2] == depth_shape[:2]
-        intrin_diff = (
-            abs(color_intrin.fx - depth_intrin.fx) > 1.0 or
-            abs(color_intrin.fy - depth_intrin.fy) > 1.0 or
-            abs(color_intrin.cx - depth_intrin.cx) > 1.0 or
-            abs(color_intrin.cy - depth_intrin.cy) > 1.0
+        self.position_stabilizer = PositionStabilizer(
+            enabled=position_config.get("enable", True),
+            still_time=position_config.get("still_time", 3.0),
+            pixel_thresh=position_config.get("pixel_thresh", 5.0),
+            window_size=position_config.get("window_size", 45),
+            ema_alpha=position_config.get(
+                "ema_alpha",
+                rospy.get_param("~position_filter_alpha", 0.25),
+            ),
+            depth_std_thresh=position_config.get(
+                "depth_std_thresh", 0.01
+            ),
         )
-        if not self._intrinsics_checked:
-            self._intrinsics_checked = True
-            if same_size and intrin_diff and self._registered_depth:
-                self.get_logger().warn(
-                    '深度图和彩色图尺寸相同但内参不同；registered_depth=true，'
-                    '将使用彩色内参反投影注册后的深度图。')
-            elif same_size and intrin_diff:
-                self.get_logger().warn(
-                    '深度图和彩色图尺寸相同但内参不同；registered_depth=false，'
-                    '仍使用深度内参反投影，请确认话题配置。')
-        if same_size and self._registered_depth:
-            return color_intrin
-        return depth_intrin
 
-    def _init_camera(self):
-        backend_type = self.cfg.get('camera_backend', 'orbbec')
-        cam_cfg = self.cfg.get('camera', {})
-        max_retries = 10
-        for attempt in range(1, max_retries + 1):
-            try:
-                raw_cam = create_backend(backend_type)
-                raw_cam.initialize(
-                    cam_cfg.get('color_width', 640),
-                    cam_cfg.get('color_height', 480),
-                    cam_cfg.get('depth_width', 640),
-                    cam_cfg.get('depth_height', 480),
-                    cam_cfg.get('fps', 30),
-                )
-                self._camera = AsyncCamera(raw_cam)
-                self._depth_scale = self._camera.get_depth_scale()
-                self._camera_ready = True
-                self.get_logger().info(
-                    f'相机已启动: {backend_type}, depth_scale={self._depth_scale}')
-                return
-            except Exception as e:
-                self.get_logger().warn(
-                    f'相机初始化失败 ({attempt}/{max_retries}): {e}')
-                if attempt < max_retries:
-                    time.sleep(3.0)
-        self.get_logger().error('相机初始化失败，节点将等待相机连接')
-
-    def _try_reconnect_camera(self):
-        now = time.time()
-        if now - self._last_reconnect_time < self._reconnect_interval:
-            return
-        self._last_reconnect_time = now
-        backend_type = self.cfg.get('camera_backend', 'orbbec')
-        cam_cfg = self.cfg.get('camera', {})
+        class_names = rospy.get_param(
+            "~class_names",
+            [
+                "light",
+                "knob",
+                "bolt",
+                "nut",
+                "valve",
+                "pump",
+                "button",
+                "door_button",
+                "air_switch",
+                "board_card",
+            ],
+        )
+        model_path = self._resolve_model_path(rospy.get_param("~model_path", ""))
+        self.detector = YoloV5Onnx(
+            model_path=model_path,
+            class_names=class_names,
+            input_size=int(rospy.get_param("~input_size", 640)),
+            confidence_threshold=float(
+                rospy.get_param("~confidence_threshold", 0.30)
+            ),
+            iou_threshold=float(rospy.get_param("~iou_threshold", 0.01)),
+            threads=int(rospy.get_param("~onnx_threads", 8)),
+        )
+        registry_target_ids = rospy.get_param("~registry_target_ids", [])
+        if not isinstance(registry_target_ids, (list, tuple)):
+            raise rospy.ROSInitException(
+                "registry_target_ids must be a YAML list"
+        )
+        self.registry_target_ids = [
+            int(value) for value in registry_target_ids
+        ]
         try:
-            raw_cam = create_backend(backend_type)
-            raw_cam.initialize(
-                cam_cfg.get('color_width', 640),
-                cam_cfg.get('color_height', 480),
-                cam_cfg.get('depth_width', 640),
-                cam_cfg.get('depth_height', 480),
-                cam_cfg.get('fps', 30),
+            self.registry = TargetRegistry(
+                stable_frames=int(
+                    rospy.get_param("~registry_stable_frames", 15)
+                ),
+                green_hue_range=tuple(
+                    rospy.get_param("~registry_green_hue_range", [35, 85])
+                ),
+                match_distance_thresh=float(
+                    rospy.get_param("~registry_match_distance_px", 80.0)
+                ),
+                color_minimum_ratio=float(
+                    rospy.get_param("~registry_color_minimum_ratio", 0.15)
+                ),
+                allowed_ids=self.registry_target_ids,
             )
-            self._camera = AsyncCamera(raw_cam)
-            self._depth_scale = self._camera.get_depth_scale()
-            self._camera_ready = True
-            self.get_logger().info(f'相机已连接: {backend_type}')
-        except Exception:
-            pass
-
-    def _create_detector(self):
-        backend = self.cfg.get('inference_backend', 'onnx')
-        pkg_dir = os.path.dirname(os.path.abspath(__file__))
-
-        if backend == 'onnx':
-            from .detector_onnx import YoloV5ORT
-            onnx_path = self.cfg.get('onnx_model', '1013.onnx')
-            if not os.path.isabs(onnx_path):
-                module_path = os.path.join(pkg_dir, onnx_path)
-                if os.path.isfile(module_path):
-                    onnx_path = module_path
-                else:
-                    import rospkg
-                    package_path = rospkg.RosPack().get_path('panel_detection')
-                    onnx_path = os.path.join(package_path, 'models', onnx_path)
-            threads = self.cfg.get('onnx_threads', 4)
-            self.get_logger().info(f'推理后端: ONNX Runtime ({onnx_path})')
-
-            import tempfile
-            tmp_cfg = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
-            yaml.dump(self.cfg, tmp_cfg)
-            tmp_cfg.close()
-
-            det = YoloV5ORT(onnx_path=onnx_path, config_path=tmp_cfg.name, threads=threads)
-            os.unlink(tmp_cfg.name)
-
-            # 从配置文件设置类别名
-            class_names = self.cfg.get('class_name', [])
-            if class_names:
-                import random
-                det.class_names = class_names
-                det.class_num = len(class_names)
-                det.colors = [[random.randint(0, 255) for _ in range(3)]
-                              for _ in range(det.class_num)]
-            self.get_logger().info(f'模型类别: {det.class_names}')
-            return det
-
-        if backend == 'rknn':
-            from .detector_rknn import YoloV5RKNN
-            rknn_path = self.cfg.get('rknn_model', '0520.rknn')
-            if not os.path.isabs(rknn_path):
-                rknn_path = os.path.join(pkg_dir, rknn_path)
-            self.get_logger().info(f'推理后端: RKNN ({rknn_path})')
-
-            import tempfile
-            tmp_cfg = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
-            yaml.dump(self.cfg, tmp_cfg)
-            tmp_cfg.close()
-            det = YoloV5RKNN(rknn_model_path=rknn_path, config_path=tmp_cfg.name)
-            os.unlink(tmp_cfg.name)
-            return det
-
-        return None
-
-    def _create_leak_bolt_detector(self, leak_cfg):
-        """为 leak 模式创建 leak_bolt 专用检测器。"""
-        from .detector_onnx import YoloV5ORT
-        import tempfile
-
-        pkg_dir = os.path.dirname(os.path.abspath(__file__))
-        bolt_model = leak_cfg.get('bolt_model', 'leak_bolt.onnx')
-        if not os.path.isabs(bolt_model):
-            module_path = os.path.join(pkg_dir, bolt_model)
-            if os.path.isfile(module_path):
-                bolt_model = module_path
-            else:
-                import rospkg
-                package_path = rospkg.RosPack().get_path('panel_detection')
-                bolt_model = os.path.join(package_path, 'models', bolt_model)
-        if not os.path.isfile(bolt_model):
-            self.get_logger().warn(f'leak_bolt 模型不存在: {bolt_model}，跳过 bolt 检测')
-            return None
-
-        bolt_cfg = {
-            'input_size': leak_cfg.get('bolt_input_size', 640),
-            'threshold': {
-                'confidence': leak_cfg.get('bolt_conf_thres', 0.5),
-                'iou': leak_cfg.get('bolt_iou_thres', 0.45),
-            },
-            'class_name': ['leak_bolt'],
+        except ValueError as error:
+            raise rospy.ROSInitException(str(error))
+        self.panel_line = {
+            "initial_dist_ratio": float(
+                rospy.get_param("~panel_line_initial_dist_ratio", 1.1)
+            ),
+            "dist_ratio": float(
+                rospy.get_param("~panel_line_dist_ratio", 0.85)
+            ),
+            "min_dist": float(
+                rospy.get_param("~panel_line_min_dist_px", 45.0)
+            ),
+            "max_dist": float(
+                rospy.get_param("~panel_line_max_dist_px", 110.0)
+            ),
+            "proj_margin_ratio": float(
+                rospy.get_param("~panel_line_proj_margin_ratio", 3.0)
+            ),
+            "min_proj_margin": float(
+                rospy.get_param("~panel_line_min_projection_margin_px", 450.0)
+            ),
         }
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False)
-        yaml.dump(bolt_cfg, tmp)
-        tmp.close()
+        self.panel_axis = PersistentPanelAxis(
+            dist_ratio=self.panel_line["dist_ratio"],
+            min_dist=self.panel_line["min_dist"],
+            max_dist=self.panel_line["max_dist"],
+            min_proj_margin=self.panel_line["min_proj_margin"],
+        )
 
-        threads = self.cfg.get('onnx_threads', 4)
-        det = YoloV5ORT(onnx_path=bolt_model, config_path=tmp.name, threads=threads)
-        os.unlink(tmp.name)
-        self.get_logger().info(f'leak_bolt 检测器已加载: {bolt_model}')
-        return det
+        angle_config = rospy.get_param("~knob_angle", {})
+        if not isinstance(angle_config, dict):
+            raise rospy.ROSInitException("knob_angle must be a YAML mapping")
+        self.knob_angle_enabled = bool(angle_config.get("enable", True))
+        self.knob_angle_binary_threshold = int(
+            angle_config.get("binary_thresh", 180)
+        )
+        self.knob_angle_circle_mask_ratio = float(
+            angle_config.get("circle_mask_ratio", 0.85)
+        )
+        if not 0.1 <= self.knob_angle_circle_mask_ratio <= 1.0:
+            raise rospy.ROSInitException(
+                "knob_angle/circle_mask_ratio must be in [0.1, 1.0]"
+            )
+        configured_mode = angle_config.get("use_constraint")
+        if configured_mode is None:
+            # Compatibility with the first ROS1 angle port.
+            configured_mode = (
+                3
+                if str(angle_config.get("output_mode", "discrete")).lower()
+                == "continuous"
+                else 1
+            )
+        constraint_alias = rospy.get_param("~use_constrain", "")
+        constraint_param = constraint_alias or rospy.get_param(
+            "~use_constraint", configured_mode
+        )
+        self.knob_angle_constraint_mode = _parse_angle_constraint_mode(
+            constraint_param
+        )
+        # ROS2 gates angle recognition by detector class only.  In particular,
+        # ID4 is a button and must never enter the knob-angle path.
+        self.knob_angle_class = str(
+            angle_config.get("knob_class", "knob")
+        )
+        self.knob_angle_stabilizer = DiscreteAngleStabilizer(
+            switch_margin=float(angle_config.get("discrete_switch_margin", 8.0)),
+            confirm_frames=int(angle_config.get("discrete_confirm_frames", 3)),
+        )
 
-    def _publish_camera_topics(self, color_image, depth_image, color_intrin, depth_intrin):
-        """直连模式下转发图像和内参话题"""
-        stamp = self.get_clock().now().to_msg()
+        self.targets_pub = rospy.Publisher(
+            rospy.get_param("~targets_topic", "/panel/targets"),
+            String,
+            queue_size=10,
+        )
+        self.status_pub = rospy.Publisher(
+            rospy.get_param("~status_topic", "/panel/status"),
+            String,
+            queue_size=10,
+            latch=True,
+        )
+        self.distance_pub = rospy.Publisher(
+            rospy.get_param("~distance_topic", "/panel/distance"),
+            String,
+            queue_size=10,
+        )
+        self.knob_angle_pub = rospy.Publisher(
+            rospy.get_param("~knob_angle_topic", "/panel/knob_angles"),
+            String,
+            queue_size=10,
+        )
+        class_topic_prefix = str(
+            rospy.get_param("~class_topic_prefix", "")
+        ).rstrip("/")
+        self.class_pose_pubs = {
+            class_name: rospy.Publisher(
+                rospy.get_param(
+                    "~{}_topic".format(class_name),
+                    (
+                        "{}/{}s".format(class_topic_prefix, class_name)
+                        if class_topic_prefix
+                        else default_topic
+                    ),
+                ),
+                PoseStamped,
+                queue_size=10,
+            )
+            for class_name, default_topic in CLASS_TOPICS.items()
+        }
+        self.publish_debug_image = bool(
+            rospy.get_param("~publish_debug_image", True)
+        )
+        self.debug_pub = rospy.Publisher(
+            rospy.get_param("~debug_image_topic", "/panel/debug_image"),
+            Image,
+            queue_size=1,
+        )
 
-        # 发布彩色图像
-        color_msg = Image()
-        color_msg.header.stamp = stamp
-        color_msg.header.frame_id = 'camera_color_optical_frame'
-        color_msg.height, color_msg.width = color_image.shape[:2]
-        color_msg.encoding = 'bgr8'
-        color_msg.step = color_msg.width * 3
-        color_msg.data = color_image.tobytes()
-        self._color_pub.publish(color_msg)
-
-        # 发布深度图像
-        depth_msg = Image()
-        depth_msg.header.stamp = stamp
-        depth_msg.header.frame_id = 'camera_depth_optical_frame'
-        depth_msg.height, depth_msg.width = depth_image.shape[:2]
-        depth_msg.encoding = '16UC1'
-        depth_msg.step = depth_msg.width * 2
-        depth_msg.data = depth_image.tobytes()
-        self._depth_pub.publish(depth_msg)
-
-        # 发布彩色相机内参
-        color_info_msg = CameraInfo()
-        color_info_msg.header.stamp = stamp
-        color_info_msg.header.frame_id = 'camera_color_optical_frame'
-        color_info_msg.width = color_intrin.width
-        color_info_msg.height = color_intrin.height
-        color_info_msg.K = [color_intrin.fx, 0.0, color_intrin.cx,
-                            0.0, color_intrin.fy, color_intrin.cy,
-                            0.0, 0.0, 1.0]
-        color_info_msg.D = color_intrin.coeffs
-        self._color_info_pub.publish(color_info_msg)
-
-        # 发布深度相机内参
-        depth_info_msg = CameraInfo()
-        depth_info_msg.header.stamp = stamp
-        depth_info_msg.header.frame_id = 'camera_depth_optical_frame'
-        depth_info_msg.width = depth_intrin.width
-        depth_info_msg.height = depth_intrin.height
-        depth_info_msg.K = [depth_intrin.fx, 0.0, depth_intrin.cx,
-                            0.0, depth_intrin.fy, depth_intrin.cy,
-                            0.0, 0.0, 1.0]
-        depth_info_msg.D = depth_intrin.coeffs
-        self._depth_info_pub.publish(depth_info_msg)
-
-    def _publish_status(self, status, force=False):
-        if self._status_pub is None:
-            return
-        now = time.time()
-        if not force and now - self._last_status_publish_time < 1.0:
-            return
-        self._last_status_publish_time = now
-        msg = String()
-        msg.data = status
-        self._status_pub.publish(msg)
-
-    def _leak_point_callback(self, msg):
-        self._leak_upstream_point = (
-            msg.point.x, msg.point.y, msg.point.z)
-        self._leak_upstream_stamp = time.time()
-
-    def _process_leak_frame(self, color_image, depth_image,
-                            color_intrin, deproj_intrin,
-                            color_stamp, stamp):
-        """Leak mode: detect leak point → estimate pipe axis direction."""
-        stamp_seconds = stamp.secs + stamp.nsecs * 1e-9
-        canvas = color_image.copy()
-        h, w = color_image.shape[:2]
-
-        leak_px = None
-        leak_xyz = None
-        leak_source = None
-        result = None
-
-        if self.cfg.get('leak', {}).get('enable_point_detection', False):
-            # Priority 1: upstream 3D leak point
-            now = time.time()
-            if (self._leak_upstream_point is not None and
-                    now - self._leak_upstream_stamp < self._leak_upstream_timeout):
-                xyz = self._leak_upstream_point
-                if xyz[2] > 0:
-                    px = int(round(color_intrin.fx * xyz[0] / xyz[2] + color_intrin.cx))
-                    py = int(round(color_intrin.fy * xyz[1] / xyz[2] + color_intrin.cy))
-                    if 0 <= px < w and 0 <= py < h:
-                        leak_px = (px, py)
-                        leak_xyz = {'x': round(xyz[0], 4),
-                                    'y': round(xyz[1], 4),
-                                    'z': round(xyz[2], 4)}
-                        leak_source = 'upstream'
-
-            # Priority 2: black marker fallback
-            if leak_px is None:
-                candidates = detect_black_marker(color_image)
-                if candidates:
-                    cx, cy, bbox, score = candidates[0]
-                    leak_px = (cx, cy)
-                    leak_source = 'black_marker'
-                    bx1, by1, bx2, by2 = bbox
-                    cv2.rectangle(canvas, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
-                    cv2.putText(canvas, f'black marker (score={score:.0f})',
-                                (bx1, by1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                                (0, 255, 0), 2, cv2.LINE_AA)
-                    depth_val = get_robust_depth(
-                        depth_image, cx, cy,
-                        sample_radius=5, depth_scale=self._depth_scale)
-                    if depth_val > 0:
-                        xyz_3d = deproject_pixel_to_point(
-                            deproj_intrin, (cx, cy), depth_val)
-                        if xyz_3d is not None and xyz_3d[2] > 0:
-                            leak_xyz = {'x': round(xyz_3d[0], 4),
-                                        'y': round(xyz_3d[1], 4),
-                                        'z': round(xyz_3d[2], 4)}
-
-            if leak_px is not None:
-                result = estimate_pipe_axis_from_image(
-                    color_image,
-                    leak_point=leak_px,
-                    roi_half_size=(200, 100),
-                    canny_thresholds=(30, 120),
-                    hough_threshold=30,
-                    min_line_length=45,
-                    max_line_gap=15,
-                    max_line_distance=60.0,
+        # AprilTag overlay.  Keep the existing registry/numbering behavior
+        # untouched and only add the decoded Tag boxes/assignments to the
+        # debug canvas (plus tag_id in the target JSON).
+        raw_panel_tags = rospy.get_param("~use_panel_tags", True)
+        if isinstance(raw_panel_tags, str):
+            raw_panel_tags = raw_panel_tags.strip().lower() in (
+                "1", "true", "yes", "on")
+        self.panel_tag_cfg = rospy.get_param("~panel_apriltag", {})
+        if not isinstance(self.panel_tag_cfg, dict):
+            self.panel_tag_cfg = {}
+        self.panel_tag_cfg = dict(self.panel_tag_cfg)
+        self.panel_tag_cfg.setdefault("scene", "validation_site")
+        self.panel_tag_cfg.setdefault("enable", True)
+        self.panel_tag_enabled = (
+            bool(raw_panel_tags)
+            and bool(self.panel_tag_cfg.get("enable", True))
+        )
+        self.panel_tag_tracker = (
+            PanelAprilTagTracker(self.panel_tag_cfg)
+            if self.panel_tag_enabled else None
+        )
+        if self.panel_tag_enabled:
+            if hasattr(cv2, "aruco"):
+                rospy.loginfo(
+                    "Panel AprilTag overlay enabled (scene=%s)",
+                    self.panel_tag_cfg.get("scene", "validation_site"),
                 )
-                if result is not None:
-                    canvas = draw_pipe_axis_result(canvas, result, output_size=180)
-
-
-        axis_3d = {'valid': False, 'reason': 'no_2d_axis',
-                   'point_xyz_m': None, 'direction_xyz': None,
-                   'endpoints_xyz_m': None}
-        if result is not None:
-            if ((self._use_topic and not self._registered_depth) or
-                    depth_image.shape[:2] != color_image.shape[:2]):
-                axis_3d['reason'] = 'depth_not_registered_to_color'
             else:
-                axis_3d = estimate_pipe_axis_3d(
-                    result, depth_image, deproj_intrin, self._depth_scale,
-                    self.cfg.get('pipe_axis_3d', {}))
-        axis_frame = (self._topic_color_frame_id if self._use_topic
-                      else 'camera_color_optical_frame')
-        axis_3d['frame_id'] = axis_frame
-        if axis_3d['valid']:
-            vector_text = ','.join(f'{v:.3f}' for v in axis_3d['direction_xyz'])
-            cv2.putText(canvas, 'pipe 3D axis: ' + vector_text,
-                        (10, 108), 0, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+                rospy.logwarn(
+                    "OpenCV has no aruco; panel AprilTag overlay disabled"
+                )
+                self.panel_tag_enabled = False
+                self.panel_tag_tracker = None
 
-        # ── leak_bolt 检测与位姿估计 ──
-        bolt_info = None
-        if self._leak_bolt_detector is not None:
-            _, bolt_cls_ids, bolt_xyxys, bolt_confs = \
-                self._leak_bolt_detector.detect(color_image)
-            if bolt_xyxys:
-                best_idx = int(np.argmax(bolt_confs))
-                bbox = bolt_xyxys[best_idx]
-                x1, y1, x2, y2 = [int(v) for v in bbox]
-                ux = (x1 + x2) // 2
-                uy = (y1 + y2) // 2
-                bolt_conf = bolt_confs[best_idx]
+        # Panel-row axis sharing.  The full-panel detector is the authority and
+        # publishes the fitted image-space row direction; a restricted wrist
+        # detector can consume it with external_panel_axis:=true when both wrist
+        # cameras are known to share an image orientation.
+        self.panel_axis_topic = str(
+            rospy.get_param("~panel_axis_topic", "/panel/panel_axis")
+        )
+        self.publish_panel_axis = bool(
+            rospy.get_param("~publish_panel_axis", True)
+        ) and not self.registry_target_ids
+        self.panel_axis_pub = (
+            rospy.Publisher(
+                self.panel_axis_topic,
+                Vector3Stamped,
+                queue_size=1,
+                latch=True,
+            )
+            if self.publish_panel_axis
+            else None
+        )
+        # A restricted wrist camera (for example the right arm, whose valid
+        # targets are the ID5/ID6 buttons) may never see a knob, so the
+        # knob-based row fit cannot run.  It then fits the row from its own
+        # button-like detections instead.
+        self.allow_button_axis = bool(
+            rospy.get_param(
+                "~button_axis_bootstrap", bool(self.registry_target_ids)
+            )
+        )
+        self.external_panel_axis = bool(
+            rospy.get_param("~external_panel_axis", False)
+        )
+        self.panel_axis_sub = (
+            rospy.Subscriber(
+                self.panel_axis_topic,
+                Vector3Stamped,
+                self._external_panel_axis_callback,
+                queue_size=1,
+            )
+            if self.external_panel_axis
+            else None
+        )
 
-                depth_val = get_robust_depth(
-                    depth_image, ux, uy,
-                    sample_radius=5, depth_scale=self._depth_scale)
-                bolt_xyz = None
-                if depth_val > 0:
-                    bolt_xyz = deproject_pixel_to_point(
-                        deproj_intrin, (ux, uy), depth_val)
+        self.info_sub = rospy.Subscriber(
+            self.camera_info_topic,
+            CameraInfo,
+            self._camera_info_callback,
+            queue_size=1,
+        )
+        self.processing = LatestFrameProcessor(
+            self._process_images,
+            max_fps=float(rospy.get_param("~max_processing_fps", 0.0)),
+            idle_fps=float(rospy.get_param("~idle_processing_fps", rospy.get_param("~max_processing_fps", 0.0))),
+            max_age_seconds=float(rospy.get_param("~max_pending_age", 0.4)),
+            on_error=lambda error: rospy.logerr_throttle(5.0, "Panel image processing failed: %s", error),
+        )
+        rospy.on_shutdown(self.processing.close)
+        activity_topic = str(rospy.get_param("~activity_topic", ""))
+        self.activity_sub = None
+        if activity_topic:
+            self.activity_sub = rospy.Subscriber(
+                activity_topic, String, self._activity_callback, queue_size=10
+            )
+        color_sub = message_filters.Subscriber(self.color_topic, Image, queue_size=1, buff_size=8388608)
+        depth_sub = message_filters.Subscriber(self.depth_topic, Image, queue_size=1, buff_size=8388608)
+        sync = message_filters.ApproximateTimeSynchronizer(
+            [color_sub, depth_sub],
+            queue_size=int(rospy.get_param("~sync_queue_size", 8)),
+            slop=float(rospy.get_param("~sync_slop", 0.08)),
+            allow_headerless=False,
+        )
+        sync.registerCallback(self._image_callback)
+        self._sync = sync
+        self._color_sub = color_sub
+        self._depth_sub = depth_sub
 
-                bolt_quat = [0.0, 0.0, 0.0, 1.0]
-                axis_dir = None
-                axis_source = None
-                if _valid_point_3d(bolt_xyz):
-                    axis_result = estimate_object_axis_direction(
-                        depth_image, deproj_intrin, bbox,
-                        depth_scale=self._depth_scale,
-                        object_class='bolt')
-                    if axis_result is None:
-                        axis_result = estimate_fastener_patch_axis_direction(
-                            depth_image, deproj_intrin, bbox,
-                            depth_scale=self._depth_scale)
-                        if axis_result is not None:
-                            axis_source = 'patch_plane'
-                    else:
-                        axis_source = 'object_plane'
-                    if axis_result is not None:
-                        axis_normal = axis_result[0]
-                        bolt_quat = _normal_to_quaternion(axis_normal)
-                        axis_dir = [round(float(v), 6) for v in axis_normal]
+        self._publish_status("waiting_camera")
+        rospy.loginfo("Panel processing: active<=%s fps idle<=%s fps ONNX threads=%s",
+                      self.processing.max_fps, self.processing.idle_fps,
+                      rospy.get_param("~onnx_threads", 8))
+        rospy.loginfo(
+            "panel_detection ready: color=%s depth=%s info=%s model=%s",
+            self.color_topic,
+            self.depth_topic,
+            self.camera_info_topic,
+            model_path,
+        )
+        rospy.loginfo(
+            "panel target-ID restriction: %s",
+            self.registry_target_ids or "full layout 0..6",
+        )
+        rospy.loginfo(
+            "knob angle detection: enabled=%s use_constraint=%s "
+            "class=%s",
+            self.knob_angle_enabled,
+            self.knob_angle_constraint_mode,
+            self.knob_angle_class,
+        )
 
-                cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 165, 255), 2)
-                cv2.putText(canvas, f'leak_bolt {bolt_conf:.2f}',
-                            (x1, max(15, y1 - 8)), 0, 0.55,
-                            (0, 165, 255), 2, cv2.LINE_AA)
-                if axis_dir is not None:
-                    _draw_axis_direction(
-                        canvas, bbox, axis_dir,
-                        label=f'bolt_axis[{axis_source}]',
-                        color=(255, 0, 255))
-                if _valid_point_3d(bolt_xyz):
-                    cv2.putText(
-                        canvas,
-                        f'({bolt_xyz[0]:.2f},{bolt_xyz[1]:.2f},{bolt_xyz[2]:.2f})',
-                        (x1, y2 + 18), 0, 0.4,
-                        (0, 165, 255), 1, cv2.LINE_AA)
-                    bolt_info = {
-                        'class': 'leak_bolt',
-                        'bbox': [x1, y1, x2, y2],
-                        'position': {
-                            'x': round(bolt_xyz[0], 4),
-                            'y': round(bolt_xyz[1], 4),
-                            'z': round(bolt_xyz[2], 4),
-                        },
-                        'orientation': {
-                            'x': bolt_quat[0], 'y': bolt_quat[1],
-                            'z': bolt_quat[2], 'w': bolt_quat[3],
-                        },
-                        'confidence': round(bolt_conf, 3),
-                    }
-                    if axis_dir is not None:
-                        bolt_info['axis_direction'] = axis_dir
-                        bolt_info['axis_source'] = axis_source
+    @staticmethod
+    def _resolve_model_path(configured_path):
+        if configured_path:
+            path = os.path.abspath(os.path.expanduser(configured_path))
+            if os.path.isfile(path):
+                return path
+            raise rospy.ROSInitException("ONNX model does not exist: " + path)
 
-        source_label = leak_source or 'bolt_only'
-        if leak_source == 'upstream' and leak_px is not None:
-            cv2.circle(canvas, leak_px, 8, (0, 0, 255), -1)
-            cv2.putText(canvas, 'upstream leak',
-                        (leak_px[0] + 12, leak_px[1] - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        (0, 0, 255), 2, cv2.LINE_AA)
-            if leak_xyz is not None:
-                cv2.putText(canvas,
-                            f'({leak_xyz["x"]:.3f},{leak_xyz["y"]:.3f},{leak_xyz["z"]:.3f})',
-                            (leak_px[0] + 12, leak_px[1] + 8),
-                            0, 0.4, (0, 0, 255), 1, cv2.LINE_AA)
-        if leak_xyz is not None and leak_source == 'black_marker' and leak_px is not None:
-            cv2.putText(canvas,
-                        f'({leak_xyz["x"]:.3f},{leak_xyz["y"]:.3f},{leak_xyz["z"]:.3f})',
-                        (leak_px[0] + 12, leak_px[1] + 8),
-                        0, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f'LEAK MODE  source: {source_label}',
-                    (10, canvas.shape[0] - 15), 0, 0.5,
-                    (0, 255, 0), 1, cv2.LINE_AA)
+        package_path = rospkg.RosPack().get_path("panel_detection")
+        candidates = [
+            os.path.join(package_path, "models", "1013.onnx"),
+            os.path.join(package_path, "models", "best_zxr_10_13.onnx"),
+            os.path.join(package_path, "models", "0824.onnx"),
+            os.path.join(package_path, "models", "0807.onnx"),
+            os.path.join(package_path, "models", "0601.onnx"),
+            os.path.normpath(
+                os.path.join(
+                    package_path,
+                    "..",
+                    "panel_detection",
+                    "panel_detection",
+                    "panel_detection",
+                    "1013.onnx",
+                )
+            ),
+            os.path.normpath(
+                os.path.join(
+                    package_path,
+                    "..",
+                    "panel_detection",
+                    "panel_detection",
+                    "panel_detection",
+                    "best_zxr_10_13.onnx",
+                )
+            ),
+            os.path.normpath(
+                os.path.join(
+                    package_path,
+                    "..",
+                    "panel_detection",
+                    "panel_detection",
+                    "panel_detection",
+                    "0824.onnx",
+                )
+            ),
+            os.path.normpath(
+                os.path.join(
+                    package_path,
+                    "..",
+                    "panel_detection",
+                    "panel_detection",
+                    "panel_detection",
+                    "0807.onnx",
+                )
+            ),
+            os.path.normpath(
+                os.path.join(
+                    package_path,
+                    "..",
+                    "panel_detection",
+                    "panel_detection",
+                    "panel_detection",
+                    "0601.onnx",
+                )
+            ),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        raise rospy.ROSInitException(
+            "No ONNX model found. Pass model_path:=/absolute/path/to/model.onnx"
+        )
 
-        if bolt_info is not None and bolt_info.get('axis_direction') is not None:
-            _draw_axis_3d_view(canvas, [{
-                'class': 'leak_bolt',
-                'source': bolt_info.get('axis_source', ''),
-                'axis_direction': bolt_info['axis_direction'],
-            }])
+    def _camera_info_callback(self, msg):
+        with self.lock:
+            self.latest_camera_info = msg
 
-        self._update_display_frame(canvas, color_stamp)
+    def _image_callback(self, color_msg, depth_msg):
+        self.processing.submit(color_msg, depth_msg)
 
-        if self._targets_pub is not None and (leak_xyz is not None or bolt_info is not None):
-            targets_payload = {'stamp': stamp_seconds}
-            if leak_xyz is not None:
-                targets_payload['leak_point'] = leak_xyz
-                targets_payload['leak_source'] = leak_source
-            if bolt_info is not None:
-                targets_payload['bolt'] = bolt_info
-            msg = String()
-            msg.data = json.dumps(targets_payload, ensure_ascii=False)
-            self._targets_pub.publish(msg)
+    def _activity_callback(self, message):
+        self.processing.set_activity(str(message.data))
 
-        if self._object_geometry_pub is not None:
-            msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp_seconds,
-                'leak_point_px': list(leak_px) if leak_px is not None else None,
-                'leak_source': leak_source,
-                'pipe_axis_angle_deg': round(result.angle_deg, 2) if result else None,
-                'pipe_axis_vector_xy': [
-                    round(result.vector_xy[0], 4),
-                    round(result.vector_xy[1], 4),
-                ] if result else None,
-                'num_segments': len(result.segments) if result else 0,
-                'frame_id': axis_frame,
-                'pipe_axis_3d': axis_3d,
-            }, ensure_ascii=False)
-            self._object_geometry_pub.publish(msg)
-
-        has_bolt = bolt_info is not None
-        has_leak = result is not None
-        if has_bolt and has_leak:
-            self._publish_status('leak_detected')
-        elif has_bolt:
-            self._publish_status('bolt_detected')
-        elif has_leak:
-            self._publish_status('leak_detected')
-        else:
-            self._publish_status('no_detection')
-
-    def _publish_board_cards(self, detections, assignments, depth_image,
-                             intrin, stamp, color_image=None, canvas=None):
-        if self._board_cards_pub is None:
-            return {}
-        normal_valid = self._panel_normal_cache is not None
-        quat = (_normal_to_quaternion(self._panel_normal_cache[0])
-                if normal_valid else None)
-        targets = []
-        details = {}
-        for index, detection in enumerate(detections):
-            if detection.class_name != 'board_card':
-                continue
-            _, _, xyz = _estimate_detection_point(
-                detection, depth_image, intrin, self._depth_scale)
-            features = detect_board_features(
-                color_image, detection.bbox, self.cfg.get('board_features', {}))
-            add_board_feature_depth(features, depth_image, intrin, self._depth_scale)
-            payload = board_card_target(
-                detection, assignments.get(index), xyz, quat, normal_valid)
-            payload.update(features)
-            targets.append(payload)
-            details[id(detection)] = features
-            if canvas is not None:
-                draw_board_features(canvas, features, detection.bbox)
-        msg = String()
-        msg.data = json.dumps({
-            'stamp': stamp.secs + stamp.nsecs * 1e-9,
-            'frame_id': (self._topic_color_frame_id if self._use_topic
-                         else 'camera_color_optical_frame'),
-            'targets': targets,
-        }, ensure_ascii=False)
-        self._board_cards_pub.publish(msg)
-        return details
-
-    def _detection_callback(self):
-        if not self._camera_ready:
-            self._publish_status('waiting_camera')
-            self._try_reconnect_camera()
+    def _process_images(self, color_msg, depth_msg):
+        started_at = time.monotonic()
+        with self.lock:
+            info = self.latest_camera_info
+        if info is None:
+            self._publish_status("waiting_camera_info")
+            return
+        try:
+            color = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding="bgr8")
+            depth = self.bridge.imgmsg_to_cv2(
+                depth_msg, desired_encoding="passthrough"
+            )
+        except CvBridgeError as error:
+            rospy.logwarn_throttle(2.0, "cv_bridge conversion failed: %s", error)
+            return
+        if depth.ndim != 2:
+            rospy.logwarn_throttle(2.0, "Depth image must be single-channel")
+            return
+        if color.shape[:2] != depth.shape[:2]:
+            rospy.logwarn_throttle(
+                2.0,
+                "Color/depth size mismatch; use aligned_depth_to_color: %s vs %s",
+                color.shape[:2],
+                depth.shape[:2],
+            )
             return
 
-        if self._use_topic:
-            topic_frames = self._get_synced_topic_frames()
-            if topic_frames is None:
-                self._publish_status('waiting_topic_frames')
-                return
-            color_intrin, depth_intrin, color_image, depth_image, color_stamp, _ = topic_frames
-            deproj_intrin = self._select_deprojection_intrin(
-                color_intrin, depth_intrin, color_image.shape, depth_image.shape)
-        else:
-            color_intrin, depth_intrin, color_image, depth_image = \
-                self._camera.get_aligned_frames()
-            if color_intrin is None:
-                return
-            deproj_intrin = depth_intrin
-            color_stamp = None
+        raw_detections = self.detector.detect(color)
+        if time.monotonic() - started_at > 0.4:
+            rospy.logwarn_throttle(10.0, "Panel inference exceeds 0.4s; inspect CPU load / ONNX_THREADS. Freshness safety limits are unchanged.")
+        for detection in raw_detections:
+            point = self._point_from_detection(detection, depth, info)
+            publisher = self.class_pose_pubs.get(detection.class_name)
+            if point is not None and publisher is not None:
+                publisher.publish(
+                    self._pose_message(color_msg.header.stamp, point)
+                )
 
-        if color_image.size == 0 or depth_image.size == 0:
-            return
-
-        if self._process_leak:
-            stamp = color_stamp if color_stamp is not None else self.get_clock().now().to_msg()
-            self._process_leak_frame(
-                color_image, depth_image, color_intrin, deproj_intrin,
-                color_stamp, stamp)
-            return
-
-        # 直连模式下转发图像话题（仅在有订阅者时发布）
-        if self._color_pub is not None and (
-                self._color_pub.get_subscription_count() > 0 or
-                self._depth_pub.get_subscription_count() > 0):
-            self._publish_camera_topics(color_image, depth_image, color_intrin, depth_intrin)
-
-        t0 = time.time()
-        canvas, class_id_list, xyxy_list, conf_list = self._detector.detect(color_image)
-        t1 = time.time()
-
-        # Detect panel tags independently of YOLO. This keeps decoded tag
-        # outlines visible while commissioning a tag sheet or when the
-        # associated component is temporarily missed by the detector.
+        # Keep detector_onnx.Detection unchanged at the inference boundary and
+        # adapt it to the richer ROS2-compatible registry representation here.
+        detections = [
+            FrameDetection(
+                class_name=detection.class_name,
+                center_x=float(detection.center[0]),
+                center_y=float(detection.center[1]),
+                bbox=tuple(float(value) for value in detection.bbox),
+                confidence=float(detection.confidence),
+            )
+            for detection in raw_detections
+        ]
         panel_tag_markers = []
-        if self._panel_tags_enabled:
-            panel_tag_markers = detect_panel_tags(color_image, self._panel_tag_cfg)
-
-        # Printed concentric targets replace YOLO fastener detections whenever
-        # present. Their geometry is deterministic and remains detectable even
-        # though the training set contained only bare bolt/nut heads.
-        concentric_markers = []
-        marker_by_raw_detection_index = {}
-        if self._process_fasteners and self._concentric_marker_enabled:
-            concentric_markers = detect_concentric_bolt_markers(
-                color_image, self._concentric_marker_cfg)
-        if concentric_markers and 'bolt' in self._class_names:
-            keep_indices = []
-            for index, bbox in enumerate(xyxy_list):
-                class_id = class_id_list[index]
-                class_name = (
-                    self._class_names[class_id]
-                    if class_id < len(self._class_names) else 'unknown')
-                center = ((bbox[0] + bbox[2]) * 0.5,
-                          (bbox[1] + bbox[3]) * 0.5)
-                overlaps_marker = any(
-                    np.hypot(center[0] - marker.center[0],
-                             center[1] - marker.center[1])
-                    <= 1.8 * marker.radius
-                    for marker in concentric_markers)
-                if class_name not in ('bolt', 'nut', 'valve') or not overlaps_marker:
-                    keep_indices.append(index)
-            class_id_list = [class_id_list[index] for index in keep_indices]
-            xyxy_list = [xyxy_list[index] for index in keep_indices]
-            conf_list = [conf_list[index] for index in keep_indices]
-
-            bolt_class_id = self._class_names.index('bolt')
-            for marker in concentric_markers:
-                raw_index = len(xyxy_list)
-                marker_by_raw_detection_index[raw_index] = marker
-                class_id_list.append(bolt_class_id)
-                xyxy_list.append(list(marker.bbox))
-                conf_list.append(float(marker.confidence))
-                cv2.drawContours(canvas, [marker.contour], -1, (0, 255, 0), 2)
-                center_px = tuple(int(round(value)) for value in marker.center)
-                cv2.drawMarker(
-                    canvas, center_px, (0, 0, 255), cv2.MARKER_CROSS, 12, 2)
-                if marker.gap_point is not None:
-                    gap_px = tuple(int(round(value)) for value in marker.gap_point)
-                    cv2.arrowedLine(
-                        canvas, center_px, gap_px, (255, 0, 255), 2,
-                        tipLength=0.3)
-
-        if not xyxy_list:
-            self._publish_board_cards([], {}, depth_image, deproj_intrin,
-                                      color_stamp if color_stamp is not None
-                                      else self.get_clock().now().to_msg())
-            if self._panel_tags_enabled:
-                self._panel_tag_tracker.update([], panel_tag_markers)
-                draw_panel_tag_assignments(
-                    canvas, panel_tag_markers, {}, [])
-            self._update_display_frame(canvas, color_stamp)
-            self._publish_status('no_detection')
-            return
-
-        filtered_depth = filter_depth(depth_image, method='bilateral', kernel_size=5)
-        t2 = time.time()
-        if not self._use_topic:
-            self._depth_scale = self._camera.get_depth_scale()
-
-        # 面板法向量
-        self._frame_count += 1
-        if (self._panel_normal_cache is None or
-                self._frame_count % self._normal_interval == 0):
-            result = compute_panel_normal(
-                color_image, filtered_depth, deproj_intrin, xyxy_list,
-                depth_scale=self._depth_scale)
-            if result is not None:
-                stable_plane = self._panel_plane_stabilizer.update(*result)
-                if stable_plane is not None:
-                    self._panel_normal_cache = stable_plane
-        t3 = time.time()
-
-        apriltag_reference = None
-        if ((self._process_valves or self._process_fasteners)
-                and self._apriltag_reference_enabled):
-            apriltag_reference = detect_apriltag_reference_axis(
-                color_image,
-                filtered_depth,
-                deproj_intrin,
-                depth_scale=self._depth_scale,
-                cfg=self.cfg.get('apriltag_reference', {}),
-            )
-            if apriltag_reference is not None:
-                self._apriltag_reference_cache = (
-                    self._frame_count, apriltag_reference)
-            elif self._apriltag_reference_cache is not None:
-                cached_frame, cached_reference = self._apriltag_reference_cache
-                cache_frames = int(self._concentric_marker_cfg.get(
-                    'reference_cache_frames', 15))
-                if self._frame_count - cached_frame <= cache_frames:
-                    apriltag_reference = dict(cached_reference)
-                    apriltag_reference['source'] = 'apriltag_pnp_cache'
-
-        marker_normal_status = 'missing'
-        if apriltag_reference is not None:
-            stable_normal, marker_normal_status = (
-                self._concentric_marker_stabilizer.update_reference(
-                    apriltag_reference['normal'],
-                    color_stamp.secs + color_stamp.nsecs * 1e-9
-                    if color_stamp is not None else self.get_clock().now().nanoseconds * 1e-9))
-            if stable_normal is not None:
-                apriltag_reference = dict(apriltag_reference)
-                apriltag_reference['normal'] = stable_normal
-                apriltag_reference['normal_filter_status'] = marker_normal_status
-
-        marker_pose_by_marker_id = {}
-        if concentric_markers and apriltag_reference is not None:
-            marker_poses = estimate_concentric_bolt_poses(
-                concentric_markers,
-                filtered_depth,
-                deproj_intrin,
-                apriltag_reference['normal'],
-                depth_scale=self._depth_scale,
-                cfg=self._concentric_marker_cfg,
-            )
-            marker_pose_by_marker_id = {
-                id(marker): pose
-                for marker, pose in zip(concentric_markers, marker_poses)
-            }
-
-        # 每 30 帧打印一次耗时
-        if self._frame_count % 30 == 0:
-            self.get_logger().info(
-                f'耗时: 推理={int((t1-t0)*1000)}ms 滤波={int((t2-t1)*1000)}ms '
-                f'法向量={int((t3-t2)*1000)}ms 总={int((t3-t0)*1000)}ms')
-
-        # 获取四元数（面板法向量）
-        quat = [0.0, 0.0, 0.0, 1.0]
-        if self._panel_normal_cache is not None:
-            normal, _ = self._panel_normal_cache
-            quat = _normal_to_quaternion(normal)
-
-        stamp = color_stamp if color_stamp is not None else self.get_clock().now().to_msg()
-        stamp_seconds = stamp.secs + stamp.nsecs * 1e-9
-
-        # 构建当前帧的 FrameDetection 列表
-        frame_detections = []
-        marker_by_detection_id = {}
-        for i, xyxy in enumerate(xyxy_list):
-            cls_id = class_id_list[i]
-            cls_name = self._class_names[cls_id] if cls_id < len(self._class_names) else 'unknown'
-            cx = (xyxy[0] + xyxy[2]) / 2.0
-            cy = (xyxy[1] + xyxy[3]) / 2.0
-            frame_detection = FrameDetection(
-                class_name=cls_name,
-                center_x=cx,
-                center_y=cy,
-                bbox=tuple(xyxy[:4]),
-                confidence=float(conf_list[i]),
-            )
-            frame_detections.append(frame_detection)
-            if i in marker_by_raw_detection_index:
-                marker_by_detection_id[id(frame_detection)] = (
-                    marker_by_raw_detection_index[i])
-
-        if self._active_classes is not None:
-            frame_detections = [
-                det for det in frame_detections
-                if det.class_name in self._active_classes
-            ]
-        active_xyxy_list = [det.bbox for det in frame_detections]
-        if not frame_detections:
-            self._publish_board_cards([], {}, filtered_depth, deproj_intrin, stamp)
-            if self._panel_tags_enabled:
-                self._panel_tag_tracker.update([], panel_tag_markers)
-                draw_panel_tag_assignments(
-                    canvas, panel_tag_markers, {}, [])
-            self._update_display_frame(canvas, color_stamp)
-            self._publish_status('no_detection')
-            return
-
         panel_tag_assignments = {}
-        tagged_detection_ids = set()
-        no_tag_light_ids = set()
-        if self._panel_tags_enabled:
-            panel_tag_assignments, changed = apply_panel_tag_rules(
-                frame_detections, panel_tag_markers, self._panel_tag_tracker)
-            no_tag_light_ids = {id(detection) for detection in changed}
-            tagged_detection_ids = {
-                id(frame_detections[det_index])
-                for det_index in panel_tag_assignments
+        if self.panel_tag_enabled and self.panel_tag_tracker is not None:
+            panel_tag_markers = detect_panel_tags(color, self.panel_tag_cfg)
+            panel_tag_assignments = self.panel_tag_tracker.update(
+                detections, panel_tag_markers)
+        tag_id_by_object = {
+            id(detections[index]): assignment.tag_id
+            for index, assignment in panel_tag_assignments.items()
+            if 0 <= index < len(detections)
+        }
+        (
+            panel_detections,
+            panel_axis_origin,
+            panel_axis_vector,
+        ) = self._select_panel_row(detections)
+        matched = dict(
+            self.registry.identify(
+                panel_detections,
+                color,
+                axis_origin=panel_axis_origin,
+                axis_vector=panel_axis_vector,
+            )
+        )
+        # Lower row (IDs 8..10).  Only detections the main row did NOT use are
+        # candidates, so main-row IDs 0..6 can never be stolen.  "light" is
+        # included because round panel buttons are frequently detected as light.
+        main_row_used = {id(detection) for detection in matched.values()}
+        second_row_candidates = [
+            detection
+            for detection in detections
+            if id(detection) not in main_row_used
+            and detection.class_name in ("button", "knob", "light")
+        ]
+        if second_row_candidates:
+            diag = self.registry.classify_lower_row(second_row_candidates, color)
+            rospy.loginfo_throttle(
+                5.0,
+                "lower-row candidates (class,colour): %s",
+                [(class_name, colour) for _, class_name, colour in diag],
+            )
+            for target_id, detection in self.registry.identify_second_row(
+                second_row_candidates, color
+            ):
+                if target_id not in matched:
+                    matched[target_id] = detection
+            lower_ids = sorted(
+                target_id for target_id in (8, 9, 10) if target_id in matched
+            )
+            if lower_ids:
+                rospy.loginfo_throttle(
+                    2.0, "Lower-row targets matched: %s", lower_ids
+                )
+
+        targets = []
+        valid_depths = []
+        knob_angles = []
+        knob_angles_by_target = {}
+        matched_points = {}
+        position_measurements = []
+        for target_id, detection in sorted(matched.items()):
+            point = self._point_from_detection(detection, depth, info)
+            if point is None:
+                continue
+            matched_points[target_id] = point
+            position_measurements.append(
+                (target_id, detection.center, point)
+            )
+        stable_points = self.position_stabilizer.update(
+            position_measurements, time.time()
+        )
+        active_angle_ids = [
+            target_id
+            for target_id, detection in matched.items()
+            if self._should_estimate_angle(target_id, detection)
+        ]
+        self.knob_angle_stabilizer.prune(active_angle_ids)
+        for target_id, detection in sorted(matched.items()):
+            if target_id not in matched_points:
+                continue
+            point = np.asarray(
+                stable_points.get(target_id, matched_points[target_id]),
+                dtype=np.float64,
+            )
+            valid_depths.append(point[2])
+            tag_id = tag_id_by_object.get(id(detection))
+            output_id = (int(tag_id)) if tag_id is not None else None
+            target = {
+                "id": output_id,
+                "class": detection.class_name,
+                "tag_id": tag_id,
+                "position": {
+                    "x": round(float(point[0]), 5),
+                    "y": round(float(point[1]), 5),
+                    "z": round(float(point[2]), 5),
+                },
+                "orientation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0,
+                },
+                "confidence": round(float(detection.confidence), 4),
             }
-            for detection in changed:
-                redraw_reclassified_detection(
-                    canvas, color_image, detection,
-                    old_class='button', color=(255, 255, 0))
-            draw_panel_tag_assignments(
-                canvas, panel_tag_markers, panel_tag_assignments, frame_detections)
+            targets.append(target)
 
-        board_feature_details = self._publish_board_cards(
-            frame_detections, panel_tag_assignments, filtered_depth,
-            deproj_intrin, stamp, color_image, canvas)
+            if self._should_estimate_angle(target_id, detection):
+                raw_angle = self._estimate_detection_angle(
+                    color, target_id, detection
+                )
+                mode_0_90 = self.knob_angle_constraint_mode == 1
+                if mode_0_90:
+                    output_angle = self.knob_angle_stabilizer.update(
+                        target_id, raw_angle
+                    )
+                else:
+                    output_angle = raw_angle
+                if output_angle is not None:
+                    if mode_0_90:
+                        output_angle = int(round(output_angle))
+                    else:
+                        output_angle = round(float(output_angle), 1)
+                    angle_entry = {
+                        "id": output_id,
+                        "class": detection.class_name,
+                        "position": dict(target["position"]),
+                        "angle": output_angle,
+                        "confidence": round(float(detection.confidence), 4),
+                    }
+                    knob_angles.append(angle_entry)
+                    if output_id is not None:
+                        knob_angles_by_target[output_id] = output_angle
 
-        nut_localizations = {}
-        for i, det in enumerate(frame_detections):
-            if self._process_fasteners and det.class_name == 'nut':
-                nut_localizations[i] = localize_nut(color_image, det.bbox)
+        # Tag-only IDs: detections without a tag are still published with
+        # id=null so downstream can see them without inventing a layout ID.
+        matched_object_ids = {id(detection) for detection in matched.values()}
+        for detection in detections:
+            if id(detection) in matched_object_ids:
+                continue
+            if detection.class_name not in (
+                    "button", "door_button", "knob", "light", "board_card"):
+                continue
+            point = self._point_from_detection(detection, depth, info)
+            if point is None:
+                continue
+            tag_id = tag_id_by_object.get(id(detection))
+            output_id = (int(tag_id)) if tag_id is not None else None
+            targets.append({
+                "id": output_id,
+                "class": detection.class_name,
+                "tag_id": tag_id,
+                "position": {
+                    "x": round(float(point[0]), 5),
+                    "y": round(float(point[1]), 5),
+                    "z": round(float(point[2]), 5),
+                },
+                "orientation": {
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": 0.0,
+                    "w": 1.0,
+                },
+                "confidence": round(float(detection.confidence), 4),
+            })
+            valid_depths.append(point[2])
+        if targets:
+            payload = {
+                "stamp": color_msg.header.stamp.to_sec(),
+                "frame_id": color_msg.header.frame_id or self.camera_frame,
+                "targets": targets,
+            }
+            self.targets_pub.publish(
+                String(data=json.dumps(payload, ensure_ascii=False))
+            )
+            if valid_depths:
+                self.distance_pub.publish(
+                    String(
+                        data=json.dumps(
+                            {
+                                "stamp": color_msg.header.stamp.to_sec(),
+                                "distance_m": round(
+                                    float(np.median(valid_depths)), 5
+                                ),
+                            }
+                        )
+                    )
+                )
+            self._publish_status("registered")
+        else:
+            self._publish_status("no_targets")
+        if knob_angles:
+            self.knob_angle_pub.publish(
+                String(
+                    data=json.dumps(
+                        {
+                            "stamp": color_msg.header.stamp.to_sec(),
+                            "frame_id": color_msg.header.frame_id
+                            or self.camera_frame,
+                            "knob_angles": knob_angles,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            )
+        self._publish_debug(
+            color_msg,
+            color,
+            detections,
+            matched,
+            knob_angles_by_target,
+            panel_tag_markers,
+            panel_tag_assignments,
+        )
 
-        # 检测到两个 knob 时：
-        # 1. 用两枚 knob 连线粗定位目标行
-        # 2. 用目标行附近的 button/knob/button-like light 重新拟合整排轴线
-        # 3. 只有最终轴线附近的 button/knob 参与编号；细长 light 不参与，避免编号贴到灯上
-        knobs = [d for d in frame_detections if d.class_name == 'knob']
-        panel_detections = []  # 只有在面板行上的目标才参与编号
-        panel_axis_origin = None
-        panel_axis_vector = None
-        matched = []
+    def _should_estimate_angle(self, target_id, detection):
+        del target_id
+        if not self.knob_angle_enabled:
+            return False
+        return detection.class_name == self.knob_angle_class
 
-        if not self._process_panel_controls:
-            matched = []
-        elif len(knobs) >= 2:
-            k1, k2 = sorted(knobs, key=lambda d: d.center_x)[:2]
-            line_vec = np.array([k2.center_x - k1.center_x, k2.center_y - k1.center_y])
-            line_len = np.linalg.norm(line_vec)
-            if line_len > 1:
-                line_unit = line_vec / line_len
-                line_normal = np.array([-line_unit[1], line_unit[0]])
+    def _estimate_detection_angle(self, color, target_id, detection):
+        height, width = color.shape[:2]
+        x1, y1, x2, y2 = [int(round(value)) for value in detection.bbox]
+        x1 = max(0, min(width, x1))
+        x2 = max(0, min(width, x2))
+        y1 = max(0, min(height, y1))
+        y2 = max(0, min(height, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        mode_0_90 = self.knob_angle_constraint_mode == 1
+        # ID 4 is the red long-handle knob in every mode.  In discrete mode
+        # its directional red-handle estimate is subsequently reduced to the
+        # stable, unoriented 0/90 state by DiscreteAngleStabilizer.  This keeps
+        # the ROS2 red-handle detector active while preserving the ROS1
+        # visual-servo direction contract.
+        if int(target_id) == 3:
+            pointer_color = "red_handle"
+        elif mode_0_90:
+            pointer_color = "white_line"
+        else:
+            pointer_color = "white_tape"
+        angle_range = None
+        if self.knob_angle_constraint_mode == 2:
+            angle_range = (
+                (180.0, 270.0)
+                if int(target_id) == 3
+                else (0.0, 90.0)
+            )
+        return estimate_knob_angle(
+            color[y1:y2, x1:x2],
+            binary_thresh=self.knob_angle_binary_threshold,
+            circle_mask_ratio=self.knob_angle_circle_mask_ratio,
+            angle_range=angle_range,
+            pointer_color=pointer_color,
+        )
 
-                size_candidates = [d for d in frame_detections
-                                   if d.class_name in ('button', 'knob')]
-                median_h = np.median([max(1.0, d.bbox[3] - d.bbox[1])
-                                      for d in size_candidates]) if size_candidates else 80.0
-                initial_thresh = float(np.clip(
-                    median_h * self._panel_line_cfg.get('initial_dist_ratio', 1.1),
-                    self._panel_line_cfg.get('min_dist', 45.0),
-                    self._panel_line_cfg.get('max_dist', 110.0)))
-                proj_margin = max(
-                    self._panel_line_cfg.get('min_proj_margin', 450.0),
-                    line_len * self._panel_line_cfg.get('proj_margin_ratio', 3.0))
+    def _select_panel_row(self, detections):
+        """Select and order the physical button/knob row.
+
+        Two visible knobs bootstrap the row.  When the view is narrower, the
+        cached direction is reused and its parallel line is relocated from the
+        currently visible detections.
+
+        A restricted wrist view (``registry_target_ids`` set, for example the
+        right arm with the ID5/ID6 buttons) may never contain a knob at all, so
+        ``button_axis_bootstrap`` lets it fit the row from its own button-like
+        detections instead.  Without an axis that view would be ordered by raw
+        image x, which is what made its IDs unstable.
+        """
+
+        knobs = [
+            detection
+            for detection in detections
+            if detection.class_name == "knob"
+        ]
+        if len(knobs) >= 2:
+            knob_1, knob_2 = sorted(
+                knobs, key=lambda detection: detection.center_x
+            )[:2]
+            line_vector = np.asarray(
+                [
+                    knob_2.center_x - knob_1.center_x,
+                    knob_2.center_y - knob_1.center_y,
+                ],
+                dtype=np.float64,
+            )
+            line_length = float(np.linalg.norm(line_vector))
+            if line_length > 1.0:
+                line_axis = line_vector / line_length
+                line_normal = np.asarray(
+                    [-line_axis[1], line_axis[0]], dtype=np.float64
+                )
+                panel_sizes = [
+                    max(1.0, detection.bbox[3] - detection.bbox[1])
+                    for detection in detections
+                    if detection.class_name in ("button", "knob")
+                ]
+                median_height = (
+                    float(np.median(panel_sizes)) if panel_sizes else 80.0
+                )
+                initial_threshold = float(
+                    np.clip(
+                        median_height
+                        * self.panel_line["initial_dist_ratio"],
+                        self.panel_line["min_dist"],
+                        self.panel_line["max_dist"],
+                    )
+                )
+                projection_margin = max(
+                    self.panel_line["min_proj_margin"],
+                    line_length * self.panel_line["proj_margin_ratio"],
+                )
 
                 rough_row = []
-                for d in frame_detections:
-                    can_join_row = (
-                        d.class_name in ('button', 'knob') or
-                        (d.class_name == 'light' and _is_button_like_detection(d))
+                knob_origin = np.asarray(
+                    [knob_1.center_x, knob_1.center_y], dtype=np.float64
+                )
+                for detection in detections:
+                    can_join = (
+                        detection.class_name in ("button", "knob")
+                        or (
+                            detection.class_name == "light"
+                            and _is_button_like_detection(detection)
+                        )
                     )
-                    if not can_join_row:
+                    if not can_join:
                         continue
-                    pt = np.array([d.center_x - k1.center_x, d.center_y - k1.center_y])
-                    dist = abs(np.dot(pt, line_normal))
-                    proj = float(np.dot(pt, line_unit))
-                    if dist <= initial_thresh and -proj_margin <= proj <= line_len + proj_margin:
-                        rough_row.append(d)
+                    point = (
+                        np.asarray(
+                            [detection.center_x, detection.center_y],
+                            dtype=np.float64,
+                        )
+                        - knob_origin
+                    )
+                    distance = abs(float(np.dot(point, line_normal)))
+                    projection = float(np.dot(point, line_axis))
+                    if (
+                        distance <= initial_threshold
+                        and -projection_margin
+                        <= projection
+                        <= line_length + projection_margin
+                    ):
+                        rough_row.append(detection)
 
                 if len(rough_row) >= 3:
                     fitted_axis = _fit_axis_from_points(
-                        [(d.center_x, d.center_y) for d in rough_row],
-                        line_unit)
-                    axis_origin_arr = np.mean(
-                        np.array([(d.center_x, d.center_y) for d in rough_row],
-                                 dtype=np.float64),
-                        axis=0)
-                else:
-                    fitted_axis = line_unit
-                    axis_origin_arr = np.array([k1.center_x, k1.center_y], dtype=np.float64)
-
-                fitted_normal = np.array([-fitted_axis[1], fitted_axis[0]])
-                projections = [
-                    float(np.dot(
-                        np.array([d.center_x, d.center_y], dtype=np.float64) - axis_origin_arr,
-                        fitted_axis))
-                    for d in rough_row
-                ]
-                if projections:
-                    proj_min = min(projections) - self._panel_line_cfg.get('min_proj_margin', 450.0)
-                    proj_max = max(projections) + self._panel_line_cfg.get('min_proj_margin', 450.0)
-                else:
-                    proj_min = -proj_margin
-                    proj_max = line_len + proj_margin
-
-                line_dist_thresh = float(np.clip(
-                    median_h * self._panel_line_cfg.get('dist_ratio', 0.85),
-                    self._panel_line_cfg.get('min_dist', 45.0),
-                    self._panel_line_cfg.get('max_dist', 110.0)))
-                panel_axis_origin = (float(axis_origin_arr[0]), float(axis_origin_arr[1]))
-                panel_axis_vector = (float(fitted_axis[0]), float(fitted_axis[1]))
-                self._persistent_panel_axis.update(panel_axis_origin, panel_axis_vector)
-
-                for d in frame_detections:
-                    can_join_row = (
-                        d.class_name in ('button', 'knob') or
-                        (d.class_name == 'light' and _is_button_like_detection(d))
-                    )
-                    if not can_join_row:
-                        continue
-                    pt = np.array([d.center_x, d.center_y], dtype=np.float64) - axis_origin_arr
-                    dist = abs(np.dot(pt, fitted_normal))
-                    proj = float(np.dot(pt, fitted_axis))
-                    on_line = (
-                        dist <= line_dist_thresh and
-                        proj_min <= proj <= proj_max
-                    )
-                    if (d.class_name == 'light' and on_line and
-                            not self._panel_tags_enabled and
-                            id(d) not in tagged_detection_ids and
-                            id(d) not in no_tag_light_ids):
-                        d.class_name = 'button'
-                        x1, y1 = int(d.bbox[0]), int(d.bbox[1])
-                        cv2.rectangle(canvas, (x1, y1 - 20), (x1 + 80, y1), (0, 0, 0), -1)
-                        cv2.putText(canvas, 'button', (x1, y1 - 5),
-                                    0, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-                    # 只有在连线上的 button/knob 参与编号
-                    if on_line and d.class_name in ('button', 'knob'):
-                        panel_detections.append(d)
-            else:
-                # knob 重叠退化，取所有 button/knob
-                axis_candidates = [
-                    d for d in frame_detections
-                    if d.class_name != 'board_card' and
-                (not self._panel_tags_enabled or d.class_name != 'light') and
-                    id(d) not in no_tag_light_ids and (
-                        id(d) not in tagged_detection_ids or
-                        d.class_name in ('button', 'knob'))
-                ]
-                cached_axis_result = self._persistent_panel_axis.select(axis_candidates)
-                if cached_axis_result is not None:
-                    panel_detections, panel_axis_origin, panel_axis_vector = cached_axis_result
-                else:
-                    panel_detections = [d for d in frame_detections
-                                        if d.class_name in ('button', 'knob')]
-        else:
-            # 没有两个 knob 可见，取所有 button/knob
-            axis_candidates = [
-                d for d in frame_detections
-                if d.class_name != 'board_card' and
-                (not self._panel_tags_enabled or d.class_name != 'light') and
-                id(d) not in no_tag_light_ids and (
-                    id(d) not in tagged_detection_ids or
-                    d.class_name in ('button', 'knob'))
-            ]
-            cached_axis_result = self._persistent_panel_axis.select(axis_candidates)
-            if cached_axis_result is not None:
-                panel_detections, panel_axis_origin, panel_axis_vector = cached_axis_result
-            else:
-                panel_detections = [d for d in frame_detections
-                                    if d.class_name in ('button', 'knob')]
-
-        if self._process_panel_controls:
-            direct_matches = [
-                (assignment.target_id, frame_detections[det_index])
-                for det_index, assignment in panel_tag_assignments.items()
-            ]
-            fallback_detections = [
-                detection for detection in panel_detections
-                if id(detection) not in tagged_detection_ids
-            ]
-            fallback_matches = self._registry.identify(
-                fallback_detections, color_image,
-                axis_origin=panel_axis_origin,
-                axis_vector=panel_axis_vector) if (
-                    not self._panel_tags_enabled or self._panel_layout_fallback) else []
-            direct_target_ids = {target_id for target_id, _ in direct_matches}
-            fallback_matches = [
-                item for item in fallback_matches
-                if item[0] not in direct_target_ids
-            ]
-            matched = sorted(
-                direct_matches + fallback_matches, key=lambda item: item[0])
-
-        tag_assignment_by_detection = {
-            id(frame_detections[det_index]): assignment
-            for det_index, assignment in panel_tag_assignments.items()
-        }
-
-        targets_output = []
-        knob_angles = []
-        matched_xyz = {}  # 缓存 3D 坐标避免重复计算
-        position_measurements = []
-
-        for target_id, det in matched:
-            ux, uy, xyz = _estimate_detection_point(
-                det, filtered_depth, deproj_intrin, self._depth_scale,
-                knob_quantile=self._knob_depth_quantile,
-                knob_offset_m=self._knob_depth_offset_m)
-            matched_xyz[target_id] = xyz
-            position_measurements.append((target_id, (ux, uy), xyz))
-
-        stable_xyz = self._position_stabilizer.update(position_measurements, time.time())
-        active_knob_ids = [
-            target_id for target_id, det in matched
-            if det.class_name == self._angle_knob_class
-        ]
-        self._knob_angle_stabilizer.prune(active_knob_ids)
-
-        for target_id, det in matched:
-            xyz = stable_xyz.get(target_id, matched_xyz[target_id])
-            matched_xyz[target_id] = xyz
-            if det.class_name == 'board_card' and not _valid_point_3d(xyz):
-                continue
-            tag_assignment = tag_assignment_by_detection.get(id(det))
-
-            target_info = {
-                'id': target_id,
-                'class': det.class_name,
-                'tag_id': (tag_assignment.tag_id
-                           if tag_assignment is not None else None),
-                'classification_source': (
-                    'yolo' if det.class_name == 'board_card' else
-                    tag_assignment.source
-                    if tag_assignment is not None else 'yolo_layout'),
-                'position': {'x': round(xyz[0], 4),
-                             'y': round(xyz[1], 4),
-                             'z': round(xyz[2], 4)},
-                'orientation': {'x': quat[0], 'y': quat[1],
-                                'z': quat[2], 'w': quat[3]},
-                'confidence': round(det.confidence, 3),
-            }
-            if det.class_name == 'board_card':
-                target_info.update(board_card_target(
-                    det, tag_assignment, xyz, quat,
-                    self._panel_normal_cache is not None))
-                target_info.update(board_feature_details.get(id(det), {}))
-            targets_output.append(target_info)
-
-            # 兼容旧话题
-            _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
-
-        # Angle is a visual observation and must not disappear merely because
-        # a Tag is outside the view. Keep the legacy numbered topic unchanged.
-        knob_observations = []
-        if self._process_panel_controls and self._angle_enable:
-            numbered = {id(det): target_id for target_id, det in matched}
-            for det in frame_detections:
-                if det.class_name != self._angle_knob_class:
-                    continue
-                target_id = numbered.get(id(det))
-                observation = observe_knob(
-                    color_image, det, target_id, self._angle_constraint_mode,
-                    self._knob_angle_stabilizer, self.cfg.get('knob_angle', {}))
-                assignment = tag_assignment_by_detection.get(id(det))
-                observation['tag_id'] = assignment.tag_id if assignment else None
-                xyz = matched_xyz.get(target_id)
-                observation['position_valid'] = bool(_valid_point_3d(xyz)) if xyz is not None else False
-                observation['position'] = (
-                    {axis: round(float(v), 4) for axis, v in zip('xyz', xyz)}
-                    if observation['position_valid'] else None)
-                knob_observations.append(observation)
-                if observation['angle_valid']:
-                    if target_id is not None:
-                        knob_angles.append({key: observation[key] for key in
-                                            ('id', 'position', 'angle', 'confidence')})
-                    else:
-                        draw_knob_angle(canvas, det.bbox, observation['angle'])
-            msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp.secs + stamp.nsecs * 1e-9,
-                'knobs': knob_observations,
-            }, ensure_ascii=False)
-            self._knob_observations_pub.publish(msg)
-
-        # 对所有非编号目标计算 3D 坐标并标注。nut 只发布 refined 可靠点。
-        object_targets_output = []
-        fastener_observation_base = {}
-        fastener_target_items = {}
-        matched_detection_ids = {id(det) for _, det in matched}
-        for det_idx, det in enumerate(frame_detections):
-            if (id(det) in matched_detection_ids or
-                    det.class_name in ('button', 'knob')):
-                continue  # 已在 matched 中处理
-
-            marker = marker_by_detection_id.get(id(det))
-            marker_pose = (
-                marker_pose_by_marker_id.get(id(marker))
-                if marker is not None else None)
-            if marker is not None:
-                ux = int(round(marker.center[0]))
-                uy = int(round(marker.center[1]))
-                xyz = marker_pose.point_3d if marker_pose is not None else None
-                if not _valid_point_3d(xyz):
-                    cv2.putText(canvas, 'marker plane/depth fail',
-                                (ux + 10, uy + 18), 0, 0.4,
-                                (0, 0, 255), 1, cv2.LINE_AA)
-                    continue
-                angle_text = ('na' if marker.gap_angle_deg is None
-                              else f'{marker.gap_angle_deg:.1f}')
-                cv2.putText(
-                    canvas,
-                    f'bolt_marker conf={marker.confidence:.2f} angle={angle_text}',
-                    (ux + 10, max(15, uy - 8)), 0, 0.4,
-                    (0, 255, 0), 1, cv2.LINE_AA)
-            elif det.class_name == 'nut':
-                loc = nut_localizations.get(det_idx)
-                bbox_cx = int(round(det.center_x))
-                bbox_cy = int(round(det.center_y))
-                cv2.circle(canvas, (bbox_cx, bbox_cy), 3, (160, 160, 160), -1)
-
-                if loc is None or loc.confidence < 0.45:
-                    x1, y1 = int(det.bbox[0]), int(det.bbox[1])
-                    conf_text = 0.0 if loc is None else loc.confidence
-                    cv2.putText(canvas, f'nut refine fail {conf_text:.2f}',
-                                (x1, max(15, y1 - 8)), 0, 0.4,
-                                (0, 0, 255), 1, cv2.LINE_AA)
-                    ux, uy, fallback_xyz = _estimate_bbox_grouping_point(
-                        det, filtered_depth, deproj_intrin, self._depth_scale)
-                    if _valid_point_3d(fallback_xyz):
-                        fastener_observation_base[det_idx] = {
-                            'det_idx': det_idx,
-                            'class_name': det.class_name,
-                            'center_xy': (float(det.center_x), float(det.center_y)),
-                            'bbox': tuple(float(v) for v in det.bbox),
-                            'confidence': float(det.confidence) * 0.75,
-                            'point_3d': [float(value) for value in fallback_xyz],
-                        }
-                    continue
-
-                ux, uy, xyz = _estimate_nut_detection_point(
-                    loc, filtered_depth, deproj_intrin, self._depth_scale)
-                cv2.drawContours(canvas, [loc.contour], -1, (0, 255, 255), 2)
-                cv2.drawMarker(canvas, (ux, uy), (0, 255, 255),
-                               markerType=cv2.MARKER_CROSS, markerSize=14,
-                               thickness=2)
-                angle_text = 'na' if loc.angle is None else f'{loc.angle:.1f}'
-                cv2.putText(canvas, f'nut_refined_conf={loc.confidence:.2f} angle={angle_text}',
-                            (ux + 10, uy - 8), 0, 0.4,
-                            (0, 255, 255), 1, cv2.LINE_AA)
-
-                if not _valid_point_3d(xyz):
-                    cv2.putText(canvas, 'nut depth fail',
-                                (ux + 10, uy + 18), 0, 0.4,
-                                (0, 0, 255), 1, cv2.LINE_AA)
-                    continue
-
-                # Fastener legacy pose is published after ID-based position filtering.
-            else:
-                ux, uy, xyz = _estimate_detection_point(
-                    det, filtered_depth, deproj_intrin, self._depth_scale)
-                if not _valid_point_3d(xyz):
-                    x1, y1 = int(det.bbox[0]), int(det.bbox[1])
-                    cv2.putText(canvas, f'{det.class_name} depth fail',
-                                (x1, max(15, y1 - 8)), 0, 0.4,
-                                (0, 0, 255), 1, cv2.LINE_AA)
-                    continue
-                if det.class_name != 'bolt':
-                    _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
-
-            if det.class_name in ('valve', 'bolt', 'nut'):
-                target_item = {
-                    'class': det.class_name,
-                    'bbox': det.bbox,
-                    'position': {'x': round(xyz[0], 4),
-                                 'y': round(xyz[1], 4),
-                                 'z': round(xyz[2], 4)},
-                    'orientation': {'x': quat[0], 'y': quat[1],
-                                    'z': quat[2], 'w': quat[3]},
-                    'confidence': round(det.confidence, 3),
-                }
-                if marker is not None and marker_pose is not None:
-                    marker_quat = (
-                        _normal_to_quaternion(apriltag_reference['normal'])
-                        if apriltag_reference is not None else quat)
-                    target_item.update({
-                        'classification_source': 'concentric_bolt_marker',
-                        'depth_source': marker_pose.depth_source,
-                        'orientation': {
-                            'x': marker_quat[0], 'y': marker_quat[1],
-                            'z': marker_quat[2], 'w': marker_quat[3],
-                        },
-                        'marker_angle_deg': (
-                            None if marker.gap_angle_deg is None
-                            else round(marker.gap_angle_deg, 1)),
-                        'marker_direction_3d': (
-                            None if marker_pose.direction_3d is None
-                            else [round(float(value), 6)
-                                  for value in marker_pose.direction_3d]),
-                    })
-                object_targets_output.append(target_item)
-                if det.class_name in ('bolt', 'nut'):
-                    fastener_target_items[det_idx] = target_item
-                    fastener_observation_base[det_idx] = {
-                        'det_idx': det_idx,
-                        'class_name': det.class_name,
-                        'center_xy': (float(det.center_x), float(det.center_y)),
-                        'bbox': tuple(float(v) for v in det.bbox),
-                        'confidence': float(det.confidence),
-                        'point_3d': [float(xyz[0]), float(xyz[1]), float(xyz[2])],
-                    }
-
-            if det.class_name not in ('bolt', 'nut'):
-                cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
-                            (ux + 10, uy + 5), 0, 0.4,
-                            (225, 255, 255), 1, cv2.LINE_AA)
-
-        valve_reference_errors = []
-
-        # 多边形角度检测（nut/bolt=六边形, valve=八边形）— 对所有检测结果
-        hex_angles = []
-        axis_directions = []
-        fastener_axis_by_det_idx = {}
-        fastener_geometry_items = {}
-        axis_candidate_points = []
-        axis_target_classes = set()
-        if self._process_valves:
-            axis_target_classes.add('valve')
-        if self._process_fasteners:
-            axis_target_classes.update(('nut', 'bolt'))
-        for det_idx, det in enumerate(frame_detections):
-            if det.class_name not in axis_target_classes:
-                continue
-            marker = marker_by_detection_id.get(id(det))
-            marker_pose = (
-                marker_pose_by_marker_id.get(id(marker))
-                if marker is not None else None)
-            loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
-            reliable_nut = loc is not None and loc.confidence >= 0.45
-            if marker_pose is not None and marker_pose.point_3d is not None:
-                ux = int(round(marker.center[0]))
-                uy = int(round(marker.center[1]))
-                xyz = marker_pose.point_3d
-            elif reliable_nut:
-                ux, uy, xyz = _estimate_nut_detection_point(
-                    loc, filtered_depth, deproj_intrin, self._depth_scale)
-            else:
-                ux, uy, xyz = _estimate_detection_point(
-                    det, filtered_depth, deproj_intrin, self._depth_scale)
-            if xyz is None or xyz[2] <= 0:
-                continue
-            axis_candidate_points.append({
-                'det_idx': det_idx,
-                'class_name': det.class_name,
-                'center_xy': (ux, uy),
-                'point_3d': xyz,
-                'frame': self._frame_count,
-            })
-
-        for det_idx, det in enumerate(frame_detections):
-            if det.class_name in ('nut', 'bolt', 'valve'):
-                x1, y1 = int(det.bbox[0]), int(det.bbox[1])
-                x2, y2 = int(det.bbox[2]), int(det.bbox[3])
-                roi = color_image[y1:y2, x1:x2]
-                loc = nut_localizations.get(det_idx) if det.class_name == 'nut' else None
-                reliable_nut = loc is not None and loc.confidence >= 0.45
-                marker = marker_by_detection_id.get(id(det))
-                marker_pose = (
-                    marker_pose_by_marker_id.get(id(marker))
-                    if marker is not None else None)
-
-                if (marker is not None and marker_pose is not None
-                        and marker_pose.point_3d is not None
-                        and apriltag_reference is not None):
-                    axis_source = apriltag_reference['source'] + '_marker'
-                    axis_result = (
-                        apriltag_reference['normal'],
-                        marker_pose.point_3d,
-                        len(concentric_markers),
-                    )
-                elif (det.class_name == 'valve' and not _bbox_inside_image(
-                        det.bbox, color_image.shape,
-                        margin_px=self.cfg.get('valve_axis', {}).get('edge_margin_px', 4))):
-                    axis_source = 'valve_incomplete'
-                    axis_result = None
-                    cv2.putText(canvas, 'valve incomplete',
-                                (x1, min(canvas.shape[0] - 8, y2 + 16)),
-                                0, 0.42, (0, 180, 255), 1, cv2.LINE_AA)
-                elif det.class_name == 'valve':
-                    axis_source = 'valve_wheel'
-                    axis_result = estimate_valve_wheel_axis_direction(
-                        filtered_depth,
-                        deproj_intrin,
-                        det.bbox,
-                        depth_scale=self._depth_scale,
-                    )
-                else:
-                    axis_source = 'fastener_current'
-                    axis_result = estimate_fastener_group_axis_direction(
-                        (det.center_x, det.center_y),
-                        axis_candidate_points,
-                        max_distance_px=max(140.0, 3.5 * max(det.bbox[2] - det.bbox[0],
-                                                             det.bbox[3] - det.bbox[1])),
-                        min_points=3,
-                        max_points=6,
-                    )
-                    if axis_result is None:
-                        axis_source = 'local_patch_plane'
-                        axis_result = estimate_fastener_patch_axis_direction(
-                            filtered_depth,
-                            deproj_intrin,
-                            det.bbox,
-                            all_bboxes=active_xyxy_list,
-                            depth_scale=self._depth_scale,
-                        )
-                        if axis_result is not None:
-                            constrained = estimate_fastener_line_constrained_axis(
-                                (det.center_x, det.center_y),
-                                axis_candidate_points,
-                                axis_result[0],
-                                max_distance_px=max(
-                                    140.0,
-                                    3.5 * max(det.bbox[2] - det.bbox[0],
-                                              det.bbox[3] - det.bbox[1])),
-                            )
-                            if constrained is not None:
-                                axis_result = constrained
-                                axis_source = 'fastener_line'
-                    if axis_result is None and self._panel_normal_cache is not None:
-                        axis_normal, axis_centroid = self._panel_normal_cache
-                        axis_points = 0
-                        axis_result = (axis_normal, axis_centroid, axis_points)
-                        axis_source = 'panel_plane'
-                    if axis_result is None:
-                        axis_result = estimate_object_axis_direction(
-                            filtered_depth,
-                            deproj_intrin,
-                            det.bbox,
-                            depth_scale=self._depth_scale,
-                            mask=loc.depth_mask if reliable_nut else None,
-                            object_class=det.class_name,
-                        )
-                        axis_source = 'local_depth'
-                if axis_result is not None:
-                    axis_normal, axis_centroid, axis_points = axis_result
-                    axis_item = {
-                        'class': det.class_name,
-                        'bbox': det.bbox,
-                        'source': axis_source,
-                        'axis_direction': [
-                            round(float(axis_normal[0]), 6),
-                            round(float(axis_normal[1]), 6),
-                            round(float(axis_normal[2]), 6),
+                        [
+                            (detection.center_x, detection.center_y)
+                            for detection in rough_row
                         ],
-                        'centroid': [
-                            round(float(axis_centroid[0]), 4),
-                            round(float(axis_centroid[1]), 4),
-                            round(float(axis_centroid[2]), 4),
-                        ],
-                        'point_count': axis_points,
-                    }
-                    if det.class_name == 'valve' and apriltag_reference is not None:
-                        angle_deg = angle_between_normals_deg(
-                            axis_normal, apriltag_reference['normal'])
-                        if angle_deg is not None:
-                            axis_item['reference'] = apriltag_reference['source']
-                            axis_item['reference_angle_deg'] = round(angle_deg, 2)
-                            valve_reference_errors.append({
-                                'bbox': det.bbox,
-                                'source': axis_source,
-                                'normal': axis_item['axis_direction'],
-                                'centroid': axis_item['centroid'],
-                                'point_count': axis_points,
-                                'angle_deg': round(angle_deg, 2),
-                            })
-                    axis_directions.append(axis_item)
-                    if det.class_name in ('bolt', 'nut'):
-                        fastener_axis_by_det_idx[det_idx] = [
-                            float(axis_normal[0]),
-                            float(axis_normal[1]),
-                            float(axis_normal[2]),
-                        ]
-                        fastener_geometry_items.setdefault(det_idx, []).append(axis_item)
-                    if det.class_name == 'valve':
-                        _draw_axis_direction(
-                            canvas, det.bbox, axis_normal,
-                            label=f'{det.class_name}_axis[{axis_source}]',
-                            color=(255, 255, 0))
+                        line_axis,
+                    )
+                    axis_origin = np.mean(
+                        np.asarray(
+                            [
+                                (
+                                    detection.center_x,
+                                    detection.center_y,
+                                )
+                                for detection in rough_row
+                            ],
+                            dtype=np.float64,
+                        ),
+                        axis=0,
+                    )
+                else:
+                    fitted_axis = line_axis
+                    axis_origin = knob_origin
 
-                # 螺栓/螺母不再做六边形角度检测，最终方案由螺栓位置推算螺母位置。
-                # 仅保留 valve 八边形角度和同心圆标靶角度。
-                if det.class_name == 'valve':
-                    hex_angle = None
-                    if not _bbox_inside_image(
-                            det.bbox, color_image.shape,
-                            margin_px=self.cfg.get('valve_axis', {}).get(
-                                'edge_margin_px', 4)):
-                        hex_angle = None
-                    else:
-                        valve_candidates = estimate_valve_angle_candidates(roi)
-                        raw_valve_angle = (
-                            valve_candidates[0] if valve_candidates
-                            else estimate_valve_angle(roi)
-                        )
-                        hex_angle = self._valve_angle_stabilizer.update(
-                            'valve', raw_valve_angle, valve_candidates)
-                    if hex_angle is not None:
-                        angle_item = {
-                            'class': det.class_name,
-                            'bbox': det.bbox,
-                            'hex_angle': round(hex_angle, 1),
-                            'valve_angle': round(hex_angle, 1),
-                        }
-                        hex_angles.append(angle_item)
-                        _draw_regular_polygon(
-                            canvas, det.bbox, 8, hex_angle,
-                            color=(0, 255, 255),
-                            angle_mode='vertex')
-                elif marker is not None and marker.gap_angle_deg is not None:
-                    marker_angle = marker.gap_angle_deg
-                    angle_item = {
-                        'class': det.class_name,
-                        'bbox': det.bbox,
-                        'hex_angle': round(marker_angle % 60.0, 1),
-                        'angle_source': 'concentric_bolt_marker',
-                        'marker_angle_deg': round(marker_angle, 1),
-                        'marker_direction_3d': (
-                            None if marker_pose is None
-                            or marker_pose.direction_3d is None
-                            else [round(float(value), 6)
-                                  for value in marker_pose.direction_3d]),
-                    }
-                    hex_angles.append(angle_item)
-                    fastener_geometry_items.setdefault(det_idx, []).append(angle_item)
-
-        fastener_axis_measurements = []
-        for det_idx, raw_axis in fastener_axis_by_det_idx.items():
-            det = frame_detections[det_idx]
-            fastener_axis_measurements.append(FastenerAxisMeasurement(
-                det_idx=det_idx,
-                center_xy=(float(det.center_x), float(det.center_y)),
-                bbox=tuple(float(value) for value in det.bbox),
-                axis_direction=raw_axis,
-            ))
-        stabilized_fastener_axes = self._fastener_axis_stabilizer.update(
-            fastener_axis_measurements, self._frame_count)
-        for det_idx, stable_axis in stabilized_fastener_axes.items():
-            stable_values = [float(value) for value in stable_axis]
-            fastener_axis_by_det_idx[det_idx] = stable_values
-            axis_item = None
-            for geometry_item in fastener_geometry_items.get(det_idx, []):
-                if 'axis_direction' not in geometry_item:
-                    continue
-                geometry_item['axis_direction'] = [
-                    round(value, 6) for value in stable_values
-                ]
-                axis_item = geometry_item
-            if axis_item is None:
-                continue
-            det = frame_detections[det_idx]
-            _draw_axis_direction(
-                canvas, det.bbox, stable_axis,
-                label=f"{det.class_name}_axis[{axis_item['source']}]",
-                color=(255, 0, 255))
-
-        axis_reference = None
-        if apriltag_reference is not None:
-            tag_origin = apriltag_reference.get(
-                'origin', apriltag_reference['centroid'])
-            axis_reference = {
-                'source': apriltag_reference['source'],
-                'tag_id': apriltag_reference['tag_id'],
-                'normal': [
-                    round(float(apriltag_reference['normal'][0]), 6),
-                    round(float(apriltag_reference['normal'][1]), 6),
-                    round(float(apriltag_reference['normal'][2]), 6),
-                ],
-                'centroid': [
-                    round(float(apriltag_reference['centroid'][0]), 4),
-                    round(float(apriltag_reference['centroid'][1]), 4),
-                    round(float(apriltag_reference['centroid'][2]), 4),
-                ],
-                'origin': [
-                    round(float(tag_origin[0]), 6),
-                    round(float(tag_origin[1]), 6),
-                    round(float(tag_origin[2]), 6),
-                ],
-                'point_count': apriltag_reference['point_count'],
-                'inlier_ratio': round(float(apriltag_reference['inlier_ratio']), 4),
-                'rms_error_m': round(float(apriltag_reference['rms_error']), 5),
-                'reprojection_error_px': (
-                    None if apriltag_reference.get('reprojection_error_px') is None
-                    else round(float(apriltag_reference['reprojection_error_px']), 4)),
-                'valve_errors': valve_reference_errors,
-            }
-            for axis_name in ('x_axis', 'y_axis'):
-                axis = apriltag_reference.get(axis_name)
-                if axis is not None:
-                    axis_reference[axis_name] = [
-                        round(float(axis[0]), 8),
-                        round(float(axis[1]), 8),
-                        round(float(axis[2]), 8),
-                    ]
-            _draw_apriltag_reference(canvas, apriltag_reference, valve_reference_errors)
-            self._write_axis_reference_log(stamp, axis_reference, valve_reference_errors)
-
-        _draw_axis_3d_view(canvas, axis_directions)
-
-        assignments = {}
-        if self._process_fasteners and fastener_observation_base:
-            observations = []
-            for det_idx, base in fastener_observation_base.items():
-                observations.append(FastenerObservation(
-                    axis_direction=fastener_axis_by_det_idx.get(det_idx),
-                    **base,
-                ))
-            assignments = self._fastener_registry.update(
-                observations, self._frame_count)
-            for det_idx, assignment in assignments.items():
-                target_item = fastener_target_items.get(det_idx)
-                if target_item is not None:
-                    target_item.update({
-                        'id': assignment.target_id,
-                        'group_id': assignment.group_id,
-                        'slot': assignment.slot,
-                        'registered': assignment.registered,
-                        'slot_distance_m': round(assignment.distance_m, 4),
-                    })
-                for geometry_item in fastener_geometry_items.get(det_idx, []):
-                    geometry_item.update({
-                        'id': assignment.target_id,
-                        'group_id': assignment.group_id,
-                        'slot': assignment.slot,
-                        'registered': assignment.registered,
-                    })
-
-                det = frame_detections[det_idx]
-                x1, y1 = int(det.bbox[0]), int(det.bbox[1])
-                label = f'G{assignment.group_id} ID{assignment.target_id} {assignment.slot}'
-                text_y = max(18, y1 - 24)
-                (text_w, text_h), _ = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-                cv2.rectangle(
-                    canvas,
-                    (x1, max(0, text_y - text_h - 5)),
-                    (min(canvas.shape[1] - 1, x1 + text_w + 6), text_y + 4),
-                    (0, 0, 0),
-                    -1,
+                fitted_normal = np.asarray(
+                    [-fitted_axis[1], fitted_axis[0]], dtype=np.float64
                 )
-                cv2.putText(canvas, label, (x1 + 3, text_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                            (0, 255, 255), 2, cv2.LINE_AA)
-
-        # 同心圆标记使用稳定 ID 进行时序门控和滤波。这个步骤放在注册器
-        # 分配槽位之后，因此不会因检测顺序变化而把滤波历史串到别的螺栓。
-        self._concentric_marker_stabilizer.prune(self._frame_count)
-        marker_filter_results = {}
-        stable_marker_normal = self._concentric_marker_stabilizer.normal
-        if stable_marker_normal is not None:
-            stable_marker_quat = _normal_to_quaternion(stable_marker_normal)
-            # 即便本帧同心圆的中心深度暂时失败，YOLO 的 bolt fallback
-            # 也沿用同一个经过门控的 Tag 法向，避免输出姿态突然跳回旧平面法向。
-            for target_item in object_targets_output:
-                if target_item.get('class') != 'bolt':
-                    continue
-                target_item['orientation'] = {
-                    'x': stable_marker_quat[0], 'y': stable_marker_quat[1],
-                    'z': stable_marker_quat[2], 'w': stable_marker_quat[3],
-                }
-                target_item.setdefault('stabilization', {})['normal'] = (
-                    marker_normal_status)
-        for det_idx, assignment in assignments.items():
-            target_item = fastener_target_items.get(det_idx)
-            marker = marker_by_detection_id.get(id(frame_detections[det_idx]))
-            marker_pose = (
-                marker_pose_by_marker_id.get(id(marker))
-                if marker is not None else None)
-            if (target_item is None or marker is None or marker_pose is None or
-                    not _valid_point_3d(marker_pose.point_3d)):
-                continue
-            filter_key = (assignment.group_id, assignment.target_id)
-            result = self._concentric_marker_stabilizer.update_marker(
-                filter_key,
-                stamp_seconds,
-                self._frame_count,
-                marker_pose.point_3d,
-                angle_deg=marker.gap_angle_deg,
-                direction=marker_pose.direction_3d,
-            )
-            if result is None:
-                continue
-            marker_filter_results[det_idx] = result
-            xyz = result['position']
-            stable_normal = self._concentric_marker_stabilizer.normal
-            if stable_normal is None and apriltag_reference is not None:
-                stable_normal = apriltag_reference['normal']
-            if stable_normal is not None:
-                stable_quat = _normal_to_quaternion(stable_normal)
-                target_item['orientation'] = {
-                    'x': stable_quat[0], 'y': stable_quat[1],
-                    'z': stable_quat[2], 'w': stable_quat[3],
-                }
-            target_item['position'] = {
-                'x': round(float(xyz[0]), 4),
-                'y': round(float(xyz[1]), 4),
-                'z': round(float(xyz[2]), 4),
-            }
-            target_item['marker_angle_deg'] = (
-                None if result['angle_deg'] is None
-                else round(float(result['angle_deg']), 1))
-            target_item['marker_direction_3d'] = (
-                None if result['direction'] is None
-                else [round(float(value), 6) for value in result['direction']])
-            target_item['marker_angle_observed'] = marker.gap_angle_deg is not None
-            target_item['marker_direction_observed'] = (
-                marker_pose.direction_3d is not None)
-            target_item['stabilization'] = {
-                'position': result['position_status'],
-                'normal': marker_normal_status,
-                'angle': result['angle_status'],
-                'direction': result['direction_status'],
-            }
-            # 在保存的可视化帧中直接标出可用于调试/验收的位姿数值。
-            pose_lines = [
-                f"ID{assignment.target_id} P=({xyz[0] * 1000:.1f},"
-                f"{xyz[1] * 1000:.1f},{xyz[2] * 1000:.1f})mm",
-            ]
-            if stable_normal is not None:
-                pose_lines.append(
-                    f"N=({stable_normal[0]:.2f},{stable_normal[1]:.2f},"
-                    f"{stable_normal[2]:.2f})")
-            if stable_normal is not None:
-                pose_lines.append(
-                    f"Q=({stable_quat[0]:.2f},{stable_quat[1]:.2f},"
-                    f"{stable_quat[2]:.2f},{stable_quat[3]:.2f})")
-            if result['angle_deg'] is not None:
-                pose_lines.append(f"Rgap={result['angle_deg']:.1f}deg")
-            x_text = max(2, int(round(marker.bbox[0])))
-            y_text = int(round(marker.bbox[3])) + 16
-            if y_text + 15 * len(pose_lines) >= canvas.shape[0]:
-                y_text = max(15, int(round(marker.bbox[1])) -
-                             4 - 15 * len(pose_lines))
-            for line_index, text in enumerate(pose_lines):
-                origin = (x_text, y_text + line_index * 15)
-                cv2.putText(canvas, text, origin, 0, 0.38,
-                            (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.putText(canvas, text, origin, 0, 0.38,
-                            (0, 255, 255), 1, cv2.LINE_AA)
-
-        fastener_position_keys = {}
-        fastener_position_measurements = []
-        for det_idx, assignment in assignments.items():
-            base = fastener_observation_base.get(det_idx)
-            if base is None:
-                continue
-            marker = marker_by_detection_id.get(id(frame_detections[det_idx]))
-            if marker is not None:
-                # 已由 ConcentricMarkerStabilizer 处理，避免再经过基于
-                # “画面静止”判断的旧滤波器而把移动中的相机位置清空。
-                continue
-            filter_key = (assignment.group_id, assignment.target_id)
-            fastener_position_keys[det_idx] = filter_key
-            fastener_position_measurements.append((
-                filter_key,
-                base['center_xy'],
-                base['point_3d'],
-            ))
-        stable_fastener_xyz = self._fastener_position_stabilizer.update(
-            fastener_position_measurements, time.time())
-
-        for det_idx, target_item in fastener_target_items.items():
-            base = fastener_observation_base.get(det_idx)
-            if base is None:
-                continue
-            marker = marker_by_detection_id.get(id(frame_detections[det_idx]))
-            marker_result = marker_filter_results.get(det_idx)
-            if marker is not None and marker_result is not None:
-                xyz = marker_result['position']
-                pose_quat = [
-                    target_item['orientation']['x'],
-                    target_item['orientation']['y'],
-                    target_item['orientation']['z'],
-                    target_item['orientation']['w'],
+                rough_projections = [
+                    float(
+                        np.dot(
+                            np.asarray(
+                                [
+                                    detection.center_x,
+                                    detection.center_y,
+                                ],
+                                dtype=np.float64,
+                            )
+                            - axis_origin,
+                            fitted_axis,
+                        )
+                    )
+                    for detection in rough_row
                 ]
-            else:
-                pose_quat = quat
-                filter_key = fastener_position_keys.get(det_idx)
-                xyz = stable_fastener_xyz.get(filter_key, base['point_3d'])
-            target_item['position'] = {
-                'x': round(float(xyz[0]), 4),
-                'y': round(float(xyz[1]), 4),
-                'z': round(float(xyz[2]), 4),
+                if rough_projections:
+                    projection_min = (
+                        min(rough_projections)
+                        - self.panel_line["min_proj_margin"]
+                    )
+                    projection_max = (
+                        max(rough_projections)
+                        + self.panel_line["min_proj_margin"]
+                    )
+                else:
+                    projection_min = -projection_margin
+                    projection_max = line_length + projection_margin
+
+                row_threshold = float(
+                    np.clip(
+                        median_height * self.panel_line["dist_ratio"],
+                        self.panel_line["min_dist"],
+                        self.panel_line["max_dist"],
+                    )
+                )
+                origin_tuple = (
+                    float(axis_origin[0]),
+                    float(axis_origin[1]),
+                )
+                vector_tuple = (
+                    float(fitted_axis[0]),
+                    float(fitted_axis[1]),
+                )
+                self.panel_axis.update(origin_tuple, vector_tuple)
+                self._publish_panel_axis(vector_tuple)
+
+                panel_detections = []
+                for detection in detections:
+                    can_join = (
+                        detection.class_name in ("button", "knob")
+                        or (
+                            detection.class_name == "light"
+                            and _is_button_like_detection(detection)
+                        )
+                    )
+                    if not can_join:
+                        continue
+                    point = (
+                        np.asarray(
+                            [detection.center_x, detection.center_y],
+                            dtype=np.float64,
+                        )
+                        - axis_origin
+                    )
+                    distance = abs(float(np.dot(point, fitted_normal)))
+                    projection = float(np.dot(point, fitted_axis))
+                    on_row = (
+                        distance <= row_threshold
+                        and projection_min
+                        <= projection
+                        <= projection_max
+                    )
+                    if (
+                        detection.class_name == "light"
+                        and on_row
+                    ):
+                        detection.class_name = "button"
+                    if (
+                        on_row
+                        and detection.class_name in ("button", "knob")
+                    ):
+                        panel_detections.append(detection)
+                return panel_detections, origin_tuple, vector_tuple
+
+        cached = self.panel_axis.select(detections)
+        if cached is not None:
+            return cached
+
+        # A restricted wrist camera such as the right arm may only ever see the
+        # ID5/ID6 buttons, so the two-knob bootstrap above can never run and
+        # sorted-by-image-x ordering would decide the IDs.  Fit the row from the
+        # button-like detections themselves: with the axis known, detections are
+        # ordered along the real panel row and a "light" reading of a square
+        # button is still promoted to "button".
+        if self.allow_button_axis:
+            row_points = [
+                detection
+                for detection in detections
+                if detection.class_name in ("button", "knob")
+                or (
+                    detection.class_name == "light"
+                    and _is_button_like_detection(detection)
+                )
+            ]
+            if len(row_points) >= 2:
+                fitted_axis = _fit_axis_from_points(
+                    [
+                        (detection.center_x, detection.center_y)
+                        for detection in row_points
+                    ],
+                    (1.0, 0.0),
+                )
+                axis_origin = np.mean(
+                    np.asarray(
+                        [
+                            (detection.center_x, detection.center_y)
+                            for detection in row_points
+                        ],
+                        dtype=np.float64,
+                    ),
+                    axis=0,
+                )
+                vector_tuple = (
+                    float(fitted_axis[0]),
+                    float(fitted_axis[1]),
+                )
+                origin_tuple = (float(axis_origin[0]), float(axis_origin[1]))
+                self.panel_axis.update(origin_tuple, vector_tuple)
+                self._publish_panel_axis(vector_tuple)
+                return (
+                    self._filter_row_detections(
+                        detections, axis_origin, fitted_axis
+                    ),
+                    origin_tuple,
+                    vector_tuple,
+                )
+
+        # Cold-start fallback: class/colour matching still supplies absolute
+        # IDs even before a reliable panel axis has been observed.
+        panel_detections = [
+            detection
+            for detection in detections
+            if detection.class_name in ("button", "knob")
+        ]
+        return panel_detections, None, None
+
+    def _filter_row_detections(self, detections, axis_origin, fitted_axis):
+        """Keep the detections that sit on the row described by the axis."""
+
+        axis = np.asarray(fitted_axis, dtype=np.float64)
+        norm = float(np.linalg.norm(axis))
+        if norm < 1e-6:
+            return []
+        axis = axis / norm
+        origin = np.asarray(axis_origin, dtype=np.float64)
+        normal = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+
+        panel_sizes = [
+            max(1.0, detection.bbox[3] - detection.bbox[1])
+            for detection in detections
+            if detection.class_name in ("button", "knob")
+        ]
+        median_height = (
+            float(np.median(panel_sizes)) if panel_sizes else 80.0
+        )
+        row_threshold = float(
+            np.clip(
+                median_height * self.panel_line["dist_ratio"],
+                self.panel_line["min_dist"],
+                self.panel_line["max_dist"],
+            )
+        )
+
+        projections = [
+            float(
+                np.dot(
+                    np.asarray(
+                        [detection.center_x, detection.center_y],
+                        dtype=np.float64,
+                    )
+                    - origin,
+                    axis,
+                )
+            )
+            for detection in detections
+        ]
+        if projections:
+            projection_min = (
+                min(projections) - self.panel_line["min_proj_margin"]
+            )
+            projection_max = (
+                max(projections) + self.panel_line["min_proj_margin"]
+            )
+        else:
+            projection_min = -np.inf
+            projection_max = np.inf
+
+        panel_detections = []
+        for detection in detections:
+            can_join = detection.class_name in ("button", "knob") or (
+                detection.class_name == "light"
+                and _is_button_like_detection(detection)
+            )
+            if not can_join:
+                continue
+            point = (
+                np.asarray(
+                    [detection.center_x, detection.center_y],
+                    dtype=np.float64,
+                )
+                - origin
+            )
+            distance = abs(float(np.dot(point, normal)))
+            projection = float(np.dot(point, axis))
+            on_row = (
+                distance <= row_threshold
+                and projection_min <= projection <= projection_max
+            )
+            if detection.class_name == "light" and on_row:
+                detection.class_name = "button"
+            if on_row and detection.class_name in ("button", "knob"):
+                panel_detections.append(detection)
+        return panel_detections
+
+    def _publish_panel_axis(self, vector_tuple):
+        if self.panel_axis_pub is None:
+            return
+        message = Vector3Stamped()
+        message.header.stamp = rospy.Time.now()
+        message.header.frame_id = self.camera_frame
+        message.vector.x = float(vector_tuple[0])
+        message.vector.y = float(vector_tuple[1])
+        message.vector.z = 0.0
+        self.panel_axis_pub.publish(message)
+
+    def _external_panel_axis_callback(self, message):
+        vector = np.asarray(
+            [message.vector.x, message.vector.y], dtype=np.float64
+        )
+        if float(np.linalg.norm(vector)) < 1e-6:
+            return
+        if not self.panel_axis.has_axis:
+            rospy.loginfo(
+                "adopting shared panel axis (%.3f, %.3f) from %s",
+                float(vector[0]),
+                float(vector[1]),
+                self.panel_axis_topic,
+            )
+        self.panel_axis.update(
+            (0.0, 0.0), (float(vector[0]), float(vector[1]))
+        )
+
+    def _point_from_detection(self, detection, depth, info):
+        x1, y1, x2, y2 = [int(round(value)) for value in detection.bbox]
+        width = max(2, x2 - x1)
+        height = max(2, y2 - y1)
+        margin_x = int(width * 0.28)
+        margin_y = int(height * 0.28)
+        x1 = max(0, x1 + margin_x)
+        x2 = min(depth.shape[1], x2 - margin_x)
+        y1 = max(0, y1 + margin_y)
+        y2 = min(depth.shape[0], y2 - margin_y)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        values = np.asarray(depth[y1:y2, x1:x2], dtype=np.float64)
+        values = values[np.isfinite(values) & (values > 0)]
+        if values.size < 8:
+            return None
+        z = float(np.median(values))
+        if depth.dtype != np.float32 and depth.dtype != np.float64:
+            z *= self.depth_scale
+        if not 0.05 <= z <= 2.0:
+            return None
+        u, v = detection.center
+        fx, fy, cx, cy = info.K[0], info.K[4], info.K[2], info.K[5]
+        if fx <= 0.0 or fy <= 0.0:
+            return None
+        return np.array(
+            [(float(u) - cx) * z / fx, (float(v) - cy) * z / fy, z],
+            dtype=np.float64,
+        )
+
+    def _pose_message(self, stamp, point):
+        msg = PoseStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.camera_frame
+        msg.pose.position.x = float(point[0])
+        msg.pose.position.y = float(point[1])
+        msg.pose.position.z = float(point[2])
+        msg.pose.orientation.w = 1.0
+        return msg
+
+    def _publish_status(self, status):
+        if status == self.last_status:
+            return
+        self.last_status = status
+        self.status_pub.publish(String(data=status))
+        rospy.loginfo("Panel status: %s", status)
+
+    def _publish_debug(
+        self,
+        source_msg,
+        color,
+        detections,
+        matched,
+        knob_angles_by_target,
+        panel_tag_markers=None,
+        panel_tag_assignments=None,
+    ):
+        if not self.publish_debug_image or self.debug_pub.get_num_connections() == 0:
+            return
+        canvas = color.copy()
+        tag_id_by_object = {
+            id(detections[index]): assignment.tag_id
+            for index, assignment in (panel_tag_assignments or {}).items()
+            if 0 <= index < len(detections)
+        }
+        id_by_object = {
+            object_id: (int(tag_id))
+            for object_id, tag_id in tag_id_by_object.items()
+            if tag_id is not None
+        }
+        for detection in detections:
+            x1, y1, x2, y2 = [int(round(value)) for value in detection.bbox]
+            target_id = id_by_object.get(id(detection))
+            label = detection.class_name
+            if target_id is not None:
+                label = "#{} {}".format(target_id, label)
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                canvas,
+                "{} {:.2f}".format(label, detection.confidence),
+                (x1, max(15, y1 - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+            if target_id in knob_angles_by_target:
+                draw_knob_angle(
+                    canvas,
+                    detection.bbox,
+                    knob_angles_by_target[target_id],
+                )
+        if panel_tag_markers:
+            display_assignments = {
+                index: replace(assignment, target_id=int(assignment.tag_id))
+                for index, assignment in (panel_tag_assignments or {}).items()
             }
-            det = frame_detections[det_idx]
-            ux, uy = [int(round(value)) for value in base['center_xy']]
-            cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
-                        (ux + 10, uy + 5), 0, 0.4,
-                        (225, 255, 255), 1, cv2.LINE_AA)
-            _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, pose_quat)
-
-        # 发布目标结果：面板模式保持原编号格式；对象模式只包含对应类别。
-        if self._process_panel_controls and targets_output and self._targets_pub is not None:
-            msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp.secs + stamp.nsecs * 1e-9,
-                'targets': targets_output,
-            }, ensure_ascii=False)
-            self._targets_pub.publish(msg)
-        elif (not self._process_panel_controls and object_targets_output and
-              self._targets_pub is not None):
-            msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp.secs + stamp.nsecs * 1e-9,
-                'targets': object_targets_output,
-            }, ensure_ascii=False)
-            self._targets_pub.publish(msg)
-
-        stamp_value = stamp.secs + stamp.nsecs * 1e-9
-
-        # 保持旋钮角度话题格式不变，不混入指示灯或面板外目标信息。
-        if knob_angles and self._angle_pub is not None:
-            msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp_value,
-                'knob_angles': knob_angles,
-            }, ensure_ascii=False)
-            self._angle_pub.publish(msg)
-
-        # 阀门/螺栓/螺母属于面板外目标，发布到独立几何话题。
-        if ((hex_angles or axis_directions or axis_reference is not None) and
-                self._object_geometry_pub is not None):
-            msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp_value,
-                'object_angles': hex_angles,
-                'axis_directions': axis_directions,
-                **({'axis_reference': axis_reference} if axis_reference is not None else {}),
-            }, ensure_ascii=False)
-            self._object_geometry_pub.publish(msg)
-
-        # 发布相机到操作面板平面的垂直距离
-        panel_distance = None
-        if self._panel_normal_cache is not None:
-            normal, centroid = self._panel_normal_cache
-            panel_distance = _panel_plane_distance(normal, centroid)
-            if panel_distance is not None and self._distance_pub is not None:
-                msg = String()
-                msg.data = json.dumps({
-                    'stamp': stamp.secs + stamp.nsecs * 1e-9,
-                    'distance_m': round(panel_distance, 4),
-                    'normal': [round(float(v), 6) for v in normal],
-                    'centroid': [round(float(v), 4) for v in centroid],
-                }, ensure_ascii=False)
-                self._distance_pub.publish(msg)
-
-        # ─── 可视化 ───
-        has_mode_targets = bool(targets_output if self._process_panel_controls
-                                else object_targets_output)
-        self._publish_status('registered' if has_mode_targets else 'no_targets')
-
-        for target_id, det in matched:
-            ux = int(det.center_x)
-            uy = int(det.center_y)
-            cv2.circle(canvas, (ux, uy), 4, (255, 255, 255), -1)
-
-            cv2.putText(canvas, f'#{target_id}',
-                        (ux - 10, uy - 15), 0, 0.6,
-                        (0, 255, 0), 2, cv2.LINE_AA)
-
-            xyz = matched_xyz[target_id]
-            cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
-                        (ux + 10, uy + 5), 0, 0.4,
-                        (225, 255, 255), 1, cv2.LINE_AA)
-
-            if self._debug_depth_roi and det.class_name in (
-                    'button', 'door_button', 'knob'):
-                q = (self._knob_depth_quantile
-                     if det.class_name == 'knob' else 0.5)
-                off = (self._knob_depth_offset_m
-                       if det.class_name == 'knob' else 0.0)
-                _draw_depth_sample_roi(
-                    canvas, det, filtered_depth, self._depth_scale,
-                    center_ratio=0.45, quantile=q, offset_m=off)
-
-        if self._panel_normal_cache is not None:
-            n = np.round(self._panel_normal_cache[0], 3).tolist()
-            cv2.putText(canvas, f'normal: {n}', (10, 25), 0, 0.6,
-                        (0, 200, 255), 2, cv2.LINE_AA)
-            if panel_distance is not None:
-                cv2.putText(canvas, f'panel distance: {panel_distance:.3f}m',
-                            (10, 50), 0, 0.6,
-                            (0, 200, 255), 2, cv2.LINE_AA)
-
-        for ka in knob_angles:
-            for target_id, det in matched:
-                if target_id == ka['id']:
-                    if 'hex_angle' in ka:
-                        draw_hex_angle(canvas, det.bbox, ka['hex_angle'])
-                    elif 'angle' in ka:
-                        draw_knob_angle(canvas, det.bbox, ka['angle'])
-                    break
-
-        # 铭牌 OCR 可视化暂停使用，Canvas 不再绘制黄色/橙色 OCR ROI 框。
-
-        cv2.putText(canvas, 'REGISTERED', (10, canvas.shape[0] - 15),
-                    0, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-
-        self._update_display_frame(canvas, stamp)
+            draw_panel_tag_assignments(
+                canvas,
+                panel_tag_markers,
+                display_assignments,
+                detections,
+            )
+        try:
+            debug = bgr8_image_message(canvas, Image, source_msg.header)
+        except (TypeError, ValueError) as error:
+            rospy.logwarn_throttle(2.0, "Cannot pack panel debug image: %s", error)
+            return
+        self.debug_pub.publish(debug)
 
 
-def main(args=None):
-    del args
-    rospy.init_node('panel_detection')
-    node = None
+def main():
+    rospy.init_node("panel_detection")
     try:
-        node = PanelDetectionNode()
-        while not rospy.is_shutdown():
-            node._detection_callback()
-            if node._gui_enabled:
-                if node.display_frame is not None:
-                    cv2.imshow('panel_detection', node.display_frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord('q'), 27):
-                    break
-            else:
-                rospy.sleep(0.001)
-    except (KeyboardInterrupt, rospy.ROSInterruptException):
-        pass
-    finally:
-        cv2.destroyAllWindows()
-        if node is not None:
-            if node._camera is not None:
-                node._camera.stop()
-            node.destroy_node()
-
-
-if __name__ == '__main__':
-    main()
+        PanelDetectionNode()
+        rospy.spin()
+    except (rospy.ROSInitException, RuntimeError, ValueError) as error:
+        rospy.logfatal("%s", error)
+        raise

@@ -1,32 +1,98 @@
-# Partial overrides are recursively merged with the defaults in the node.
-inference_backend: onnx
-onnx_model: 1013.onnx
-onnx_threads: 8
+# Camera input. Depth must already be aligned to the color image.
+color_topic: /camera_d435_0/color/image_raw
+depth_topic: /camera_d435_0/aligned_depth_to_color/image_raw
+camera_info_topic: /camera_d435_0/color/camera_info
+camera_frame: camera_d435_0_color_optical_frame
+depth_scale: 0.001
+sync_queue_size: 8
+sync_slop: 0.05
+
+# Empty selects the bundled default models/1013.onnx; launch may override it.
+model_path: ""
 input_size: 640
-class_num: 10
-class_name:
-  - light
-  - knob
-  - bolt
-  - nut
-  - valve
-  - pump
-  - button
-  - door_button
-  - air_switch
-  - board_card
-threshold:
-  iou: 0.01
-  confidence: 0.3
-topic_sync:
-  max_dt: 0.05
-  registered_depth: true
-panel_apriltag:
-  scene: validation_site
+onnx_threads: 8
+confidence_threshold: 0.30
+iou_threshold: 0.01
+class_names: [light, knob, bolt, nut, valve, pump, button, door_button, air_switch, board_card]
+
+# Absolute panel ID layout (left to right):
+#   0 button/green, 1 button/red, 2 knob/black,
+#   3 knob/red, 4 button/red, 5 button/red, 6 button/green.
+# A complete view seeds the position cache; partial views are matched as a
+# contiguous class/colour window and then disambiguated by cached positions.
+registry_stable_frames: 15
+registry_match_distance_px: 80.0
+registry_green_hue_range: [35, 85]
+registry_color_minimum_ratio: 0.15
+# Empty uses the full seven-target layout. A wrist camera dedicated to a
+# physical subset can override this (the dual-arm launch uses [5, 6] on right).
+registry_target_ids: []
+
+# Panel-row axis handling.  The defaults are derived per node and are normally
+# left unset:
+#   button_axis_bootstrap  defaults to 1 when registry_target_ids is not empty.
+#                          The right wrist only sees the ID5/ID6 buttons, so it
+#                          has no knob to anchor the row and must fit the row
+#                          from its own detections.  Leave unset.
+#   publish_panel_axis     the full-panel detector publishes its fitted row
+#                          direction on panel_axis_topic (latched, default 1).
+#   panel_axis_topic       shared row-direction topic, default /panel/panel_axis.
+#   external_panel_axis    a restricted detector may adopt the shared direction
+#                          (default 0).  Only valid when both wrist cameras have
+#                          the same image orientation; the local bootstrap above
+#                          is preferred.
+
+# Panel-row extraction. Two visible knobs bootstrap the axis; afterwards its
+# direction is cached so that a translated/narrow camera view still works.
+panel_line_initial_dist_ratio: 1.1
+panel_line_dist_ratio: 0.85
+panel_line_min_dist_px: 45.0
+panel_line_max_dist_px: 110.0
+panel_line_proj_margin_ratio: 3.0
+panel_line_min_projection_margin_px: 450.0
+
+# Same eye-in-hand position stabilizer used by ROS2. During camera motion it
+# publishes the current measurement; temporal smoothing begins only after the
+# target has remained at nearly the same pixel for the configured time.
+position_stabilizer:
   enable: true
-apriltag_reference:
-  enable: true
+  still_time: 3.0
+  pixel_thresh: 5.0
+  window_size: 45
+  ema_alpha: 0.25
+  depth_std_thresh: 0.01
+
+# ROS2-compatible angle modes:
+#   1: stable 0/90 output; ID 4 uses the red long-handle detector and the
+#      other configured IDs use the white marker line detector.
+#   2: red knob uses red-handle/white-tape detection constrained to 180..270;
+#      other knobs use white-tape detection constrained to 0..90.
+#   3: the same red-handle/white-tape detection without angle constraints.
 knob_angle:
   enable: true
+  binary_thresh: 180
+  circle_mask_ratio: 0.85
   use_constraint: 1
-publish_legacy_topics: false
+  # ROS2 behavior: only detections whose class is exactly "knob" have an
+  # angle. ID4 is a normal button; IDs2/3 are knobs.
+  knob_class: knob
+  discrete_switch_margin: 8.0
+  discrete_confirm_frames: 3
+
+# Outputs may be namespaced independently for the left and right arm.
+targets_topic: /panel/targets
+status_topic: /panel/status
+distance_topic: /panel/distance
+knob_angle_topic: /panel/knob_angles
+button_topic: /panel/buttons
+debug_image_topic: /panel/debug_image
+publish_debug_image: true
+
+# Physical panel tags on this robot are ArUco 6x6, not AprilTag 36h11.
+# Keep the validation-site ID mapping (T02/T03 knobs, T00/T01/T04/T05/T06
+# buttons, T07 board card).
+panel_apriltag:
+  scene: validation_site
+  dictionary: [DICT_6X6_250, DICT_APRILTAG_36h11]
+  enable: true
+

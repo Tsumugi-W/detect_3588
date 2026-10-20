@@ -1,26 +1,61 @@
 <launch>
-  <arg name="registered_depth" default="true"/>
-  <arg name="use_topic" default="true"/>
-  <arg name="config_file" default="$(find panel_detection)/config/panel_detection.yaml"/>
-  <arg name="serial_no" default=""/>
+  <arg name="serial_no"/>
   <arg name="camera_name" default="camera_d435_0"/>
-  <arg name="detection_mode" default="all"/>
+  <arg name="model_path" default="$(find panel_detection)/models/1013.onnx"/>
+  <arg name="enable_pointcloud" default="false"/>
+  <!-- Multiple D435 nodes are launched together. Concurrent hardware resets
+       can make librealsense report RS2_USB_STATUS_BUSY, so reset is opt-in. -->
+  <arg name="initial_reset" default="false"/>
+  <arg name="detection_node_name" default="panel_detection"/>
   <arg name="use_constraint" default="1"/>
-  <arg name="show_gui" default="false"/>
+  <arg name="use_constrain" default=""/>
+  <arg name="targets_topic" default="/panel/targets"/>
+  <arg name="status_topic" default="/panel/status"/>
+  <arg name="distance_topic" default="/panel/distance"/>
+  <arg name="knob_angle_topic" default="/panel/knob_angles"/>
+  <arg name="button_topic" default="/panel/buttons"/>
+  <arg name="debug_image_topic" default="/panel/debug_image"/>
+  <arg name="registry_target_ids" default="[]"/>
+  <arg name="class_topic_prefix" default=""/>
+  <arg name="camera_fps" default="30"/>
+  <arg name="max_processing_fps" default="0"/>
+  <arg name="idle_processing_fps" default="$(arg max_processing_fps)"/>
+  <arg name="onnx_threads" default="8"/>
+  <arg name="opencv_threads" default="0"/>
+  <arg name="publish_debug_image" default="true"/>
+  <arg name="activity_topic" default=""/>
+
   <include file="$(find realsense2_camera)/launch/rs_camera.launch">
     <arg name="camera" value="$(arg camera_name)"/>
     <arg name="serial_no" value="$(arg serial_no)"/>
+    <arg name="color_fps" value="$(arg camera_fps)"/>
+    <arg name="depth_fps" value="$(arg camera_fps)"/>
     <arg name="align_depth" value="true"/>
     <arg name="enable_sync" value="true"/>
     <arg name="publish_tf" value="false"/>
+    <arg name="initial_reset" value="$(arg initial_reset)"/>
+    <arg name="filters" value="$(eval 'pointcloud' if arg('enable_pointcloud') == 'true' else '')"/>
   </include>
+
   <include file="$(find panel_detection)/launch/panel_detection.launch">
     <arg name="camera_name" value="$(arg camera_name)"/>
-    <arg name="detection_mode" value="$(arg detection_mode)"/>
+    <arg name="model_path" value="$(arg model_path)"/>
+    <arg name="node_name" value="$(arg detection_node_name)"/>
+    <arg name="max_processing_fps" value="$(arg max_processing_fps)"/>
+    <arg name="idle_processing_fps" value="$(arg idle_processing_fps)"/>
+    <arg name="onnx_threads" value="$(arg onnx_threads)"/>
+    <arg name="opencv_threads" value="$(arg opencv_threads)"/>
+    <arg name="publish_debug_image" value="$(arg publish_debug_image)"/>
+    <arg name="activity_topic" value="$(arg activity_topic)"/>
     <arg name="use_constraint" value="$(arg use_constraint)"/>
-    <arg name="show_gui" value="$(arg show_gui)"/>
-    <arg name="config_file" value="$(arg config_file)"/>
-    <arg name="use_topic" value="$(arg use_topic)"/>
-    <arg name="registered_depth" value="$(arg registered_depth)"/>
+    <arg name="use_constrain" value="$(arg use_constrain)"/>
+    <arg name="targets_topic" value="$(arg targets_topic)"/>
+    <arg name="status_topic" value="$(arg status_topic)"/>
+    <arg name="distance_topic" value="$(arg distance_topic)"/>
+    <arg name="knob_angle_topic" value="$(arg knob_angle_topic)"/>
+    <arg name="button_topic" value="$(arg button_topic)"/>
+    <arg name="debug_image_topic" value="$(arg debug_image_topic)"/>
+    <arg name="registry_target_ids" value="$(arg registry_target_ids)"/>
+    <arg name="class_topic_prefix" value="$(arg class_topic_prefix)"/>
   </include>
 </launch>

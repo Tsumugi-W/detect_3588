@@ -1,216 +1,175 @@
-# panel_detection (ROS1 Noetic)
+# panel_detection
 
-## 快速启动：面板 / 螺栓检测
-
-**每个终端先加载 ROS1 工作空间**（路径按实际部署修改）：
-
-```bash
-cd ~/panel_ros1_ws
-source /opt/ros/noetic/setup.bash
-source devel/setup.bash
-```
-
-**面板检测（相机已单独启动）**：
-
-```bash
-roslaunch panel_detection panel_controls.launch
-```
-
-**螺栓 / 螺母检测（另开终端）**：
-
-```bash
-roslaunch panel_detection fastener_detection.launch
-```
-
-默认订阅 `/camera_d435_0` 的彩色图和对齐深度；相机命名不同可加 `camera_name:=名称`。
-ROS1 默认通过图像话题查看检测画面：
-
-```bash
-rqt_image_view /panel/debug_image
-rqt_image_view /fasteners/debug_image
-```
-
-有桌面时可给检测 launch 加 `show_gui:=true` 弹出 OpenCV 窗口。
-面板结果包含 `/panel/targets`、`/panel/board_cards`；紧固件结果见 `/fasteners/targets`、`/fasteners/geometry`。
-
-This package ports the current ROS2 detector to ROS1 Noetic while keeping the
-same YOLO, target numbering, angle, 3D position and axis-estimation algorithms.
-It consumes color-aligned D435 depth and uses `1013.onnx` by default.
-
-## Build
-
-Place this package in `~/panel_ros1_ws/src/panel_detection`. The repository's
-`COLCON_IGNORE` belongs in the parent `ros1/` directory, outside this package:
-recent `catkin_pkg` also honors that marker and would silently skip the package.
-When updating an older copy, remove its leftover marker before building.
-
-```bash
-cd ~/panel_ros1_ws
-rm -f src/panel_detection/COLCON_IGNORE
-source /opt/ros/noetic/setup.bash
-catkin_make
-source devel/setup.bash
-```
+`panel_detection` is the ROS1 Noetic port of the ROS2
+`panel_detection` package. It keeps the `/panel/targets` JSON contract used by
+the visual-servo pipeline.
 
 ## Inputs
 
-- `/camera_d435_0/color/image_raw`
-- `/camera_d435_0/aligned_depth_to_color/image_raw`
-- `/camera_d435_0/color/camera_info`
+- Color image
+- Depth image registered to that color image
+- Color `sensor_msgs/CameraInfo`
 
-The depth image must be registered to the color image. Override
-`camera_name:=...` when the D435 namespace differs.
-
-## Launch
-
-Run against an already running camera:
-
-```bash
-roslaunch panel_detection panel_detection.launch
-roslaunch panel_detection panel_controls.launch
-roslaunch panel_detection valve_detection.launch
-roslaunch panel_detection fastener_detection.launch
-```
-
-Start one D435 and the detector together:
-
-```bash
-roslaunch panel_detection d435_panel_detection.launch serial_no:=<serial>
-```
-
-GUI is disabled by default. View the annotated Canvas with:
-
-```bash
-rqt_image_view /panel/debug_image
-```
+The recommended input is the official ROS1 `realsense2_camera` wrapper with
+`align_depth:=true`. The older `embodied_camera` publisher is not used by
+default because it does not publish `CameraInfo` and its depth image is not
+aligned to color.
 
 ## Outputs
 
-Panel mode preserves the existing formats:
+- `/panel/targets` (`std_msgs/String`, JSON)
+- `/panel/knob_angles` (`std_msgs/String`, JSON; marked knob angle in degrees)
+- `/panel/status` (`std_msgs/String`)
+- `/panel/distance` (`std_msgs/String`, JSON)
+- `/panel/buttons` (`geometry_msgs/PoseStamped`)
+- `/panel/lights`, `/panel/knobs`, `/panel/bolts`, `/panel/nuts`,
+  `/panel/valves`, `/panel/pumps` (`geometry_msgs/PoseStamped`)
+- `/panel/debug_image` (`sensor_msgs/Image`)
 
-- `/panel/targets`, `/panel/board_cards`, `/panel/knob_angles`, `/panel/status`, `/panel/distance`
+## Knob angle detection
 
-Dedicated modes publish only their own object family:
+Angle recognition is enabled by default and uses the complete ROS2 traditional
+CV implementation, including white marker-line, white-tape, red-handle,
+bright-pointer and dark-pointer fallbacks. `use_constraint` selects the same
+three modes as ROS2:
 
-- `/valve/targets`, `/valve/geometry`, `/valve/status`
-- `/fasteners/targets`, `/fasteners/geometry`, `/fasteners/status`
+- `1`: ID3 uses the red long-handle detector and other configured IDs use the
+  white line detector, followed by hysteresis and three-frame confirmation;
+  output is stable `0` or `90` (vertical is `0`, horizontal is `90`).
+- `2`: ID 3 uses red-handle detection constrained to `180..270` degrees;
+  other knobs use white-tape detection constrained to `0..90` degrees.
+- `3`: the mode-2 red-handle/white-tape pipeline without physical constraints.
 
-In panel mode, every final `button` must be directly associated with its own
-AprilTag in the current frame. A YOLO `button` without a direct assignment is
-treated as `light`, even when another tag is visible or a stale tracked tag ID
-exists. Layout fallback cannot promote an untagged `light` back to `button`.
-`door_button`, knobs, YOLO board cards and non-panel modes are unaffected. Set
-`use_panel_tags:=false` to retain the legacy no-tag classification behavior.
-
-All structured results use `std_msgs/String` JSON. Debug images use
-`sensor_msgs/Image`. Legacy per-class `PoseStamped` topics are disabled by default.
-For panel mode with legacy topics, use the general launch:
-
-```bash
-roslaunch panel_detection panel_detection.launch detection_mode:=panel_controls publish_legacy_topics:=true
+```yaml
+knob_angle:
+  enable: true
+  use_constraint: 1
+  knob_class: knob
+knob_angle_topic: /panel/knob_angles
 ```
 
-The task-specific ROS1 wrapper does not expose `publish_legacy_topics`.
+The launch argument overrides the YAML value, matching ROS2 usage:
+
+```bash
+roslaunch panel_detection d435_panel_detection.launch \
+  serial_no:=420222072543 use_constraint:=2
+```
+
+The JSON payload is compatible with the ROS2 detector:
+
+```json
+{
+  "stamp": 1720000000.0,
+  "frame_id": "camera_d435_0_color_optical_frame",
+  "knob_angles": [
+    {"id": 3, "class": "knob", "position": {"x": 0.1, "y": 0.0, "z": 0.5}, "angle": 90, "confidence": 0.94}
+  ]
+}
+```
+
+As in ROS2, the angle path only accepts the detector class configured by
+`knob_class` (normally `knob`). ID4 is a `button`, so it is published only as a
+button target and never appears on `/panel/knob_angles`. The visual-servo task
+can still rotate ID4 using its configured fallback direction.
 
 ## Model
 
-The bundled model has ten classes:
-
-`light, knob, bolt, nut, valve, pump, button, door_button, air_switch, board_card`
-
-Override it with an absolute ONNX path:
+The package uses the supplied `models/1013.onnx` model by default. It contains
+ten classes: `light`, `knob`, `bolt`, `nut`, `valve`, `pump`, `button`,
+`door_button`, `air_switch`, and `board_card`. The `best_zxr_10_13.onnx`,
+`0824.onnx`, `0807.onnx` and `0601.onnx` exports remain bundled as fallbacks.
+You can still override the model explicitly:
 
 ```bash
-roslaunch panel_detection panel_detection.launch model_path:=/path/model.onnx
+model_path:=/absolute/path/to/model.onnx
 ```
 
-## 面板场景配置（与 ROS2 同步）
+`models/1013.onnx` is the same file shipped by the upstream `detect_3588`
+repository, so the robot and the RK3588 detector use identical weights.
 
-默认 `validation_site`：T02/T03 为旋钮，T00/T01/T04/T05/T06 为按钮，T07 对应板卡 `board_card`。
-T07 仅给 YOLO 板卡分配编号 8，有无 Tag 均不修改板卡类别；不把其他类别改为板卡。
-其他 Tag 不参与关联；目标编号仍为 Tag ID+1。
-`test_site` 保留旧场景：T03/T04 为旋钮，T00/T01/T02/T05/T06 为按钮，T07–39 为灯。
+ONNX Runtime is not provided by ROS Noetic:
 
 ```bash
-# 默认验证场，保留 ROS1 相机配置
-roslaunch panel_detection panel_controls.launch
-# 测试场
-roslaunch panel_detection panel_controls.launch config_file:=$(rospack find panel_detection)/config/test_site.yaml
-# 显示深度采样区域（通过已有 debug_image 话题查看）
-roslaunch panel_detection panel_controls.launch debug_depth_roi:=true
+python3 -m pip install --user onnxruntime
 ```
 
-`config_file` 也可指定自定义 YAML。配置递归合并，`panel_apriltag.tag_classes`
-整体替换，规则与 ROS2 一致。验证场关闭旧布局回退，测试场开启。
-本帧没有直接 Tag 对应的 button 仍改为 light；knob 不因缺少 Tag 被改类。
-ROS1 的图像话题参数、Noetic 时间戳、模型查找路径和 debug_image 发布方式保留。
+## Absolute target IDs
 
-完整检测功能现已与 ROS2 对齐：包括同心紧固件标记、Tag 几何参考、稳定器、
-精度记录器、RGB/深度查看器、RKNN 后端、模型导出与二维管道复核工具。
-算法模块由跨版本测试检查一致性，节点保留 ROS1 时间戳、话题和模型路径适配。
+The ROS1 node now uses the same panel-layout logic as the ROS2 package:
 
-新增入口：`leak_detection.launch`、`panel_controls_debug.launch`、
-`rgb_depth_viewer.launch`、`fastener_precision_recorder.launch`。
-支持 `use_topic:=false` 直接连接已安装 SDK 的相机；相机驱动仍使用各 ROS 版本原生包。
-ROS1 默认 YAML 现在启用 AprilTag 几何参考，与 ROS2 相同。
+| ID | Class | Colour |
+|---:|---|---|
+| 1 | button | green |
+| 2 | button | red |
+| 3 | button | red |
+| 4 | knob | red |
+| 5 | knob | black |
+| 6 | button | red |
+| 7 | button | green |
 
-漏点模式默认开启完整漏点/管道检测和三维轴线拟合。仅检测螺栓时使用
-`config_file:=$(rospack find panel_detection)/config/leak_bolt_only.yaml`。
-三维输出协议和深度要求见仓库根 README 的“管道三维轴线”。
+Visible button/knob detections are sorted along the physical panel axis and
+matched to a contiguous window of this layout. This means `/panel/targets`
+contains absolute IDs even when only part of the panel is visible. Show the
+camera the complete seven-target row once after startup whenever possible:
+that seeds a position cache which disambiguates a single knob or other narrow
+views. The panel-axis direction is also cached, so the row can be relocated
+after camera translation.
 
+Square/circular `light` detections on the panel row are treated as buttons to
+recover a missed button classification. Elongated indicator lights are
+excluded by their aspect ratio. Tune `registry_*` and `panel_line_*` in
+`config/panel_detection.yaml` if the camera resolution or panel scale changes.
 
-## 板卡检测与位姿发布
+For a camera dedicated to a known physical subset, set
+`registry_target_ids`. The dual-arm launch uses `[5, 6]` for the right wrist,
+so a solitary red right-side button is ID5 rather than being matched to the
+first red button ID1. Ambiguous unknown-colour detections are not assigned.
 
-- `/panel/board_cards`（`std_msgs/String` JSON）默认发布在 panel_controls/all 模式，
-  包含时间戳、相机坐标系 `frame_id` 和所有 YOLO 板卡的 `targets`。
-  每个目标含 `class: board_card`、框、置信度、`classification_source: yolo`、
-  `id`、`tag_id`、`identity_source`、`position`（米）和 `orientation`（四元数）。
-- 验证场 T07 仅关联已检测为板卡的目标，编号仍为 8；没有 Tag 关联时 id/tag_id 为 null，
-  板卡类别和有效深度位姿仍发布。短暂丢 Tag 时沿用原有跟踪期限。
-- `position_valid` / `orientation_valid` 标明有效性。缺少有效深度时 position 为 null；
-  缺少面板法向时 orientation 为 null。姿态沿用面板法向，不估计板卡面内旋转角。
-  无板卡的帧发布空 targets，避免下游保留旧检测。
-- 有 Tag 编号且深度有效的板卡同时进入 `/panel/targets`。
-  通用入口 `panel_detection.launch publish_legacy_topics:=true` 时另发 `/panel/board_card_pose`（`geometry_msgs/PoseStamped`），
-  沿用旧类别位姿接口；区分多个板卡和识别无效姿态时应使用 JSON 话题。
+### Knob-free wrist views
 
+The row axis is normally bootstrapped from two visible knobs. The right wrist
+only ever sees the ID5/ID6 buttons and therefore contains no knob, so that
+bootstrap can never run there. Previously every frame of that view fell through
+to the cold-start path: detections were ordered by raw image `x` and matched by
+colour alone, so a colour misread, a `light` reading of a square button, or a
+mirrored camera image changed the IDs between the two arms.
+
+`button_axis_bootstrap` (default `1` whenever `registry_target_ids` is not
+empty) makes such a view fit the row from its own button-like detections. The
+same axis then drives the row filtering, the image-order sorting and the
+`light` -> `button` promotion, so both arms number the same physical targets.
+
+The full-panel detector additionally publishes its fitted row direction on
+`panel_axis_topic` (`geometry_msgs/Vector3Stamped`, latched). A restricted
+detector can adopt it with `external_panel_axis:=true`, but the published
+vector is expressed in the publishing camera's image plane, so only enable it
+when both wrist cameras share an image orientation. The local bootstrap is the
+default and needs no cross-camera assumption.
+
+Two instances can run in one ROS master by giving them different
+`detection_node_name`, output topics and `class_topic_prefix`. The visual-servo
+dual launch does this automatically, publishing `/panel/left/*` and
+`/panel/right/*` without mixing measurements from the two optical frames.
+
+## Run
+
+Start the camera and detector together:
 
 ```bash
-# 默认面板入口已发布板卡 JSON；无需开启旧话题
-rostopic echo /panel/board_cards
+roslaunch panel_detection d435_panel_detection.launch \
+  serial_no:=420222072543 \
+  camera_name:=camera_d435_0
+```
+
+Inspect:
+
+```bash
+rostopic echo /panel/status
 rostopic echo /panel/targets
-# 如需同时发布板卡 PoseStamped，使用通用入口（相机命名保留默认 camera_d435_0）
-roslaunch panel_detection panel_detection.launch detection_mode:=panel_controls publish_legacy_topics:=true
-rostopic echo /panel/board_card_pose
+rostopic echo /panel/knob_angles
+rqt_image_view /panel/debug_image
 ```
 
-完整 JSON 示例、字段含义和无效位姿处理见[根 README 的板卡话题说明](../../README.md#panelboard_cards-string-json--板卡检测与位姿)。
-板卡只框固定白色矩形外框；位置由检测框中心深度反投影，姿态沿用面板法向，不估计面内旋转。
-`position_valid` 和 `orientation_valid` 需分别检查；目标消失时收到空 `targets`。
-
-当前中心深度采样可能受到插入件、插槽背景和手部遮挡影响；`position_valid` 不保证采样点属于固定外框。
-插拔前后的几何位置一致性尚未验证，限制与改进方向见根 README 板卡话题一节。
-
-
-## 验证场编号、旋钮与板卡操作部位
-
-本节点与 ROS2 共用一致的 Tag 局部轴关联、白色旋钮条纹拟合和板卡部位算法。
-目标编号仍为 Tag ID + 1；相机倾斜超过 45° 时不会交换 Tag 的横、竖轴。
-默认旋钮角度为图像竖直/水平的 0°/90°档位。无 Tag 的旋钮仍显示角度，
-另发 `/panel/knob_observations`（String JSON，`knobs` 数组，未知 `id/tag_id` 为 null）；
-旧 `/panel/knob_angles` 只保留有编号旋钮。
-
-`/panel/board_cards` 及 `/panel/targets` 中的板卡新增 `insertion_state`：
-`inserted`（白色拉手可见）、`empty`（蓝色槽口暴露）、`unknown`（证据不足）。
-`handle` / `slot` 分别包含 `pixel`、`polygon`、`confidence`、`position_valid`、`position`。
-插入状态输出拉手夹取区域，拔出状态输出槽口中心；隐藏部位为 null。
-部位位置来自自身有效深度（米），缺失时仍保留二维位置，三维位置为 null。
-这些是验证场颜色/几何规则的视觉观察，不代表机械锁紧或电气连接状态。
-`board_features.enable: false` 可关闭；固定白色外框的原有位姿计算保持不变。
-
-```bash
-rostopic echo /panel/knob_observations
-rostopic echo /panel/board_cards
-```
-
-完整字段和离线视频复核方式见仓库根目录 README。
+Verify the absolute IDs on the debug image before enabling robot motion. The
+`registry_stable_frames` parameter is retained for ROS2/config compatibility;
+the current layout matcher identifies each frame without a registration wait.

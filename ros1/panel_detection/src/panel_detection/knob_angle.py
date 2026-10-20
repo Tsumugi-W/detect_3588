@@ -1386,3 +1386,8 @@ def draw_knob_angle(image, bbox, angle, color=(0, 255, 255), thickness=2):
     label = f'{angle:.0f} deg'
     cv2.putText(image, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX,
                 0.5, color, 1, cv2.LINE_AA)
+
+
+# ROS1 adapter compatibility alias
+DiscreteAngleStabilizer = KnobDiscreteAngleStabilizer
+
