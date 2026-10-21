@@ -74,7 +74,7 @@ can still rotate ID4 using its configured fallback direction.
 
 ## Model
 
-The package uses the supplied `models/1013.onnx` model by default. It contains
+The package uses the supplied `models/1020.onnx` model by default. It contains
 ten classes: `light`, `knob`, `bolt`, `nut`, `valve`, `pump`, `button`,
 `door_button`, `air_switch`, and `board_card`. The `best_zxr_10_13.onnx`,
 `0824.onnx`, `0807.onnx` and `0601.onnx` exports remain bundled as fallbacks.
@@ -84,7 +84,7 @@ You can still override the model explicitly:
 model_path:=/absolute/path/to/model.onnx
 ```
 
-`models/1013.onnx` is the same file shipped by the upstream `detect_3588`
+`models/1020.onnx` is the same file shipped by the upstream `detect_3588`
 repository, so the robot and the RK3588 detector use identical weights.
 
 ONNX Runtime is not provided by ROS Noetic:

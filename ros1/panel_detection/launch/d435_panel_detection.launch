@@ -1,7 +1,7 @@
 <launch>
   <arg name="serial_no"/>
   <arg name="camera_name" default="camera_d435_0"/>
-  <arg name="model_path" default="$(find panel_detection)/models/1013.onnx"/>
+  <arg name="model_path" default="$(find panel_detection)/models/1020.onnx"/>
   <arg name="enable_pointcloud" default="false"/>
   <!-- Multiple D435 nodes are launched together. Concurrent hardware resets
        can make librealsense report RS2_USB_STATUS_BUSY, so reset is opt-in. -->

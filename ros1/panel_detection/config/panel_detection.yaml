@@ -7,7 +7,7 @@ depth_scale: 0.001
 sync_queue_size: 8
 sync_slop: 0.05
 
-# Empty selects the bundled default models/1013.onnx; launch may override it.
+# Empty selects the bundled default models/1020.onnx; launch may override it.
 model_path: ""
 input_size: 640
 onnx_threads: 8

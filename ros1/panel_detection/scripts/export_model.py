@@ -16,7 +16,7 @@
     python scripts/export_model.py --pt newckpt/best.pt --output-dir weights/
 
     # YOLOv5 checkpoint 需要训练时的 models/ 和 utils/ 源码
-    python scripts/export_model.py --pt 1013.pt --yolov5-dir /path/to/yolov5
+    python scripts/export_model.py --pt 1020.pt --yolov5-dir /path/to/yolov5
 
 依赖:
     - torch, torchvision (导出 ONNX)

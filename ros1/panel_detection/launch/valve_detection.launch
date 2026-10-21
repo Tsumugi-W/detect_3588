@@ -3,7 +3,7 @@
   <arg name="use_topic" default="true"/>
   <arg name="config_file" default="$(find panel_detection)/config/panel_detection.yaml"/>
   <arg name="camera_name" default="camera_d435_0"/>
-  <arg name="model_path" default="$(find panel_detection)/models/1013.onnx"/>
+  <arg name="model_path" default="$(find panel_detection)/models/1020.onnx"/>
   <arg name="show_gui" default="false"/>
   <arg name="debug_image_topic" default="/valve/debug_image"/>
   <include file="$(find panel_detection)/launch/panel_detection.launch">

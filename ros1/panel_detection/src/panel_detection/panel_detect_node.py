@@ -459,7 +459,7 @@ class PanelDetectionNode:
 
         package_path = rospkg.RosPack().get_path("panel_detection")
         candidates = [
-            os.path.join(package_path, "models", "1013.onnx"),
+            os.path.join(package_path, "models", "1020.onnx"),
             os.path.join(package_path, "models", "best_zxr_10_13.onnx"),
             os.path.join(package_path, "models", "0824.onnx"),
             os.path.join(package_path, "models", "0807.onnx"),
@@ -471,7 +471,7 @@ class PanelDetectionNode:
                     "panel_detection",
                     "panel_detection",
                     "panel_detection",
-                    "1013.onnx",
+                    "1020.onnx",
                 )
             ),
             os.path.normpath(

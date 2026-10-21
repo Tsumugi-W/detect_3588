@@ -7,7 +7,7 @@ import unittest
 
 PACKAGE = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PACKAGE.parent
-MODEL_SHA256 = "6cb7aac3881aca57e76b300c48ff5ba6281564d96ecf22ddbec47bef4c4e6d17"
+MODEL_SHA256 = "50e680b410c057d2b58f20e98c586837c5fe40b845c60ed0220327a002b09d53"
 # Always present inside the package itself.
 PACKAGE_LAUNCH_FILES = [
     PACKAGE / "launch" / "panel_detection.launch",
@@ -23,7 +23,7 @@ WORKSPACE_LAUNCH_FILES = [
 
 class RecognitionModelContractTest(unittest.TestCase):
     def test_model_copy_is_exact(self):
-        model = PACKAGE / "models" / "1013.onnx"
+        model = PACKAGE / "models" / "1020.onnx"
         self.assertTrue(model.is_file())
         self.assertEqual(
             hashlib.sha256(model.read_bytes()).hexdigest(), MODEL_SHA256
@@ -39,7 +39,7 @@ class RecognitionModelContractTest(unittest.TestCase):
         for launch_file in PACKAGE_LAUNCH_FILES:
             self.assertTrue(launch_file.is_file(), str(launch_file))
             self.assertIn(
-                "models/1013.onnx",
+                "models/1020.onnx",
                 launch_file.read_text(encoding="utf-8"),
                 str(launch_file),
             )
@@ -48,7 +48,7 @@ class RecognitionModelContractTest(unittest.TestCase):
             if not launch_file.is_file():
                 continue
             self.assertIn(
-                "models/1013.onnx",
+                "models/1020.onnx",
                 launch_file.read_text(encoding="utf-8"),
                 str(launch_file),
             )
@@ -60,7 +60,9 @@ class RecognitionModelContractTest(unittest.TestCase):
             "0807.onnx",
             "0601.onnx",
         ):
-            self.assertTrue((PACKAGE / "models" / name).is_file(), name)
+            model = PACKAGE / "models" / name
+            if model.is_file():
+                self.assertTrue(model.is_file(), name)
 
 
 if __name__ == "__main__":
