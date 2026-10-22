@@ -948,6 +948,7 @@ def _observation_to_image(observation: dict, context: dict, cfg: Optional[dict] 
             "visible_center_px",
             "center_px",
             "anchor_px",
+            "slot_px",
         ):
             value = observation.get(name)
             if value is None:
@@ -971,6 +972,7 @@ def _observation_to_image(observation: dict, context: dict, cfg: Optional[dict] 
         "left_bottom_px",
         "right_bottom_px",
         "anchor_px",
+        "slot_px",
     ):
         if observation.get(name) is not None:
             observation[name] = _to_image(observation[name], roi_to_image)
