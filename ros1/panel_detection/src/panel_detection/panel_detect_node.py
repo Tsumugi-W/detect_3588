@@ -40,6 +40,10 @@ from panel_detection.panel_apriltag import (
     detect_panel_tags,
     draw_panel_tag_assignments,
 )
+from panel_detection.board_card_localizer import (
+    BoardCardLocalizer,
+    draw_board_card_observation,
+)
 
 
 CLASS_TOPICS = {
@@ -201,6 +205,18 @@ class PanelDetectionNode:
             )
         except ValueError as error:
             raise rospy.ROSInitException(str(error))
+        board_card_config = rospy.get_param("~board_card_localizer", {})
+        if not isinstance(board_card_config, dict):
+            raise rospy.ROSInitException(
+                "board_card_localizer must be a YAML mapping"
+            )
+        board_card_config = dict(board_card_config)
+        board_card_config.setdefault("depth_scale", self.depth_scale)
+        self.board_card_localizer = (
+            BoardCardLocalizer(board_card_config)
+            if board_card_config.get("enable", True)
+            else None
+        )
         self.panel_line = {
             "initial_dist_ratio": float(
                 rospy.get_param("~panel_line_initial_dist_ratio", 1.1)
@@ -593,6 +609,32 @@ class PanelDetectionNode:
             for index, assignment in panel_tag_assignments.items()
             if 0 <= index < len(detections)
         }
+        board_card_observations = {}
+        if self.board_card_localizer is not None:
+            for index, assignment in panel_tag_assignments.items():
+                if not 0 <= index < len(detections):
+                    continue
+                detection = detections[index]
+                if detection.class_name != "board_card":
+                    continue
+                observation = self.board_card_localizer.observe(
+                    color,
+                    depth,
+                    info,
+                    marker=assignment.marker,
+                    tag_id=assignment.tag_id,
+                )
+                if observation is None:
+                    continue
+                board_card_observations[id(detection)] = observation
+                # Refine the detector's loose white-frame box to the actual
+                # card.  The anchor is the stable top-centre, not a centre
+                # biased by a clipped/occluded bottom edge.
+                if observation.get("card_present") and observation.get("bbox"):
+                    detection.bbox = tuple(observation["bbox"])
+                    detection.center_x, detection.center_y = observation[
+                        "anchor_px"
+                    ]
         (
             panel_detections,
             panel_axis_origin,
@@ -643,7 +685,11 @@ class PanelDetectionNode:
         matched_points = {}
         position_measurements = []
         for target_id, detection in sorted(matched.items()):
-            point = self._point_from_detection(detection, depth, info)
+            observation = board_card_observations.get(id(detection))
+            if observation is not None and observation.get("position") is not None:
+                point = np.asarray(observation["position"], dtype=np.float64)
+            else:
+                point = self._point_from_detection(detection, depth, info)
             if point is None:
                 continue
             matched_points[target_id] = point
@@ -686,6 +732,9 @@ class PanelDetectionNode:
                 },
                 "confidence": round(float(detection.confidence), 4),
             }
+            observation = board_card_observations.get(id(detection))
+            if observation is not None:
+                target["board_card"] = self._board_card_payload(observation)
             targets.append(target)
 
             if self._should_estimate_angle(target_id, detection):
@@ -724,12 +773,16 @@ class PanelDetectionNode:
             if detection.class_name not in (
                     "button", "door_button", "knob", "light", "board_card"):
                 continue
-            point = self._point_from_detection(detection, depth, info)
+            observation = board_card_observations.get(id(detection))
+            if observation is not None and observation.get("position") is not None:
+                point = np.asarray(observation["position"], dtype=np.float64)
+            else:
+                point = self._point_from_detection(detection, depth, info)
             if point is None:
                 continue
             tag_id = tag_id_by_object.get(id(detection))
             output_id = (int(tag_id)) if tag_id is not None else None
-            targets.append({
+            target = {
                 "id": output_id,
                 "class": detection.class_name,
                 "tag_id": tag_id,
@@ -745,7 +798,10 @@ class PanelDetectionNode:
                     "w": 1.0,
                 },
                 "confidence": round(float(detection.confidence), 4),
-            })
+            }
+            if observation is not None:
+                target["board_card"] = self._board_card_payload(observation)
+            targets.append(target)
             valid_depths.append(point[2])
         if targets:
             payload = {
@@ -794,6 +850,7 @@ class PanelDetectionNode:
             knob_angles_by_target,
             panel_tag_markers,
             panel_tag_assignments,
+            board_card_observations,
         )
 
     def _should_estimate_angle(self, target_id, detection):
@@ -1207,6 +1264,57 @@ class PanelDetectionNode:
             (0.0, 0.0), (float(vector[0]), float(vector[1]))
         )
 
+    def _board_card_payload(self, observation):
+        """JSON-safe board-card geometry, without non-finite values."""
+
+        def point(value):
+            if value is None or len(value) != 2:
+                return None
+            return [round(float(value[0]), 3), round(float(value[1]), 3)]
+
+        def position(value):
+            if value is None:
+                return None
+            return {
+                "x": round(float(value[0]), 5),
+                "y": round(float(value[1]), 5),
+                "z": round(float(value[2]), 5),
+            }
+
+        return {
+            "card_present": bool(observation.get("card_present")),
+            "insertion_state": observation.get("insertion_state", "unknown"),
+            "anchor_source": observation.get("anchor_source"),
+            "anchor_px": point(observation.get("anchor_px")),
+            "top_px": point(observation.get("top_px")),
+            "bottom_px": point(observation.get("bottom_px")),
+            "center_px": point(observation.get("center_px")),
+            "axis_px": point(observation.get("axis_px")),
+            "width_px": (
+                round(float(observation["width_px"]), 2)
+                if observation.get("width_px") is not None else None
+            ),
+            "visible_length_px": round(
+                float(observation.get("visible_length_px", 0.0)), 2
+            ),
+            "nominal_length_px": (
+                round(float(observation["nominal_length_px"]), 2)
+                if observation.get("nominal_length_px") is not None else None
+            ),
+            "length_estimated": bool(observation.get("length_estimated")),
+            "clipped": bool(observation.get("clipped")),
+            "confidence": round(float(observation.get("confidence", 0.0)), 4),
+            "position_source": observation.get("source"),
+            "depth_source": observation.get("depth_source"),
+            "plane_rms_m": (
+                round(float(observation["plane_rms_m"]), 5)
+                if observation.get("plane_rms_m") is not None else None
+            ),
+            "top_position": position(observation.get("top_position")),
+            "anchor_position": position(observation.get("anchor_position")),
+            "bottom_position": position(observation.get("bottom_position")),
+        }
+
     def _point_from_detection(self, detection, depth, info):
         x1, y1, x2, y2 = [int(round(value)) for value in detection.bbox]
         width = max(2, x2 - x1)
@@ -1263,6 +1371,7 @@ class PanelDetectionNode:
         knob_angles_by_target,
         panel_tag_markers=None,
         panel_tag_assignments=None,
+        board_card_observations=None,
     ):
         if not self.publish_debug_image or self.debug_pub.get_num_connections() == 0:
             return
@@ -1311,6 +1420,8 @@ class PanelDetectionNode:
                 display_assignments,
                 detections,
             )
+        for observation in (board_card_observations or {}).values():
+            draw_board_card_observation(canvas, observation)
         try:
             debug = bgr8_image_message(canvas, Image, source_msg.header)
         except (TypeError, ValueError) as error:

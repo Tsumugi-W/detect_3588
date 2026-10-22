@@ -72,6 +72,27 @@ As in ROS2, the angle path only accepts the detector class configured by
 button target and never appears on `/panel/knob_angles`. The visual-servo task
 can still rotate ID4 using its configured fallback direction.
 
+## Board-card localization
+
+`board_card` uses the board-card Tag (T07 on `validation_site`) as a stable,
+scale-normalised frame. The node warps a fixed tag-relative slot ROI, fits the
+card's two long **colour** edges and its top/bottom endpoints inside that ROI,
+and uses depth only for the card plane and 3D projection. Depth edges are not
+used to fit the 2D card boundary.
+
+The published `position` is the canonical card centre: the stable top-centre
+plus half of the longest reliably observed card length. A clipped/occluded
+bottom therefore cannot drag the centre upward. `board_card.anchor_position`
+is the physical top-centre anchor (the best point for insertion/grasp), and
+`board_card.top_px` / `bottom_px` / `center_px` expose the image geometry.
+`insertion_state` is `inserted`, `pulled`, `empty`, or `transition`;
+`clipped` and `length_estimated` state whether the observed end is complete.
+
+Configuration lives under `board_card_localizer:` in
+`config/panel_detection.yaml`. The default slot ROI is
+`x=[-3.5,3.5]`, `y=[1,11]` tag-side units and assumes a 20 mm tag; all pixel
+gates scale with that ROI. Set `enable: false` to fall back to the YOLO box.
+
 ## Model
 
 The package uses the supplied `models/1020.onnx` model by default. It contains
@@ -85,7 +106,8 @@ model_path:=/absolute/path/to/model.onnx
 ```
 
 `models/1020.onnx` is the same file shipped by the upstream `detect_3588`
-repository, so the robot and the RK3588 detector use identical weights.
+repository, so the robot and the RK3588 detector use identical weights. The
+1013 export remains available as a fallback.
 
 ONNX Runtime is not provided by ROS Noetic:
 

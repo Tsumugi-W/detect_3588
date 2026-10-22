@@ -17,6 +17,9 @@ DEFAULT_CONFIG = {
                    'circle_mask_ratio': 0.85, 'knob_class': 'knob',
                    'use_constraint': 1},
     'board_features': {'enable': True, 'slot_hue_min': 85, 'slot_hue_max': 125},
+    # Tag-relative card refinement.  Remaining geometry/depth defaults live in
+    # board_card_localizer.DEFAULT_CONFIG; this only enables the stage.
+    'board_card_localizer': {'enable': True},
     'knob_depth': {'quantile': 0.2, 'offset_m': 0.005},
     'position_stabilizer': {'enable': True, 'still_time': 3.0,
                             'pixel_thresh': 5.0, 'window_size': 45,

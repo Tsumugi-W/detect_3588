@@ -7,7 +7,7 @@ depth_scale: 0.001
 sync_queue_size: 8
 sync_slop: 0.05
 
-# Empty selects the bundled default models/1020.onnx; launch may override it.
+# Empty selects the bundled default model (1020.onnx); launch may override it.
 model_path: ""
 input_size: 640
 onnx_threads: 8
@@ -95,4 +95,54 @@ panel_apriltag:
   scene: validation_site
   dictionary: [DICT_6X6_250, DICT_APRILTAG_36h11]
   enable: true
+
+# Tag-relative board-card refinement.  T07 supplies a scale-normalised slot
+# frame; the card's two long edges and endpoints are fitted in colour, and
+# depth is used only to fit the card plane and to produce 3D points.  The
+# published `position` is the canonical card centre: the stable top-centre
+# plus half of the longest reliably observed card length, so a clipped bottom
+# cannot drag the centre upward.  `board_card.anchor_position` is the physical
+# top-centre anchor (best for insertion/grasp).
+board_card_localizer:
+  enable: true
+  # Fixed tag-relative ROI: x right, y down, one unit = one tag side.
+  roi_x: [-3.5, 3.5]
+  roi_y: [1.0, 11.0]
+  roi_size: [560, 800]
+  # Central search band, in rectified-ROI fractions.
+  slot_x: [0.36, 0.64]
+  slot_y: [0.16, 0.99]
+  max_top_ratio: 0.45
+  dark_v_max: 105
+  dark_s_max: 165
+  blue_h: [80, 138]
+  blue_s_min: 70
+  blue_v_min: 18
+  min_visible_rows: 30
+  min_width_px: 18
+  max_width_px: 150
+  min_confidence: 0.30
+  blue_width_px: 58.0
+  black_width_px: 105.0
+  blue_ratio_threshold: 0.45
+  edge_width_ratio: 0.75
+  plane_depth_gate_m: 0.12
+  # Empty-slot anchor in tag-side units.
+  slot_anchor_tag: [0.0, 6.0]
+  # Stable centre / state logic.
+  nominal_length_memory: true
+  design_width_change_ratio: 0.30
+  state_inserted_ratio: 0.85
+  state_pulled_ratio: 0.72
+  state_pulled_bottom_roi_ratio: 0.78
+  state_wide_width_px: 80.0
+  smooth_alpha: 0.35
+  max_anchor_jump_px: 35.0
+  tag_cache_frames: 12
+  # Depth plane fit (metres).
+  depth_min_m: 0.05
+  depth_max_m: 2.0
+  plane_inlier_m: 0.004
+  plane_iterations: 80
+  plane_min_points: 40
 

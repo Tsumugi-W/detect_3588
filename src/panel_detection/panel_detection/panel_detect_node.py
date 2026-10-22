@@ -70,6 +70,10 @@ from .panel_apriltag import (
 )
 from .pipe_axis_3d import estimate_pipe_axis_3d
 from .board_card import board_card_target
+from .board_card_localizer import (
+    BoardCardLocalizer,
+    draw_board_card_observation,
+)
 from .board_features import (detect_board_features, add_board_feature_depth,
                              draw_board_features)
 from .pipe_axis import (
@@ -168,6 +172,39 @@ class AsyncCamera:
         self._running = False
         self._thread.join(timeout=2)
         self._cam.stop()
+
+
+def _board_card_observation_summary(observation):
+    """JSON-safe subset of a BoardCardLocalizer observation."""
+
+    def point(value):
+        if value is None or len(value) != 2:
+            return None
+        return [round(float(value[0]), 3), round(float(value[1]), 3)]
+
+    return {
+        'card_present': bool(observation.get('card_present')),
+        'insertion_state': observation.get('insertion_state', 'unknown'),
+        'anchor_source': observation.get('anchor_source'),
+        'anchor_px': point(observation.get('anchor_px')),
+        'top_px': point(observation.get('top_px')),
+        'bottom_px': point(observation.get('bottom_px')),
+        'center_px': point(observation.get('center_px')),
+        'axis_px': point(observation.get('axis_px')),
+        'width_px': (round(float(observation['width_px']), 2)
+                     if observation.get('width_px') is not None else None),
+        'visible_length_px': round(
+            float(observation.get('visible_length_px', 0.0)), 2),
+        'nominal_length_px': (
+            round(float(observation['nominal_length_px']), 2)
+            if observation.get('nominal_length_px') is not None else None),
+        'length_estimated': bool(observation.get('length_estimated')),
+        'clipped': bool(observation.get('clipped')),
+        'confidence': round(float(observation.get('confidence', 0.0)), 4),
+        'depth_source': observation.get('depth_source'),
+        'plane_rms_m': (round(float(observation['plane_rms_m']), 5)
+                        if observation.get('plane_rms_m') is not None else None),
+    }
 
 
 def _normal_to_quaternion(normal):
@@ -874,6 +911,13 @@ class PanelDetectionNode(Node):
         # Orbbec 官方驱动深度图单位为 mm，× 0.001 转米
         self._depth_scale = self.cfg.get('depth_scale', 0.001)
         self._camera_ready = False
+
+        board_card_cfg = dict(self.cfg.get('board_card_localizer', {}) or {})
+        board_card_cfg.setdefault('depth_scale', self._depth_scale)
+        self._board_card_localizer = (
+            BoardCardLocalizer(board_card_cfg)
+            if board_card_cfg.get('enable', True) else None
+        )
 
         # 话题订阅模式的缓存
         self._topic_color_frame_id = 'camera_color_optical_frame'
@@ -1732,18 +1776,46 @@ class PanelDetectionNode(Node):
         for index, detection in enumerate(detections):
             if detection.class_name != 'board_card':
                 continue
+            observation = None
+            assignment = assignments.get(index)
+            if self._board_card_localizer is not None and color_image is not None:
+                observation = self._board_card_localizer.observe(
+                    color_image,
+                    depth_image,
+                    intrin,
+                    marker=(assignment.marker if assignment is not None else None),
+                    tag_id=(assignment.tag_id if assignment is not None else None),
+                )
+            if observation is not None and observation.get('card_present'):
+                if observation.get('bbox'):
+                    detection.bbox = tuple(observation['bbox'])
+                detection.center_x, detection.center_y = observation['anchor_px']
             _, _, xyz = _estimate_detection_point(
                 detection, depth_image, intrin, self._depth_scale)
+            if observation is not None and observation.get('position') is not None:
+                xyz = np.asarray(observation['position'], dtype=np.float64)
             features = detect_board_features(
                 color_image, detection.bbox, self.cfg.get('board_features', {}))
             add_board_feature_depth(features, depth_image, intrin, self._depth_scale)
             payload = board_card_target(
-                detection, assignments.get(index), xyz, quat, normal_valid)
+                detection, assignment, xyz, quat, normal_valid)
+            if observation is not None:
+                summary = _board_card_observation_summary(observation)
+                features['board_card'] = summary
+                payload['board_card'] = summary
+                if observation.get('position') is not None:
+                    payload['position'] = {
+                        axis: round(float(value), 4)
+                        for axis, value in zip('xyz', observation['position'])
+                    }
+                    payload['position_valid'] = True
+                    features['refined_position'] = dict(payload['position'])
             payload.update(features)
             targets.append(payload)
             details[id(detection)] = features
             if canvas is not None:
                 draw_board_features(canvas, features, detection.bbox)
+                draw_board_card_observation(canvas, observation)
         msg = String()
         msg.data = json.dumps({
             'stamp': stamp.sec + stamp.nanosec * 1e-9,
@@ -2217,7 +2289,10 @@ class PanelDetectionNode(Node):
                 target_info.update(board_card_target(
                     det, tag_assignment, xyz, quat,
                     self._panel_normal_cache is not None))
-                target_info.update(board_feature_details.get(id(det), {}))
+                board_detail = board_feature_details.get(id(det), {})
+                target_info.update(board_detail)
+                if board_detail.get('refined_position') is not None:
+                    target_info['position'] = board_detail['refined_position']
             targets_output.append(target_info)
 
             # 兼容旧话题
