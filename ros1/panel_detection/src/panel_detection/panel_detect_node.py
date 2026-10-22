@@ -657,14 +657,16 @@ class PanelDetectionNode:
                 if observation is None:
                     continue
                 board_card_observations[id(detection)] = observation
-                # Refine the detector's loose white-frame box to the actual
-                # card only when a card is present.  The anchor is the stable
-                # top-centre, not a centre biased by a clipped bottom edge.
+                # Refine the detector's loose white-frame box to the measured
+                # outer card silhouette.  The detection centre follows the
+                # outer-card centre, not the top anchor.
                 if observation.get("card_present") and observation.get("bbox"):
                     detection.bbox = tuple(observation["bbox"])
-                    detection.center_x, detection.center_y = observation[
+                    center = observation.get("center_px") or observation.get(
                         "anchor_px"
-                    ]
+                    )
+                    if center is not None:
+                        detection.center_x, detection.center_y = center
         (
             panel_detections,
             panel_axis_origin,
@@ -716,8 +718,13 @@ class PanelDetectionNode:
         position_measurements = []
         for target_id, detection in sorted(matched.items()):
             observation = board_card_observations.get(id(detection))
-            if observation is not None and not observation.get("card_present"):
-                # Empty slot: do not publish a card position from the YOLO box.
+            if (
+                observation is not None
+                and not observation.get("card_present")
+                and observation.get("position") is None
+            ):
+                # Empty slot without a measured slot centre: never fall back to
+                # the YOLO white-frame box.
                 continue
             if observation is not None and observation.get("position") is not None:
                 point = np.asarray(observation["position"], dtype=np.float64)
@@ -767,7 +774,10 @@ class PanelDetectionNode:
             }
             observation = board_card_observations.get(id(detection))
             if observation is not None:
+                target["graspable"] = bool(observation.get("card_present"))
                 target["board_card"] = self._board_card_payload(observation)
+            else:
+                target["graspable"] = True
             targets.append(target)
 
             if self._should_estimate_angle(target_id, detection):
@@ -807,7 +817,11 @@ class PanelDetectionNode:
                     "button", "door_button", "knob", "light", "board_card"):
                 continue
             observation = board_card_observations.get(id(detection))
-            if observation is not None and not observation.get("card_present"):
+            if (
+                observation is not None
+                and not observation.get("card_present")
+                and observation.get("position") is None
+            ):
                 continue
             if observation is not None and observation.get("position") is not None:
                 point = np.asarray(observation["position"], dtype=np.float64)
@@ -835,14 +849,17 @@ class PanelDetectionNode:
                 "confidence": round(float(detection.confidence), 4),
             }
             if observation is not None:
+                target["graspable"] = bool(observation.get("card_present"))
                 target["board_card"] = self._board_card_payload(observation)
+            else:
+                target["graspable"] = True
             targets.append(target)
             valid_depths.append(point[2])
 
         # Board-card state is published once per frame, keyed by T07.  Empty
-        # slots carry position=null so they can never be mistaken for a card
-        # target; inserted cards can still be published when YOLO missed the
-        # slot because T07 drives the localizer.
+        # slots carry the measured slot centre but are never graspable;
+        # inserted cards carry the measured outer-card centre.  T07 drives the
+        # localizer even when YOLO missed the slot.
         if (
             board_card_observation is not None
             and board_card_observation.get("stable")
@@ -875,15 +892,15 @@ class PanelDetectionNode:
                 existing["graspable"] = bool(
                     board_card_observation.get("card_present")
                 )
-                if board_card_observation.get("state") == "empty":
-                    existing["position"] = None
-                elif board_card_observation.get("position") is not None:
+                if board_card_observation.get("position") is not None:
                     px, py, pz = board_card_observation["position"]
                     existing["position"] = {
                         "x": round(float(px), 5),
                         "y": round(float(py), 5),
                         "z": round(float(pz), 5),
                     }
+                else:
+                    existing["position"] = None
 
         # The empty-slot reference must not enter the distance median.
         valid_depths = [
@@ -1387,6 +1404,14 @@ class PanelDetectionNode:
                 return None
             return [round(float(value[0]), 3), round(float(value[1]), 3)]
 
+        def points(values):
+            if values is None:
+                return None
+            return [
+                [round(float(value[0]), 3), round(float(value[1]), 3)]
+                for value in values
+            ]
+
         def position(value):
             if value is None:
                 return None
@@ -1416,10 +1441,19 @@ class PanelDetectionNode:
             "center_px": point(observation.get("center_px")),
             "axis_px": point(observation.get("axis_px")),
             "slot_px": point(observation.get("slot_px")),
+            "quad_px": points(observation.get("quad_px")),
             "slot_position": position(observation.get("slot_position")),
             "width_px": (
                 round(float(observation["width_px"]), 2)
                 if observation.get("width_px") is not None else None
+            ),
+            "width_tag": (
+                round(float(observation["width_tag"]), 4)
+                if observation.get("width_tag") is not None else None
+            ),
+            "length_tag": (
+                round(float(observation["length_tag"]), 4)
+                if observation.get("length_tag") is not None else None
             ),
             "visible_length_px": round(
                 float(observation.get("visible_length_px", 0.0)), 2
@@ -1446,6 +1480,15 @@ class PanelDetectionNode:
             "top_position": position(observation.get("top_position")),
             "anchor_position": position(observation.get("anchor_position")),
             "bottom_position": position(observation.get("bottom_position")),
+            "geometry_source": observation.get("geometry_source"),
+            "card_depth_m": (
+                round(float(observation["card_depth_m"]), 5)
+                if observation.get("card_depth_m") is not None else None
+            ),
+            "card_plane_rms_m": (
+                round(float(observation["card_plane_rms_m"]), 5)
+                if observation.get("card_plane_rms_m") is not None else None
+            ),
         }
 
     def _point_from_detection(self, detection, depth, info):

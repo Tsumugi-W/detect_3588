@@ -79,39 +79,47 @@ slot and a fully inserted black card.  It only localises the slot region; it is
 not the state source.  T07 (or the configured `board_card_localizer.tag_id`)
 drives the state machine and the geometry.
 
-The node warps a fixed tag-relative slot ROI, builds a low-saturation black
-mask, and fits the card's long colour edges.  A frame is `inserted` only when
-the black body passes the measured length, black-body fraction and width gates.
-The empty slot's blue backplane, white walls and recess shadow are therefore
-classified as `empty`, not as a card.
+The node warps a fixed tag-relative slot ROI and measures the black card's
+**full outer silhouette**: a low-value/low-saturation black mask, largest
+card-body component, and small card fragments merged across the card's white
+label.  Components are also checked against the panel depth, so the dark gap
+between the card and the recess wall is not merged into the card.  The white
+recess frame and the blue backplane are excluded.  A frame is `inserted` only
+when the silhouette passes the measured length, black-body fraction and
+fill-ratio gates.  The empty slot's blue backplane, white walls and recess
+shadow are therefore classified as `empty`, not as a card.
 
 Production has only two stable states:
 
 - `empty`: `card_present=false`; `position` is the measured blue-backplane
   slot centre on the panel plane, and `graspable=false`;
 - `inserted`: `card_present=true`; `position` is the measured centre of the
-  card's outer box.
+  black card's outer silhouette.
 
 There is no `pulled`/`transition` state; insertion motion is out of scope.
 
 After `inserted` is confirmed, the localizer locks the robust median
-tag-relative `top_tag`/`axis_tag` pose.  The per-frame colour edges are used
-only for state confirmation and to feed the lock, never as the published
-centre.  There is **no fixed tag-relative top/slot anchor and no fixed card
-length prior**: the tag may be mounted at a different offset on another panel.
-The empty-slot centre is measured from the blue backplane; the inserted centre
-is the measured outer-box centre.
+tag-relative outer **centre/axis/width/length**.  The per-frame silhouette is
+used to feed that lock, never as a fixed prior.  There is **no fixed
+tag-relative top/slot anchor and no fixed card length**: the tag may be mounted
+at a different offset on another panel.  When the silhouette is temporarily
+unavailable, the locked outer pose is projected through the current T07
+homography; the colour strip is only a short-lived fallback and is never
+locked.
 
-3D uses the **panel plane** around T07 plus a fixed card-thickness offset, not
-the black card's own depth (which is often a depth hole).  When T07 is
-stationary for several frames, the final camera-frame 3D position is locked to
-a median and stops publishing residual depth/tag jitter; camera motion unlocks
-it again.
+3D uses the **measured card-front depth** inside the outer quad: the white
+label and illuminated card edges usually provide valid depth even when the
+black body is a depth hole.  The panel plane plus `panel_depth_offset_m` is a
+fallback only.  When T07 is stationary for several frames, the final
+camera-frame 3D position is locked to a median and stops publishing residual
+depth/tag jitter; camera motion unlocks it again.
 
 `board_card` payload exposes `state`, `stable`, `pose_locked`, `position_stable`,
-`anchor_px`, `center_px`, `slot_px`, `anchor_position`, `position`,
-`slot_position`, `panel_plane_rms_m` and `depth_source`.  `insertion_state` is
-kept as a one-release compatibility alias.
+`anchor_px`, `center_px`, `slot_px`, `quad_px`, `width_tag`, `length_tag`,
+`anchor_position`, `position`, `slot_position`, `geometry_source`,
+`card_depth_m`, `card_plane_rms_m`, `panel_plane_rms_m` and `depth_source`.
+`insertion_state` is kept as a one-release compatibility alias.  The orange
+debug quad is the measured outer card, not the YOLO white-frame box.
 
 Configuration lives under `board_card_localizer:` in
 `config/panel_detection.yaml`.  The default slot ROI is

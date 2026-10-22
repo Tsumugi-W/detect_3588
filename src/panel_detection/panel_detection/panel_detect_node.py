@@ -182,6 +182,12 @@ def _board_card_observation_summary(observation):
             return None
         return [round(float(value[0]), 3), round(float(value[1]), 3)]
 
+    def points(values):
+        if values is None:
+            return None
+        return [[round(float(value[0]), 3), round(float(value[1]), 3)]
+                for value in values]
+
     return {
         'card_present': bool(observation.get('card_present')),
         'state': observation.get('state', observation.get('insertion_state', 'unknown')),
@@ -201,11 +207,16 @@ def _board_card_observation_summary(observation):
         'center_px': point(observation.get('center_px')),
         'axis_px': point(observation.get('axis_px')),
         'slot_px': point(observation.get('slot_px')),
+        'quad_px': points(observation.get('quad_px')),
         'slot_position': ({axis: round(float(value), 5)
                            for axis, value in zip('xyz', observation['slot_position'])}
                           if observation.get('slot_position') is not None else None),
         'width_px': (round(float(observation['width_px']), 2)
                      if observation.get('width_px') is not None else None),
+        'width_tag': (round(float(observation['width_tag']), 4)
+                      if observation.get('width_tag') is not None else None),
+        'length_tag': (round(float(observation['length_tag']), 4)
+                       if observation.get('length_tag') is not None else None),
         'visible_length_px': round(
             float(observation.get('visible_length_px', 0.0)), 2),
         'nominal_length_px': (
@@ -214,7 +225,13 @@ def _board_card_observation_summary(observation):
         'length_estimated': bool(observation.get('length_estimated')),
         'clipped': bool(observation.get('clipped')),
         'confidence': round(float(observation.get('confidence', 0.0)), 4),
+        'geometry_source': observation.get('geometry_source'),
         'depth_source': observation.get('depth_source'),
+        'card_depth_m': (round(float(observation['card_depth_m']), 5)
+                         if observation.get('card_depth_m') is not None else None),
+        'card_plane_rms_m': (
+            round(float(observation['card_plane_rms_m']), 5)
+            if observation.get('card_plane_rms_m') is not None else None),
         'plane_rms_m': (round(float(observation['plane_rms_m']), 5)
                         if observation.get('plane_rms_m') is not None else None),
         'panel_plane_rms_m': (
@@ -1827,7 +1844,10 @@ class PanelDetectionNode(Node):
             )
             if inserted and observation.get('bbox'):
                 detection.bbox = tuple(observation['bbox'])
-                detection.center_x, detection.center_y = observation['anchor_px']
+                center = (observation.get('center_px') or
+                          observation.get('anchor_px'))
+                if center is not None:
+                    detection.center_x, detection.center_y = center
             _, _, xyz = _estimate_detection_point(
                 detection, depth_image, intrin, self._depth_scale)
             if inserted:
@@ -1852,13 +1872,13 @@ class PanelDetectionNode(Node):
                     payload['position_valid'] = True
                     features['refined_position'] = dict(payload['position'])
                 elif observation.get('position') is not None:
-                    # Empty slot: publish the measured slot centre on the
-                    # panel plane, but keep graspable=False.
+                    # Empty slot: measured slot centre, never graspable.
                     payload['position'] = {
                         axis: round(float(value), 5)
                         for axis, value in zip('xyz', observation['position'])
                     }
                     payload['position_valid'] = True
+                    features['refined_position'] = dict(payload['position'])
                 else:
                     payload['position'] = None
                     payload['position_valid'] = False
@@ -2372,9 +2392,17 @@ class PanelDetectionNode(Node):
 
         for target_id, det in matched:
             if det.class_name == 'board_card':
-                board_summary = board_feature_details.get(
-                    id(det), {}).get('board_card', {})
-                if board_summary.get('state') != 'inserted':
+                board_detail = board_feature_details.get(id(det), {})
+                board_summary = board_detail.get('board_card', {})
+                state = board_summary.get('state')
+                if state == 'empty':
+                    slot_position = board_detail.get('refined_position')
+                    if slot_position is not None:
+                        matched_xyz[target_id] = np.array(
+                            [slot_position['x'], slot_position['y'],
+                             slot_position['z']], dtype=np.float64)
+                    continue
+                if state != 'inserted':
                     continue
             ux, uy, xyz = _estimate_detection_point(
                 det, filtered_depth, deproj_intrin, self._depth_scale,
@@ -2391,15 +2419,18 @@ class PanelDetectionNode(Node):
         self._knob_angle_stabilizer.prune(active_knob_ids)
 
         for target_id, det in matched:
-            xyz = stable_xyz.get(target_id, matched_xyz[target_id])
-            matched_xyz[target_id] = xyz
-            if det.class_name == 'board_card':
-                board_summary = board_feature_details.get(
-                    id(det), {}).get('board_card', {})
-                if board_summary.get('state') != 'inserted':
-                    continue
-            if det.class_name == 'board_card' and not _valid_point_3d(xyz):
+            xyz = stable_xyz.get(target_id, matched_xyz.get(target_id))
+            if xyz is None:
                 continue
+            matched_xyz[target_id] = xyz
+            board_detail = {}
+            board_summary = {}
+            if det.class_name == 'board_card':
+                board_detail = board_feature_details.get(id(det), {})
+                board_summary = board_detail.get('board_card', {})
+                state = board_summary.get('state')
+                if state not in ('empty', 'inserted'):
+                    continue
             tag_assignment = tag_assignment_by_detection.get(id(det))
 
             target_info = {
@@ -2422,18 +2453,20 @@ class PanelDetectionNode(Node):
                 target_info.update(board_card_target(
                     det, tag_assignment, xyz, quat,
                     self._panel_normal_cache is not None))
-                board_detail = board_feature_details.get(id(det), {})
                 target_info.update(board_detail)
                 if board_detail.get('refined_position') is not None:
                     target_info['position'] = board_detail['refined_position']
+                target_info['graspable'] = state == 'inserted'
+                target_info['board_card'] = board_summary
             targets_output.append(target_info)
 
-            # 兼容旧话题
-            _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
+            # 兼容旧话题；空槽位不是可抓取板卡，不发布 board_card 位姿
+            if not (det.class_name == 'board_card' and state == 'empty'):
+                _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
         # Publish exactly one board-card state target per frame.  The T07
         # observation is available even when YOLO missed the slot; empty slots
-        # carry position=None and are not graspable.
+        # carry the measured slot centre and are not graspable.
         state_observation = (board_feature_details.get('__t07__')
                              if isinstance(board_feature_details, dict) else None)
         if (state_observation is not None and
@@ -2476,7 +2509,14 @@ class PanelDetectionNode(Node):
                 existing['board_card'] = summary
                 existing['graspable'] = (
                     state_observation.get('state') == 'inserted')
-                if state_observation.get('state') == 'empty':
+                position = state_observation.get('position')
+                if position is not None:
+                    existing['position'] = {
+                        axis: round(float(value), 5)
+                        for axis, value in zip('xyz', position)
+                    }
+                    existing['position_valid'] = True
+                else:
                     existing['position'] = None
                     existing['position_valid'] = False
 

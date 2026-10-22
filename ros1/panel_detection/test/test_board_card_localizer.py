@@ -7,6 +7,8 @@ import numpy as np
 
 from panel_detection.board_card_localizer import (
     BoardCardLocalizer,
+    _measure_slot_anchor,
+    locate_card_outer,
     locate_card_strip,
 )
 
@@ -78,6 +80,21 @@ class BoardCardStripTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertTrue(result["clipped"])
         self.assertLess(result["visible_length_px"], 220.0)
+
+    def test_outer_silhouette_is_full_black_rectangle(self):
+        image, valid = _image()
+        result = locate_card_outer(image, valid)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["center_px"][0], 290.0, delta=2.0)
+        self.assertAlmostEqual(result["center_px"][1], 400.0, delta=2.0)
+        self.assertAlmostEqual(result["width_px"], 80.0, delta=3.0)
+        self.assertAlmostEqual(result["length_px"], 400.0, delta=3.0)
+        self.assertEqual(len(result["quad_px"]), 4)
+        self.assertFalse(result["clipped"])
+
+    def test_outer_silhouette_rejects_blue_backplane(self):
+        image, valid = _image(colour=(120, 60, 20), x0=260, x1=320)
+        self.assertIsNone(locate_card_outer(image, valid))
 
 
 class BoardCardLocalizerTest(unittest.TestCase):
@@ -158,6 +175,13 @@ class BoardCardLocalizerTest(unittest.TestCase):
         self.assertEqual(observation["position"], observation["slot_position"])
         self.assertAlmostEqual(observation["position"][2], 0.5, delta=0.01)
 
+    def test_slot_blue_outside_central_band_is_rejected(self):
+        image = np.full((800, 560, 3), 225, dtype=np.uint8)
+        cv2.rectangle(image, (450, 280), (520, 520), (120, 60, 20), -1)
+        valid = np.ones((800, 560), dtype=bool)
+        context = _context(image, valid)
+        self.assertIsNone(_measure_slot_anchor(image, valid, context))
+
     def test_short_dark_blob_is_empty(self):
         image, valid = _image(y0=650, y1=750)
         context = _context(image, valid)
@@ -198,7 +222,25 @@ class BoardCardLocalizerTest(unittest.TestCase):
             delta=0.5,
         )
 
-    def test_panel_plane_offset(self):
+    def test_card_shift_follows_measurement_not_tag_prior(self):
+        def measured_center(x0):
+            image, valid = _image(x0=x0, x1=x0 + 80)
+            context = _context(image, valid)
+            localizer = BoardCardLocalizer(
+                {"min_confidence": 0.1, "inserted_confirm_frames": 1}
+            )
+            with patch(
+                "panel_detection.board_card_localizer.rectify_board_card_roi",
+                side_effect=lambda *args, **kwargs: context,
+            ):
+                observation = None
+                for _ in range(4):
+                    observation = localizer.observe(image, marker=_Marker())
+            return observation["center_px"][0]
+
+        self.assertAlmostEqual(measured_center(250) + 20.0, measured_center(270), delta=2.0)
+
+    def test_card_surface_depth_is_not_panel_offset(self):
         image, valid = _image()
         depth = np.full((800, 560), 500, dtype=np.uint16)
         intrinsics = {
@@ -218,8 +260,13 @@ class BoardCardLocalizerTest(unittest.TestCase):
                     image, depth=depth, camera_info=intrinsics, marker=_Marker()
                 )
         self.assertIsNotNone(result)
-        self.assertAlmostEqual(result["position"][2], 0.49, delta=0.01)
-        self.assertEqual(result["depth_source"], "panel_plane")
+        # The card front is measured at 0.5 m; the panel offset must not move
+        # the published outer-card centre backwards.
+        self.assertAlmostEqual(result["position"][2], 0.50, delta=0.01)
+        self.assertIn(
+            result["depth_source"], ("card_plane", "card_depth_z")
+        )
+        self.assertAlmostEqual(result["card_depth_m"], 0.5, delta=0.01)
 
     def test_stillness_locks_final_position(self):
         image, valid = _image()

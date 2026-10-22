@@ -1,13 +1,18 @@
 """Stable tag-relative board-card state and position estimation.
 
-T07 supplies a scale-normalised slot frame.  Colour is used to confirm the
-binary state (black card fully inserted vs empty slot) and to feed a robust
-tag-relative pose lock.  Once inserted, the fixed card pose is projected
-through the current T07 homography; per-frame colour edges are no longer used
-as the published centre.  Depth is used only for the panel plane around T07,
-not for the black card surface (which is often a depth hole).  A final
-stillness-gated lock removes residual camera-frame jitter while the robot is
-stationary.
+T07 supplies a scale-normalised slot frame.  Colour confirms the binary state
+(black card fully inserted vs empty slot).  In the inserted state the published
+centre is the centre of the **outer black card silhouette**, not the centre of
+the narrow black strip used by earlier versions.  The silhouette is measured
+from the low-value/low-saturation card body, neighbouring card fragments are
+merged across its white label, and a robust tag-relative centre/axis/width/
+length lock is projected through the current T07 homography.
+
+Depth is measured on the card front itself (the white label and illuminated
+edges usually provide valid pixels), with the panel plane only as a fallback.
+The empty state publishes the blue-backplane slot centre on the panel plane.
+No fixed tag-relative card top, length, or slot anchor is used: the tag may be
+mounted with a different offset on another panel.
 
 The module is deliberately independent of ROS.  It accepts a plain BGR image,
 a depth image, a camera matrix and a tag object with ``corners``/``tag_id``
@@ -53,6 +58,35 @@ DEFAULT_CONFIG = {
     "max_row_gap": 24,
     "min_inserted_length_tag": 3.8,
     "min_black_fraction": 0.50,
+    # Full outer-card silhouette.  The black card body is much darker and less
+    # saturated than the blue backplane and the white recess.  Neighbouring
+    # card fragments separated by the card's white label are merged inside a
+    # narrow band around the main body.
+    "card_dark_v_max": 70,
+    "card_dark_s_max": 100,
+    "card_min_area_px": 5000,
+    "card_min_width_px": 50,
+    "card_max_width_px": 260,
+    "card_candidate_max_width_px": 520,
+    "card_trim_margin_px": 12,
+    "card_min_length_px": 180,
+    "card_min_fill_ratio": 0.45,
+    "card_merge_gap_px": 28,
+    "card_merge_min_area_px": 300,
+    "card_merge_min_height_px": 40,
+    "card_merge_min_overlap": 0.40,
+    "card_protrusion_min_m": 0.015,
+    "card_component_min_protrusion_fraction": 0.45,
+    "card_min_protrusion_pixels": 500,
+    "card_outer_min_confidence": 0.35,
+    "card_outer_min_black_fraction": 0.55,
+    # Card-front depth plane.  A plane fit is accepted only when its residual
+    # is small and its centre is consistent with the measured median depth.
+    "card_depth_min_points": 80,
+    "card_depth_max_rms_m": 0.010,
+    "card_depth_gate_m": 0.08,
+    "card_plane_inlier_m": 0.006,
+    "card_plane_min_inliers": 150,
     # Robust tag-relative pose lock.  No absolute tag-relative position prior:
     # the tag may be mounted with a different offset on another panel.
     "pose_lock_frames": 5,
@@ -83,6 +117,8 @@ DEFAULT_CONFIG = {
     "slot_blue_s_min": 70,
     "slot_blue_v_min": 18,
     "slot_min_blue_area": 300,
+    "slot_min_blue_height": 80,
+    "slot_max_blue_width": 180,
     # Depth / plane fitting.
     "depth_min_m": 0.05,
     "depth_max_m": 2.0,
@@ -628,6 +664,372 @@ def locate_card_strip(
     }
 
 
+def _box_geometry(box: np.ndarray) -> dict:
+    """Return centre/axis/width/length and ordered corners for a box."""
+
+    box = np.asarray(box, dtype=np.float64).reshape(4, 2)
+    edges = [box[(index + 1) % 4] - box[index] for index in range(4)]
+    lengths = [float(np.linalg.norm(edge)) for edge in edges]
+    long_index = int(np.argmax(lengths))
+    axis = edges[long_index] / max(lengths[long_index], 1e-9)
+    if axis[1] < 0:
+        axis = -axis
+    length = float(max(lengths))
+    width = float(min(lengths))
+    if width > length:
+        width, length = length, width
+        axis = np.array([-axis[1], axis[0]], dtype=np.float64)
+        if axis[1] < 0:
+            axis = -axis
+    centre = box.mean(axis=0)
+    # Right-handed perpendicular with +y down: for a downward card axis this
+    # points to image-right, so the four corners read TL, TR, BR, BL.
+    perp = np.array([axis[1], -axis[0]], dtype=np.float64)
+    half_width = 0.5 * width
+    top = centre - axis * (0.5 * length)
+    bottom = centre + axis * (0.5 * length)
+    quad = np.array(
+        [
+            top - perp * half_width,
+            top + perp * half_width,
+            bottom + perp * half_width,
+            bottom - perp * half_width,
+        ],
+        dtype=np.float64,
+    )
+    return {
+        "center": centre,
+        "axis": axis,
+        "width": width,
+        "length": length,
+        "quad": quad,
+        "top": quad[0] + (quad[1] - quad[0]) * 0.5,
+        "bottom": quad[3] + (quad[2] - quad[3]) * 0.5,
+    }
+
+
+def _protrusion_masks(
+    depth_m: Optional[np.ndarray],
+    camera_matrix: Optional[np.ndarray],
+    panel: Optional[dict],
+    context: dict,
+    cfg: Optional[dict] = None,
+):
+    """Warp a card-front protrusion mask and a depth-validity mask to the ROI."""
+
+    if depth_m is None or camera_matrix is None or panel is None:
+        return None, None
+    height, width = depth_m.shape[:2]
+    ys, xs = np.indices((height, width))
+    z = np.asarray(depth_m, dtype=np.float64)
+    valid = (
+        np.isfinite(z)
+        & (z > float(_cfg_value(cfg, "depth_min_m")))
+        & (z < float(_cfg_value(cfg, "depth_max_m")))
+    )
+    fx, fy = camera_matrix[0, 0], camera_matrix[1, 1]
+    cx, cy = camera_matrix[0, 2], camera_matrix[1, 2]
+    x = (xs - cx) * z / fx
+    y = (ys - cy) * z / fy
+    normal = np.asarray(panel["normal"], dtype=np.float64)
+    residual = normal[0] * x + normal[1] * y + normal[2] * z - float(panel["d"])
+    threshold = float(_cfg_value(cfg, "card_protrusion_min_m"))
+    protrusion = (valid & (residual < -threshold)).astype(np.uint8) * 255
+    validity = valid.astype(np.uint8) * 255
+    shape = (context["roi"].shape[1], context["roi"].shape[0])
+    transform = context["image_to_roi"]
+    protrusion_roi = cv2.warpPerspective(
+        protrusion, transform, shape, flags=cv2.INTER_NEAREST
+    ) > 0
+    validity_roi = cv2.warpPerspective(
+        validity, transform, shape, flags=cv2.INTER_NEAREST
+    ) > 0
+    return protrusion_roi, validity_roi
+
+
+def locate_card_outer(
+    roi: np.ndarray,
+    valid: Optional[np.ndarray] = None,
+    context: Optional[dict] = None,
+    cfg: Optional[dict] = None,
+    depth_m: Optional[np.ndarray] = None,
+    camera_matrix: Optional[np.ndarray] = None,
+    panel: Optional[dict] = None,
+) -> Optional[dict]:
+    """Measure the full outer silhouette of the inserted black card.
+
+    The black body is the darkest, least-saturated object in the slot.  A white
+    label can split the body into several dark components, so components that
+    are vertically aligned with and close to the main body are merged before
+    the rotated rectangle is fitted.  The white recess frame is much brighter
+    and is not merged; the blue backplane is more saturated and is rejected by
+    the saturation gate.
+
+    When depth and a panel plane are available, a component is accepted only
+    when its valid depth pixels are in front of the panel.  This rejects the
+    dark gap between the card and the recess wall, which has the same colour as
+    the card but lies on the panel.
+    """
+
+    if roi is None or roi.size == 0:
+        return None
+    height, width = roi.shape[:2]
+    if valid is None:
+        valid = np.ones((height, width), dtype=bool)
+    else:
+        valid = np.asarray(valid, dtype=bool)
+
+    protrusion = validity = None
+    if context is not None:
+        protrusion, validity = _protrusion_masks(
+            depth_m, camera_matrix, panel, context, cfg
+        )
+        if (
+            protrusion is not None
+            and int(np.count_nonzero(protrusion & valid))
+            < int(_cfg_value(cfg, "card_min_protrusion_pixels"))
+        ):
+            # Depth is unusable/aligned to a completely flat scene.  Fall back
+            # to the colour silhouette rather than rejecting every card.
+            protrusion = validity = None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    _, saturation, value = cv2.split(hsv)
+    dark = (
+        (value < float(_cfg_value(cfg, "card_dark_v_max")))
+        & (saturation < float(_cfg_value(cfg, "card_dark_s_max")))
+        & valid
+    ).astype(np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark, 8)
+    if count <= 1:
+        return None
+
+    min_width = int(_cfg_value(cfg, "card_min_width_px"))
+    max_width = int(_cfg_value(cfg, "card_max_width_px"))
+    candidate_max_width = int(
+        _cfg_value(cfg, "card_candidate_max_width_px")
+    )
+    min_length = int(_cfg_value(cfg, "card_min_length_px"))
+    min_area = int(_cfg_value(cfg, "card_min_area_px"))
+    candidates = []
+    for index in range(1, count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        x, y, component_width, component_height = [
+            int(v) for v in stats[index, :4]
+        ]
+        if area < min_area:
+            continue
+        if not (min_width <= component_width <= candidate_max_width):
+            continue
+        if component_height < min_length:
+            continue
+        centre_x = x + 0.5 * component_width
+        if not (0.15 * width <= centre_x <= 0.85 * width):
+            continue
+        near_fraction = None
+        if protrusion is not None and validity is not None:
+            component = labels == index
+            valid_count = int(np.count_nonzero(validity & component))
+            if valid_count <= 0:
+                near_fraction = 0.0
+            else:
+                near_fraction = float(
+                    np.count_nonzero(protrusion & component)
+                ) / float(valid_count)
+            if near_fraction < float(
+                _cfg_value(cfg, "card_component_min_protrusion_fraction")
+            ):
+                continue
+        candidates.append(
+            (
+                area,
+                index,
+                (x, y, component_width, component_height),
+                near_fraction,
+            )
+        )
+    if not candidates:
+        return None
+
+    _, best_index, base_bbox, _ = max(candidates)
+    base_x, base_y, base_w, base_h = base_bbox
+    base_component = (labels == best_index).astype(np.uint8)
+    if protrusion is not None and validity is not None:
+        ys, xs = np.nonzero(protrusion & (base_component > 0))
+        if len(xs) >= int(_cfg_value(cfg, "card_min_protrusion_pixels")):
+            # The dark component can merge the card with the left recess wall
+            # during a fast pan.  Trim it to the measured card-front
+            # protrusion, with a small margin for the black edge/holes.
+            margin = int(_cfg_value(cfg, "card_trim_margin_px"))
+            x0 = max(0, int(np.floor(np.percentile(xs, 1))) - margin)
+            x1 = min(width, int(np.ceil(np.percentile(xs, 99))) + margin)
+            # Trim only the horizontal extent.  The card's top/bottom edges
+            # often have no valid depth (black/dark), so trimming vertically
+            # would cut the real card ends and bias the centre downward.
+            y0 = max(0, base_y)
+            y1 = min(height, base_y + base_h)
+            trim = np.zeros_like(base_component)
+            trim[y0:y1, x0:x1] = 1
+            trimmed = base_component & trim
+            if int(trimmed.sum()) >= max(min_area // 2, 1000):
+                base_component = trimmed
+                rows = np.flatnonzero(base_component.any(axis=1))
+                cols = np.flatnonzero(base_component.any(axis=0))
+                if len(rows) and len(cols):
+                    base_y, base_h = int(rows[0]), int(rows[-1] - rows[0] + 1)
+                    base_x, base_w = int(cols[0]), int(cols[-1] - cols[0] + 1)
+                    base_bbox = (base_x, base_y, base_w, base_h)
+    base_area = float(
+        sum(
+            cv2.contourArea(contour)
+            for contour in cv2.findContours(
+                base_component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )[0]
+        )
+    )
+    if base_area / max(float(base_w * base_h), 1.0) < float(
+        _cfg_value(cfg, "card_min_fill_ratio")
+    ):
+        return None
+
+    merge_gap = float(_cfg_value(cfg, "card_merge_gap_px"))
+    merge_min_area = int(_cfg_value(cfg, "card_merge_min_area_px"))
+    merge_min_height = int(_cfg_value(cfg, "card_merge_min_height_px"))
+    merge_min_overlap = float(_cfg_value(cfg, "card_merge_min_overlap"))
+    union = base_component.copy()
+    if protrusion is not None and validity is not None:
+        for index in range(1, count):
+            if index == best_index:
+                continue
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            x, y, component_width, component_height = [
+                int(v) for v in stats[index, :4]
+            ]
+            if area < merge_min_area or component_height < merge_min_height:
+                continue
+            overlap = max(
+                0,
+                min(base_y + base_h, y + component_height) - max(base_y, y),
+            )
+            if overlap < merge_min_overlap * min(base_h, component_height):
+                continue
+            gap = max(
+                0, max(x - (base_x + base_w), base_x - (x + component_width))
+            )
+            if gap > merge_gap:
+                continue
+            fragment_centre_x = x + 0.5 * component_width
+            if not (
+                base_x - 0.25 * base_w
+                <= fragment_centre_x
+                <= base_x + 1.25 * base_w
+            ):
+                continue
+            component = labels == index
+            valid_count = int(np.count_nonzero(validity & component))
+            if valid_count <= 0:
+                continue
+            near_fraction = float(
+                np.count_nonzero(protrusion & component)
+            ) / float(valid_count)
+            if near_fraction < 0.50:
+                continue
+            union[component] = 1
+
+    union = cv2.morphologyEx(union, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(
+        union, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    contours = [contour for contour in contours if cv2.contourArea(contour) > 100]
+    if not contours:
+        return None
+    points = np.vstack([contour.reshape(-1, 2) for contour in contours])
+    rect = cv2.minAreaRect(points.astype(np.float32))
+    box = cv2.boxPoints(rect)
+    geometry = _box_geometry(box)
+    if (
+        geometry["width"] < min_width
+        or geometry["width"] > max_width
+        or geometry["length"] < min_length
+        or geometry["length"] < 1.8 * geometry["width"]
+    ):
+        return None
+
+    quad = geometry["quad"].astype(np.float32)
+    interior = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(interior, np.rint(quad).astype(np.int32), 255)
+    interior = (interior > 0) & valid
+    interior_count = int(interior.sum())
+    if interior_count <= 0:
+        return None
+    black_fraction = (
+        float(np.count_nonzero(dark & interior)) / float(interior_count)
+    )
+    silhouette_area = float(sum(cv2.contourArea(c) for c in contours))
+    fill_ratio = silhouette_area / max(
+        geometry["width"] * geometry["length"], 1e-9
+    )
+    if fill_ratio < float(_cfg_value(cfg, "card_min_fill_ratio")):
+        return None
+    if black_fraction < float(_cfg_value(cfg, "card_outer_min_black_fraction")):
+        return None
+
+    confidence = float(
+        np.clip(
+            0.45 * np.clip(fill_ratio / 0.70, 0.0, 1.0)
+            + 0.35 * np.clip(black_fraction / 0.75, 0.0, 1.0)
+            + 0.20 * np.clip(geometry["length"] / 420.0, 0.0, 1.0),
+            0.0,
+            1.0,
+        )
+    )
+    if confidence < float(_cfg_value(cfg, "card_outer_min_confidence")):
+        return None
+
+    centre_x = float(geometry["center"][0])
+    valid_rows = np.flatnonzero(valid[:, int(np.clip(round(centre_x), 0, width - 1))])
+    clipped = False
+    if len(valid_rows):
+        top_y = float(geometry["quad"][:, 1].min())
+        bottom_y = float(geometry["quad"][:, 1].max())
+        if top_y <= float(valid_rows[0]) + 1.5:
+            clipped = True
+        if bottom_y >= float(valid_rows[-1]) - 1.5:
+            clipped = True
+
+    return {
+        "center_px": tuple(float(v) for v in geometry["center"]),
+        "axis_px": tuple(float(v) for v in geometry["axis"]),
+        "top_px": tuple(float(v) for v in geometry["top"]),
+        "bottom_px": tuple(float(v) for v in geometry["bottom"]),
+        "width_px": float(geometry["width"]),
+        "length_px": float(geometry["length"]),
+        "visible_length_px": float(geometry["length"]),
+        "quad_px": [tuple(float(v) for v in point) for point in geometry["quad"]],
+        "left_top_px": tuple(float(v) for v in geometry["quad"][0]),
+        "right_top_px": tuple(float(v) for v in geometry["quad"][1]),
+        "right_bottom_px": tuple(float(v) for v in geometry["quad"][2]),
+        "left_bottom_px": tuple(float(v) for v in geometry["quad"][3]),
+        "bbox": (
+            float(geometry["quad"][:, 0].min()),
+            float(geometry["quad"][:, 1].min()),
+            float(geometry["quad"][:, 0].max()),
+            float(geometry["quad"][:, 1].max()),
+        ),
+        "area_px": int(silhouette_area),
+        "black_fraction": black_fraction,
+        "fill_ratio": float(fill_ratio),
+        "clipped": bool(clipped),
+        "confidence": confidence,
+        "rows": int(geometry["length"]),
+        "source": "tag_rectified_outer_silhouette",
+    }
+
+
+
 def _measure_slot_anchor(
     roi: np.ndarray,
     valid: Optional[np.ndarray],
@@ -653,6 +1055,19 @@ def _measure_slot_anchor(
         & (value > int(_cfg_value(cfg, "slot_blue_v_min")))
         & valid
     ).astype(np.uint8)
+    # Restrict to the broad central slot band.  The rectified ROI also contains
+    # blue panel furniture (buttons, cables); without this gate the largest
+    # blue blob can be far away from the slot when the slot is partially out of
+    # view.
+    slot_x = _cfg_value(cfg, "slot_x")
+    slot_y = _cfg_value(cfg, "slot_y")
+    x_min = int(float(slot_x[0]) * width)
+    x_max = int(float(slot_x[1]) * width)
+    y_min = int(float(slot_y[0]) * height)
+    y_max = int(float(slot_y[1]) * height)
+    region = np.zeros_like(mask)
+    region[y_min:y_max, x_min:x_max] = 1
+    mask *= region
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
@@ -665,7 +1080,15 @@ def _measure_slot_anchor(
     area = int(stats[best, cv2.CC_STAT_AREA])
     if area < int(_cfg_value(cfg, "slot_min_blue_area")):
         return None
+    component_width = int(stats[best, cv2.CC_STAT_WIDTH])
+    component_height = int(stats[best, cv2.CC_STAT_HEIGHT])
+    if component_height < int(_cfg_value(cfg, "slot_min_blue_height")):
+        return None
+    if component_width > int(_cfg_value(cfg, "slot_max_blue_width")):
+        return None
     centre = centroids[best]
+    if not (x_min - 8 <= float(centre[0]) <= x_max + 8):
+        return None
     anchor_roi = (float(centre[0]), float(centre[1]))
     anchor_tag = _roi_point_to_tag(anchor_roi, context)
     return {
@@ -773,6 +1196,70 @@ def _depth_plane(
     y = (ys[valid].astype(np.float64) - cy) * z / fy
     points_3d = np.column_stack([x, y, z])
     return _plane_from_points(points_3d, cfg)
+
+
+def _card_surface_depth(
+    depth_m: Optional[np.ndarray],
+    camera_matrix: Optional[np.ndarray],
+    quad: np.ndarray,
+    cfg: Optional[dict] = None,
+) -> Optional[dict]:
+    """Measure the card-front depth from pixels inside the outer quad."""
+
+    if depth_m is None or camera_matrix is None:
+        return None
+    height, width = depth_m.shape[:2]
+    polygon = np.asarray(quad, dtype=np.float32).reshape(-1, 2)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.rint(polygon).astype(np.int32), 1)
+    mask = cv2.erode(mask, np.ones((7, 7), np.uint8))
+    ys, xs = np.nonzero(mask > 0)
+    if len(xs) < int(_cfg_value(cfg, "card_depth_min_points")):
+        return None
+    z = np.asarray(depth_m[ys, xs], dtype=np.float64)
+    valid = (
+        np.isfinite(z)
+        & (z > float(_cfg_value(cfg, "depth_min_m")))
+        & (z < float(_cfg_value(cfg, "depth_max_m")))
+    )
+    if int(valid.sum()) < int(_cfg_value(cfg, "card_depth_min_points")):
+        return None
+    z_valid = z[valid]
+    median_z = float(np.median(z_valid))
+    plane = _depth_plane(
+        depth_m,
+        camera_matrix,
+        polygon,
+        {
+            **dict(cfg or {}),
+            "plane_min_points": int(_cfg_value(cfg, "card_depth_min_points")),
+            "plane_inlier_m": float(_cfg_value(cfg, "card_plane_inlier_m")),
+            "plane_depth_gate_m": float(_cfg_value(cfg, "card_depth_gate_m")),
+        },
+        expected_z=median_z,
+    )
+    if plane is not None:
+        rms = plane.get("rms")
+        centre = polygon.mean(axis=0)
+        centre_xyz = _ray_plane(centre, camera_matrix, plane)
+        if (
+            (rms is None or float(rms) <= float(_cfg_value(cfg, "card_depth_max_rms_m")))
+            and int(plane["inliers"]) >= int(_cfg_value(cfg, "card_plane_min_inliers"))
+            and centre_xyz is not None
+            and abs(float(centre_xyz[2]) - median_z)
+            <= float(_cfg_value(cfg, "card_depth_gate_m"))
+        ):
+            return {
+                "plane": plane,
+                "median_z": median_z,
+                "source": "card_plane",
+            }
+    return {
+        "plane": None,
+        "median_z": median_z,
+        "source": "card_depth_z",
+    }
+
 
 
 def _panel_plane(
@@ -1041,6 +1528,10 @@ def _observation_to_image(observation: dict, context: dict, cfg: Optional[dict] 
             float(transformed[:, 0].max()),
             float(transformed[:, 1].max()),
         )
+    if observation.get("quad_px") is not None:
+        observation["quad_px"] = [
+            _to_image(point, roi_to_image) for point in observation["quad_px"]
+        ]
     return observation
 
 
@@ -1103,9 +1594,10 @@ class BoardCardLocalizer:
                 "last_panel_z": None,
                 "missed": 0,
                 "pose_samples": [],
-                "pose_top_tag": None,
+                "pose_center_tag": None,
                 "pose_axis_tag": None,
                 "pose_width_tag": None,
+                "pose_length_tag": None,
                 "pose_spread_tag": None,
                 "pose_locked": False,
                 "panel_plane": None,
@@ -1151,24 +1643,74 @@ class BoardCardLocalizer:
         state = self._state_for(tag_id)
         camera_matrix = _intrinsics(camera_info)
         depth_m = _depth_metres(depth, float(self.cfg["depth_scale"]))
+        panel = self._effective_panel_plane(
+            state, depth_m, camera_matrix, marker
+        )
+        outer = locate_card_outer(
+            context["roi"],
+            context["valid"],
+            context,
+            self.cfg,
+            depth_m,
+            camera_matrix,
+            panel,
+        )
 
+        roi_width = context["roi"].shape[1]
         roi_height = context["roi"].shape[0]
+        roi_x0, roi_x1 = (float(v) for v in self.cfg["roi_x"])
         roi_y0, roi_y1 = (float(v) for v in self.cfg["roi_y"])
-        tag_y_span = max(roi_y1 - roi_y0, 1e-6)
+        sx = roi_width / max(roi_x1 - roi_x0, 1e-6)
+        sy = roi_height / max(roi_y1 - roi_y0, 1e-6)
         # No fixed card length: report the length actually measured this frame.
-        nominal = float(strip["visible_length_px"]) if strip is not None else 0.0
+        nominal = float(
+            outer["length_px"]
+            if outer is not None
+            else (strip["visible_length_px"] if strip is not None else 0.0)
+        )
+        outer_length_tag = (
+            float(outer["length_px"]) * (roi_y1 - roi_y0) / roi_height
+            if outer is not None
+            else 0.0
+        )
+        strip_length_tag = (
+            float(strip["visible_length_px"]) * (roi_y1 - roi_y0) / roi_height
+            if strip is not None
+            else 0.0
+        )
 
-        visible_length_tag = 0.0
-        if strip is not None:
-            visible_length_tag = float(strip["visible_length_px"]) * tag_y_span / roi_height
-
-        inserted_measurement = bool(
+        outer_inserted = bool(
+            outer is not None
+            and outer["confidence"]
+            >= float(self.cfg["card_outer_min_confidence"])
+            and outer_length_tag >= float(self.cfg["min_inserted_length_tag"])
+            and outer["black_fraction"]
+            >= float(self.cfg["card_outer_min_black_fraction"])
+        )
+        strip_inserted = bool(
             strip is not None
             and strip["confidence"] >= float(self.cfg["min_confidence"])
-            and visible_length_tag >= float(self.cfg["min_inserted_length_tag"])
+            and strip_length_tag >= float(self.cfg["min_inserted_length_tag"])
             and float(strip.get("black_fraction", 0.0))
             >= float(self.cfg["min_black_fraction"])
         )
+        depth_available = bool(
+            depth_m is not None and camera_matrix is not None and panel is not None
+        )
+        if depth_available:
+            # With depth, the outer silhouette is authoritative for entering
+            # the inserted state.  The colour strip may only *hold* an already
+            # confirmed inserted state while the silhouette is temporarily
+            # missing (motion blur, tag near the image edge).
+            inserted_measurement = bool(
+                outer_inserted
+                or (
+                    state.get("stable_state") == "inserted"
+                    and strip_inserted
+                )
+            )
+        else:
+            inserted_measurement = bool(outer_inserted or strip_inserted)
         candidate = "inserted" if inserted_measurement else "empty"
 
         if state["candidate_state"] == candidate:
@@ -1193,9 +1735,6 @@ class BoardCardLocalizer:
             1.0, float(state["candidate_count"]) / max(1, confirm_frames)
         )
         state["missed"] = 0
-        panel = self._effective_panel_plane(
-            state, depth_m, camera_matrix, marker
-        )
 
         if stable_state is None:
             observation = {
@@ -1217,6 +1756,9 @@ class BoardCardLocalizer:
                 "left_bottom_px": None,
                 "right_bottom_px": None,
                 "bbox": None,
+                "quad_px": None,
+                "quad_tag": None,
+                "geometry_source": "none",
                 "axis_px": (0.0, 1.0),
                 "width_px": None,
                 "visible_length_px": 0.0,
@@ -1266,6 +1808,9 @@ class BoardCardLocalizer:
                 "left_bottom_px": None,
                 "right_bottom_px": None,
                 "bbox": None,
+                "quad_px": None,
+                "quad_tag": None,
+                "geometry_source": "none",
                 "axis_px": (0.0, 1.0),
                 "width_px": None,
                 "visible_length_px": 0.0,
@@ -1285,6 +1830,8 @@ class BoardCardLocalizer:
                 "plane_rms_m": None,
                 "depth_source": None,
             }
+            if anchor_roi is not None:
+                observation["center_px"] = anchor_roi
             if camera_matrix is not None and anchor_roi is not None:
                 anchor_img = _to_image(anchor_roi, context["roi_to_image"])
                 slot_xyz = None
@@ -1332,177 +1879,348 @@ class BoardCardLocalizer:
             state["still_count"] = 0
             state["center_lock"] = None
             state["anchor_lock"] = None
+            state["pose_samples"] = []
+            state["pose_center_tag"] = None
+            state["pose_axis_tag"] = None
+            state["pose_width_tag"] = None
+            state["pose_length_tag"] = None
+            state["pose_spread_tag"] = None
+            state["pose_locked"] = False
             return _observation_to_image(observation, context, self.cfg)
 
-        # Inserted card: measure once in tag coordinates, lock the robust
-        # median pose, then project that fixed pose through the current T07
-        # homography.  Per-frame colour edges are only used to confirm the
-        # state and to feed the lock.
-        top_roi = np.asarray(strip["top_px"], dtype=np.float64)
-        axis_roi_meas = np.asarray(strip["axis_px"], dtype=np.float64)
-        top_tag = _roi_point_to_tag(top_roi, context)
-        axis_probe_roi = top_roi + axis_roi_meas * 40.0
-        axis_probe_tag = _roi_point_to_tag(axis_probe_roi, context)
-        roi_width = context["roi"].shape[1]
-        roi_x0, roi_x1 = (float(v) for v in self.cfg["roi_x"])
-        sx = roi_width / max(roi_x1 - roi_x0, 1e-6)
-        width_tag = float(strip["width_px"]) / max(sx, 1e-6)
-        axis_tag = None
-        if top_tag is not None and axis_probe_tag is not None:
-            axis_tag = np.asarray(axis_probe_tag, dtype=np.float64) - np.asarray(
-                top_tag, dtype=np.float64
+        # Inserted card: measure the full outer silhouette in tag coordinates,
+        # lock its robust median pose, then project that pose through the
+        # current T07 homography.  The strip fit remains only a state check and
+        # a fallback when the outer silhouette is unavailable.
+        if outer is not None:
+            geometry_measure = outer
+            geometry_source = "outer_silhouette"
+        else:
+            geometry_measure = strip
+            geometry_source = "strip_fallback"
+        bbox_measure = geometry_measure["bbox"]
+        center_roi_meas = np.array(
+            [
+                float((bbox_measure[0] + bbox_measure[2]) * 0.5),
+                float((bbox_measure[1] + bbox_measure[3]) * 0.5),
+            ],
+            dtype=np.float64,
+        )
+        axis_roi_meas = np.asarray(geometry_measure["axis_px"], dtype=np.float64)
+        axis_norm = float(np.linalg.norm(axis_roi_meas))
+        if axis_norm > 1e-9:
+            axis_roi_meas /= axis_norm
+        else:
+            axis_roi_meas = np.array([0.0, 1.0], dtype=np.float64)
+        width_meas_px = float(geometry_measure["width_px"])
+        length_meas_px = float(
+            geometry_measure.get(
+                "length_px", geometry_measure.get("visible_length_px", 0.0)
             )
-            norm = float(np.linalg.norm(axis_tag))
-            if norm > 1e-9:
-                axis_tag /= norm
+        )
+        perp_roi = np.array([-axis_roi_meas[1], axis_roi_meas[0]])
+        centre_tag_meas = _roi_point_to_tag(center_roi_meas, context)
+        axis_probe_tag = _roi_point_to_tag(
+            center_roi_meas + axis_roi_meas * 40.0, context
+        )
+        width_a_tag = _roi_point_to_tag(
+            center_roi_meas + perp_roi * 0.5 * width_meas_px, context
+        )
+        width_b_tag = _roi_point_to_tag(
+            center_roi_meas - perp_roi * 0.5 * width_meas_px, context
+        )
+        top_tag_meas = _roi_point_to_tag(
+            center_roi_meas - axis_roi_meas * 0.5 * length_meas_px, context
+        )
+        bottom_tag_meas = _roi_point_to_tag(
+            center_roi_meas + axis_roi_meas * 0.5 * length_meas_px, context
+        )
+        axis_tag_meas = None
+        width_tag_meas = 0.0
+        length_tag_meas = 0.0
+        if centre_tag_meas is not None and axis_probe_tag is not None:
+            axis_tag_meas = np.asarray(axis_probe_tag) - np.asarray(
+                centre_tag_meas
+            )
+            axis_norm = float(np.linalg.norm(axis_tag_meas))
+            if axis_norm > 1e-9:
+                axis_tag_meas /= axis_norm
             else:
-                axis_tag = None
-        if axis_tag is not None and axis_tag[1] < 0:
-            axis_tag = -axis_tag
+                axis_tag_meas = None
+        if axis_tag_meas is not None and axis_tag_meas[1] < 0:
+            axis_tag_meas = -axis_tag_meas
+        if width_a_tag is not None and width_b_tag is not None:
+            width_tag_meas = float(
+                np.linalg.norm(
+                    np.asarray(width_a_tag) - np.asarray(width_b_tag)
+                )
+            )
+        if top_tag_meas is not None and bottom_tag_meas is not None:
+            length_tag_meas = float(
+                np.linalg.norm(
+                    np.asarray(bottom_tag_meas) - np.asarray(top_tag_meas)
+                )
+            )
 
         pose_ok = bool(
-            top_tag is not None
-            and axis_tag is not None
-            and float(strip["confidence"]) >= 0.45
-            and float(axis_tag[1]) > 0.7
+            geometry_source == "outer_silhouette"
+            and centre_tag_meas is not None
+            and axis_tag_meas is not None
+            and width_tag_meas > 0.1
+            and length_tag_meas > 0.1
+            and float(geometry_measure.get("confidence", 0.0)) >= 0.45
+            and float(axis_tag_meas[1]) > 0.7
         )
         if pose_ok:
             state["pose_samples"].append(
-                (tuple(top_tag), tuple(float(v) for v in axis_tag), float(width_tag))
+                (
+                    tuple(float(v) for v in centre_tag_meas),
+                    tuple(float(v) for v in axis_tag_meas),
+                    float(width_tag_meas),
+                    float(length_tag_meas),
+                )
             )
             state["pose_samples"] = state["pose_samples"][-30:]
+            sample_centres = np.asarray(
+                [sample[0] for sample in state["pose_samples"]],
+                dtype=np.float64,
+            )
+            sample_median = np.median(sample_centres, axis=0)
+            state["pose_spread_tag"] = float(
+                np.median(
+                    np.linalg.norm(sample_centres - sample_median, axis=1)
+                )
+            )
         if not state["pose_locked"] and len(state["pose_samples"]) >= int(
             self.cfg["pose_lock_frames"]
         ):
-            tops = np.asarray([s[0] for s in state["pose_samples"]], dtype=np.float64)
-            axes = np.asarray([s[1] for s in state["pose_samples"]], dtype=np.float64)
-            widths = np.asarray([s[2] for s in state["pose_samples"]], dtype=np.float64)
-            top_med = np.median(tops, axis=0)
+            centres = np.asarray(
+                [sample[0] for sample in state["pose_samples"]], dtype=np.float64
+            )
+            axes = np.asarray(
+                [sample[1] for sample in state["pose_samples"]], dtype=np.float64
+            )
+            widths = np.asarray(
+                [sample[2] for sample in state["pose_samples"]], dtype=np.float64
+            )
+            lengths = np.asarray(
+                [sample[3] for sample in state["pose_samples"]], dtype=np.float64
+            )
+            centre_med = np.median(centres, axis=0)
             axis_med = np.median(axes, axis=0)
             axis_norm = float(np.linalg.norm(axis_med))
             if axis_norm > 1e-9:
                 axis_med /= axis_norm
             spread = float(
-                np.median(np.linalg.norm(tops - top_med, axis=1))
+                np.median(np.linalg.norm(centres - centre_med, axis=1))
             )
-            if spread <= float(self.cfg["pose_lock_max_mad_tag"]):
-                state["pose_top_tag"] = tuple(float(v) for v in top_med)
+            width_med = float(np.median(widths))
+            length_med = float(np.median(lengths))
+            width_spread = float(
+                np.median(np.abs(widths - width_med))
+            ) / max(width_med, 1e-6)
+            length_spread = float(
+                np.median(np.abs(lengths - length_med))
+            ) / max(length_med, 1e-6)
+            if (
+                spread <= float(self.cfg["pose_lock_max_mad_tag"])
+                and width_spread <= 0.25
+                and length_spread <= 0.25
+                and float(axis_med[1]) > 0.7
+            ):
+                state["pose_center_tag"] = tuple(
+                    float(v) for v in centre_med
+                )
                 state["pose_axis_tag"] = tuple(float(v) for v in axis_med)
-                state["pose_width_tag"] = float(np.median(widths))
+                state["pose_width_tag"] = width_med
+                state["pose_length_tag"] = length_med
                 state["pose_spread_tag"] = spread
                 state["pose_locked"] = True
 
         if state["pose_locked"]:
-            top_use = np.asarray(state["pose_top_tag"], dtype=np.float64)
-            anchor_roi = _tag_roi_point(top_use, context, self.cfg)
-            top_px_use = anchor_roi
-            axis_px_use = axis_roi_meas
+            centre_tag_use = np.asarray(
+                state["pose_center_tag"], dtype=np.float64
+            )
+            axis_tag_use = np.asarray(state["pose_axis_tag"], dtype=np.float64)
+            width_tag_use = float(state["pose_width_tag"])
+            length_tag_use = float(state["pose_length_tag"])
             pose_locked = True
+            output_geometry_source = (
+                "outer_pose_lock" if outer is None else "outer_silhouette"
+            )
+        elif centre_tag_meas is None or axis_tag_meas is None:
+            # Cannot express the measured geometry in tag coordinates; do not
+            # invent a position from a fixed prior.
+            return None
         else:
-            previous_anchor = state.get("anchor_px")
-            if previous_anchor is not None and float(
-                np.linalg.norm(top_roi - np.asarray(previous_anchor, dtype=np.float64))
-            ) <= float(self.cfg["max_anchor_jump_px"]):
-                alpha = float(self.cfg["smooth_alpha"])
-                smooth_top = (
-                    np.asarray(previous_anchor, dtype=np.float64) * (1.0 - alpha)
-                    + top_roi * alpha
-                )
-            else:
-                smooth_top = top_roi.copy()
-            previous_axis = state.get("axis_px")
-            if previous_axis is not None:
-                previous_axis = np.asarray(previous_axis, dtype=np.float64)
-                if float(previous_axis @ axis_roi_meas) > 0.8:
-                    alpha = float(self.cfg["smooth_alpha"])
-                    axis_roi_meas = (
-                        previous_axis * (1.0 - alpha) + axis_roi_meas * alpha
-                    )
-                    axis_roi_meas /= max(
-                        float(np.linalg.norm(axis_roi_meas)), 1e-9
-                    )
-            state["anchor_px"] = tuple(float(v) for v in smooth_top)
-            state["axis_px"] = tuple(float(v) for v in axis_roi_meas)
-            anchor_roi = tuple(float(v) for v in smooth_top)
-            top_px_use = tuple(float(v) for v in top_roi)
-            axis_px_use = tuple(float(v) for v in axis_roi_meas)
+            centre_tag_use = np.asarray(centre_tag_meas, dtype=np.float64)
+            axis_tag_use = np.asarray(axis_tag_meas, dtype=np.float64)
+            width_tag_use = float(width_tag_meas)
+            length_tag_use = float(length_tag_meas)
             pose_locked = False
+            output_geometry_source = geometry_source
 
-        # Position is the measured centre of the card's outer box, not a
-        # top-centre plus a fixed nominal length.
-        bbox = strip["bbox"]
-        center_roi = (
-            float((bbox[0] + bbox[2]) * 0.5),
-            float((bbox[1] + bbox[3]) * 0.5),
+        # Project the measured (or locked) tag-relative outer rectangle through
+        # the current homography.  No fixed top/length prior is involved.
+        axis_tag_use = axis_tag_use / max(
+            float(np.linalg.norm(axis_tag_use)), 1e-9
         )
-        width_px_use = float(strip["width_px"])
-
-        visible_center = np.asarray(strip["visible_center_px"], dtype=np.float64)
-        observation = dict(strip)
-        observation.update(
-            {
-                "tag_id": tag_id,
-                "card_present": True,
-                "insertion_state": "inserted",
-                "state": "inserted",
-                "stable": True,
-                "state_confidence": state_confidence,
-                "state_frames": int(state["candidate_count"]),
-                "pose_locked": pose_locked,
-                "pose_samples": len(state["pose_samples"]),
-                "pose_spread_tag": state.get("pose_spread_tag"),
-                "anchor_source": "card_top",
-                "anchor_px": tuple(float(v) for v in anchor_roi),
-                "top_px": tuple(float(v) for v in top_px_use),
-                "center_px": (float(center_roi[0]), float(center_roi[1])),
-                "visible_center_px": tuple(float(v) for v in visible_center),
-                "axis_px": tuple(float(v) for v in axis_px_use),
-                "width_px": width_px_use,
-                "nominal_length_px": float(nominal),
-                "length_estimated": False,
-                "clipped": bool(strip["clipped"]),
-                "bbox": bbox,
-                "slot_px": None,
-                "position": None,
-                "slot_position": None,
-                "anchor_position": None,
-                "top_position": None,
-                "bottom_position": None,
-                "plane": None,
-                "plane_rms_m": None,
-                "panel_plane_rms_m": None,
-                "depth_source": None,
-                "position_source": None,
-            }
+        perp_tag_use = np.array(
+            [axis_tag_use[1], -axis_tag_use[0]], dtype=np.float64
         )
+        top_tag_use = centre_tag_use - axis_tag_use * (0.5 * length_tag_use)
+        bottom_tag_use = centre_tag_use + axis_tag_use * (0.5 * length_tag_use)
+        quad_tag = [
+            top_tag_use - perp_tag_use * (0.5 * width_tag_use),
+            top_tag_use + perp_tag_use * (0.5 * width_tag_use),
+            bottom_tag_use + perp_tag_use * (0.5 * width_tag_use),
+            bottom_tag_use - perp_tag_use * (0.5 * width_tag_use),
+        ]
+        quad_roi = [
+            _tag_roi_point(point, context, self.cfg) for point in quad_tag
+        ]
+        quad_roi = [np.asarray(point, dtype=np.float64) for point in quad_roi]
+        center_roi = np.asarray(
+            _tag_roi_point(centre_tag_use, context, self.cfg),
+            dtype=np.float64,
+        )
+        axis_roi_use = quad_roi[3] - quad_roi[0]
+        axis_roi_use = axis_roi_use / max(
+            float(np.linalg.norm(axis_roi_use)), 1e-9
+        )
+        width_px_use = float(np.linalg.norm(quad_roi[1] - quad_roi[0]))
+        length_px_use = float(np.linalg.norm(quad_roi[3] - quad_roi[0]))
+        top_roi = np.asarray(
+            _tag_roi_point(top_tag_use, context, self.cfg), dtype=np.float64
+        )
+        bottom_roi = np.asarray(
+            _tag_roi_point(bottom_tag_use, context, self.cfg),
+            dtype=np.float64,
+        )
+        bbox = (
+            float(min(point[0] for point in quad_roi)),
+            float(min(point[1] for point in quad_roi)),
+            float(max(point[0] for point in quad_roi)),
+            float(max(point[1] for point in quad_roi)),
+        )
+        visible_center = center_roi
 
-        # 3D: use the panel plane around T07, not the black card's depth (which
-        # is frequently full of holes).  Card thickness is a fixed site offset.
-        plane_card = None
+        observation = {
+            "tag_id": tag_id,
+            "card_present": True,
+            "insertion_state": "inserted",
+            "state": "inserted",
+            "stable": True,
+            "state_confidence": state_confidence,
+            "state_frames": int(state["candidate_count"]),
+            "pose_locked": pose_locked,
+            "pose_samples": len(state["pose_samples"]),
+            "pose_spread_tag": state.get("pose_spread_tag"),
+            "anchor_source": "card_top",
+            "anchor_px": tuple(float(v) for v in top_roi),
+            "top_px": tuple(float(v) for v in top_roi),
+            "bottom_px": tuple(float(v) for v in bottom_roi),
+            "center_px": tuple(float(v) for v in center_roi),
+            "visible_center_px": tuple(float(v) for v in visible_center),
+            "axis_px": tuple(float(v) for v in axis_roi_use),
+            "width_px": width_px_use,
+            "visible_length_px": length_px_use,
+            "nominal_length_px": length_px_use,
+            "length_estimated": False,
+            "clipped": bool(
+                outer["clipped"] if outer is not None else strip["clipped"]
+            ),
+            "confidence": float(geometry_measure.get("confidence", 0.0)),
+            "source": geometry_measure.get(
+                "source", "tag_rectified_outer_silhouette"
+            ),
+            "geometry_source": output_geometry_source,
+            "black_fraction": float(
+                geometry_measure.get("black_fraction", 0.0)
+            ),
+            "fill_ratio": float(geometry_measure.get("fill_ratio", 0.0)),
+            "bbox": bbox,
+            "quad_px": [tuple(float(v) for v in point) for point in quad_roi],
+            "quad_tag": [tuple(float(v) for v in point) for point in quad_tag],
+            "left_top_px": tuple(float(v) for v in quad_roi[0]),
+            "right_top_px": tuple(float(v) for v in quad_roi[1]),
+            "right_bottom_px": tuple(float(v) for v in quad_roi[2]),
+            "left_bottom_px": tuple(float(v) for v in quad_roi[3]),
+            "width_tag": width_tag_use,
+            "length_tag": length_tag_use,
+            "slot_px": None,
+            "position": None,
+            "slot_position": None,
+            "anchor_position": None,
+            "top_position": None,
+            "bottom_position": None,
+            "plane": None,
+            "plane_rms_m": None,
+            "panel_plane_rms_m": None,
+            "depth_source": None,
+            "position_source": None,
+            "card_depth_m": None,
+            "card_plane_rms_m": None,
+        }
+
+        # 3D: measure the card-front depth from the outer quad.  The panel
+        # plane is only a fallback; it is not the card surface.
         center_xyz = None
         anchor_xyz = None
         expected_z = panel.get("expected_z") if panel is not None else None
         if expected_z is None:
             expected_z = state.get("last_panel_z")
-        if panel is not None:
+        center_img = _to_image(center_roi, context["roi_to_image"])
+        top_img = _to_image(top_roi, context["roi_to_image"])
+        quad_img = np.asarray(
+            [
+                _to_image(point, context["roi_to_image"])
+                for point in quad_roi
+            ],
+            dtype=np.float64,
+        )
+        card_depth = _card_surface_depth(
+            depth_m, camera_matrix, quad_img, self.cfg
+        )
+        if card_depth is not None:
+            observation["card_depth_m"] = float(card_depth["median_z"])
+            if card_depth.get("plane") is not None:
+                center_xyz = _ray_plane(
+                    center_img, camera_matrix, card_depth["plane"]
+                )
+                anchor_xyz = _ray_plane(
+                    top_img, camera_matrix, card_depth["plane"]
+                )
+                observation["card_plane_rms_m"] = (
+                    float(card_depth["plane"]["rms"])
+                    if card_depth["plane"].get("rms") is not None
+                    else None
+                )
+            if center_xyz is None:
+                center_xyz = _point_at_z(
+                    center_img, camera_matrix, float(card_depth["median_z"])
+                )
+                anchor_xyz = _point_at_z(
+                    top_img, camera_matrix, float(card_depth["median_z"])
+                )
+            observation["depth_source"] = card_depth["source"]
+        if center_xyz is None and panel is not None:
             plane_card = {
                 "normal": np.asarray(panel["normal"], dtype=np.float64),
                 "d": float(panel["d"])
                 - float(self.cfg["panel_depth_offset_m"]),
             }
-        if camera_matrix is not None:
-            anchor_img = _to_image(anchor_roi, context["roi_to_image"])
-            center_img = _to_image(center_roi, context["roi_to_image"])
-            if plane_card is not None:
-                anchor_xyz = _ray_plane(anchor_img, camera_matrix, plane_card)
-                center_xyz = _ray_plane(center_img, camera_matrix, plane_card)
-                observation["depth_source"] = "panel_plane"
-            if center_xyz is None and expected_z is not None:
-                center_xyz = _point_at_z(center_img, camera_matrix, float(expected_z))
-                anchor_xyz = _point_at_z(
-                    anchor_img, camera_matrix, float(expected_z)
-                )
-                observation["depth_source"] = "tag_z_fallback"
+            center_xyz = _ray_plane(center_img, camera_matrix, plane_card)
+            anchor_xyz = _ray_plane(top_img, camera_matrix, plane_card)
+            observation["depth_source"] = "panel_plane"
+        if center_xyz is None and expected_z is not None:
+            center_xyz = _point_at_z(
+                center_img, camera_matrix, float(expected_z)
+            )
+            anchor_xyz = _point_at_z(
+                top_img, camera_matrix, float(expected_z)
+            )
+            observation["depth_source"] = "tag_z_fallback"
         observation["plane"] = (
             {
                 "normal": [float(v) for v in panel["normal"]],
@@ -1598,28 +2316,44 @@ def draw_board_card_observation(
     if canvas is None or not observation:
         return
     colour = (0, 165, 255) if observation.get("card_present") else (128, 128, 128)
-    for name in ("left_top_px", "right_top_px", "right_bottom_px", "left_bottom_px"):
-        point = observation.get(name)
-        if point is None:
-            continue
-        cv2.circle(canvas, (int(round(point[0])), int(round(point[1]))), 3, colour, -1)
-    for start, end in (
-        ("left_top_px", "left_bottom_px"),
-        ("right_top_px", "right_bottom_px"),
-        ("left_top_px", "right_top_px"),
-        ("left_bottom_px", "right_bottom_px"),
-    ):
-        a, b = observation.get(start), observation.get(end)
-        if a is None or b is None:
-            continue
-        cv2.line(
-            canvas,
-            (int(round(a[0])), int(round(a[1]))),
-            (int(round(b[0])), int(round(b[1]))),
-            colour,
-            2,
-            cv2.LINE_AA,
-        )
+    quad = observation.get("quad_px")
+    if quad is not None and len(quad) == 4:
+        points = np.rint(np.asarray(quad, dtype=np.float64)).astype(np.int32)
+        cv2.polylines(canvas, [points], True, colour, 2, cv2.LINE_AA)
+    else:
+        for name in (
+            "left_top_px",
+            "right_top_px",
+            "right_bottom_px",
+            "left_bottom_px",
+        ):
+            point = observation.get(name)
+            if point is None:
+                continue
+            cv2.circle(
+                canvas,
+                (int(round(point[0])), int(round(point[1]))),
+                3,
+                colour,
+                -1,
+            )
+        for start, end in (
+            ("left_top_px", "left_bottom_px"),
+            ("right_top_px", "right_bottom_px"),
+            ("left_top_px", "right_top_px"),
+            ("left_bottom_px", "right_bottom_px"),
+        ):
+            a, b = observation.get(start), observation.get(end)
+            if a is None or b is None:
+                continue
+            cv2.line(
+                canvas,
+                (int(round(a[0])), int(round(a[1]))),
+                (int(round(b[0])), int(round(b[1]))),
+                colour,
+                2,
+                cv2.LINE_AA,
+            )
     anchor = observation.get("anchor_px")
     if anchor is not None:
         point = (int(round(anchor[0])), int(round(anchor[1])))
@@ -1638,3 +2372,7 @@ def draw_board_card_observation(
             1,
             cv2.LINE_AA,
         )
+    center = observation.get("center_px")
+    if center is not None:
+        point = (int(round(center[0])), int(round(center[1])))
+        cv2.drawMarker(canvas, point, (255, 255, 0), cv2.MARKER_CROSS, 12, 2)

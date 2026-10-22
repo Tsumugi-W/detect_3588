@@ -97,11 +97,13 @@ panel_apriltag:
   enable: true
 
 # Tag-relative board-card refinement.  T07 supplies a scale-normalised slot
-# frame; the black card's two long edges and endpoints are fitted in colour.
-# Production has only two stable states: `empty` (white base only) and
-# `inserted` (black card fully seated).  Insertion motion is out of scope.
-# The canonical centre uses a fixed site card length, so a clipped bottom does
-# not bias the centre.  `board_card.anchor_position` is the physical top-centre.
+# frame; the black card's full outer silhouette is measured in colour and
+# checked against the panel depth.  Production has only two stable states:
+# `empty` (white base + blue backplane) and `inserted` (black card fully
+# seated).  Insertion motion is out of scope.  No fixed tag-relative card top,
+# length or slot anchor is used: the tag may be mounted with a different offset
+# on another panel.  `position` is the measured outer-card centre (inserted) or
+# the measured blue-backplane slot centre on the panel plane (empty).
 board_card_localizer:
   enable: true
   tag_id: 7
@@ -109,25 +111,50 @@ board_card_localizer:
   roi_x: [-3.5, 3.5]
   roi_y: [1.0, 11.0]
   roi_size: [560, 800]
-  # Central search band, in rectified-ROI fractions.
+  # Broad central band: legacy strip state check and blue-backplane search.
   slot_x: [0.36, 0.64]
   slot_y: [0.16, 0.99]
   dark_v_max: 105
   dark_s_max: 165
   min_visible_rows: 30
-  # Black card body is about 87-133 px wide in the normalised ROI; the empty
-  # slot's blue backplane is narrower.
   min_width_px: 70
   max_width_px: 150
   min_confidence: 0.30
+  # Full outer-card silhouette.  The black body is darker and less saturated
+  # than the blue backplane; nearby fragments split by the card's white label
+  # are merged only when they are also in front of the panel.
+  card_dark_v_max: 70
+  card_dark_s_max: 100
+  card_min_area_px: 5000
+  card_min_width_px: 50
+  card_max_width_px: 260
+  card_candidate_max_width_px: 520
+  card_trim_margin_px: 12
+  card_min_length_px: 180
+  card_min_fill_ratio: 0.45
+  card_merge_gap_px: 28
+  card_merge_min_area_px: 300
+  card_merge_min_height_px: 40
+  card_merge_min_overlap: 0.40
+  card_protrusion_min_m: 0.015
+  card_component_min_protrusion_fraction: 0.45
+  card_min_protrusion_pixels: 500
+  card_outer_min_confidence: 0.35
+  card_outer_min_black_fraction: 0.55
+  # Card-front depth plane; panel plane is fallback only.
+  card_depth_min_points: 80
+  card_depth_max_rms_m: 0.010
+  card_depth_gate_m: 0.08
+  card_plane_inlier_m: 0.006
+  card_plane_min_inliers: 150
   # A fully inserted card extends at least this far down the ROI.  A short
-  # dark blob near the bottom of an empty recess is rejected.
+  # dark blob near the bottom of an empty recess is rejected.  This is a state
+  # gate, not a position prior.
   min_inserted_length_tag: 3.8
   # Reject the empty slot's blue backplane/connector and recess shadow: the
   # black card body must occupy most of the fitted polygon.
   min_black_fraction: 0.50
-  # Robust tag-relative pose lock.  No absolute tag-relative position prior:
-  # the tag may be mounted with a different offset on another panel.
+  # Robust tag-relative pose lock.  No absolute tag-relative position prior.
   pose_lock_frames: 5
   pose_lock_max_mad_tag: 0.30
   plane_depth_gate_m: 0.12
@@ -137,6 +164,8 @@ board_card_localizer:
   slot_blue_s_min: 70
   slot_blue_v_min: 18
   slot_min_blue_area: 300
+  slot_min_blue_height: 80
+  slot_max_blue_width: 180
   # Binary state confirmation.  Insertion motion is ignored.
   inserted_confirm_frames: 3
   empty_confirm_frames: 5
@@ -148,6 +177,7 @@ board_card_localizer:
   panel_plane_min_points: 60
   panel_plane_min_inliers: 600
   panel_z_range_m: [0.15, 1.20]
+  # Fallback only; inserted cards use the measured card-front plane.
   panel_depth_offset_m: 0.0
   plane_hold_frames: 15
   depth_min_m: 0.05
