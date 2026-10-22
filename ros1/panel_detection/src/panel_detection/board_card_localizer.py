@@ -48,20 +48,12 @@ DEFAULT_CONFIG = {
     "max_width_px": 150,
     "min_confidence": 0.30,
     "max_row_gap": 24,
-    "blue_width_px": 58.0,
-    "black_width_px": 105.0,
-    "blue_ratio_threshold": 0.45,
-    "edge_width_ratio": 0.75,
     "plane_depth_gate_m": 0.12,
     # Top-centre is the stable insertion/grasp anchor.  The canonical centre
     # uses the longest reliably observed length so a clipped bottom does not
     # drag the centre towards the camera.
-    "nominal_length_memory": True,
-    "design_width_change_ratio": 0.30,
     "state_inserted_ratio": 0.85,
     "state_pulled_ratio": 0.72,
-    "state_pulled_bottom_roi_ratio": 0.78,
-    "state_wide_width_px": 80.0,
     # Temporal smoothing of the 2D anchor.
     "smooth_alpha": 0.35,
     "max_anchor_jump_px": 35.0,
@@ -610,7 +602,7 @@ def locate_card_strip(
     }
 
 
-def _plane_from_points(points: np.ndarray) -> Optional[dict]:
+def _plane_from_points(points: np.ndarray, cfg: Optional[dict] = None) -> Optional[dict]:
     """RANSAC plane in camera coordinates; n.dot(X) = d."""
 
     if points is None or len(points) < 12:
@@ -619,10 +611,12 @@ def _plane_from_points(points: np.ndarray) -> Optional[dict]:
     points = points[np.isfinite(points).all(axis=1)]
     if len(points) < 12:
         return None
+    threshold = float(_cfg_value(cfg, "plane_inlier_m"))
+    iterations = int(_cfg_value(cfg, "plane_iterations"))
     rng = np.random.default_rng(0)
     best_inliers = None
     best_count = 0
-    for _ in range(80):
+    for _ in range(iterations):
         indices = rng.choice(len(points), 3, replace=False)
         p0, p1, p2 = points[indices]
         normal = np.cross(p1 - p0, p2 - p0)
@@ -632,7 +626,7 @@ def _plane_from_points(points: np.ndarray) -> Optional[dict]:
         normal /= norm
         distance = float(normal @ p0)
         residual = np.abs(points @ normal - distance)
-        inliers = residual < 0.004
+        inliers = residual < threshold
         count = int(inliers.sum())
         if count > best_count:
             best_count = count
@@ -649,7 +643,7 @@ def _plane_from_points(points: np.ndarray) -> Optional[dict]:
     normal /= norm
     distance = float(normal @ centre)
     residual = np.abs(points @ normal - distance)
-    inliers = residual < 0.006
+    inliers = residual < 1.5 * threshold
     if inliers.sum() >= 12:
         selected = points[inliers]
         centre = selected.mean(axis=0)
@@ -705,7 +699,7 @@ def _depth_plane(
     x = (xs[valid].astype(np.float64) - cx) * z / fx
     y = (ys[valid].astype(np.float64) - cy) * z / fy
     points_3d = np.column_stack([x, y, z])
-    return _plane_from_points(points_3d)
+    return _plane_from_points(points_3d, cfg)
 
 
 def _ray_plane(
@@ -892,96 +886,12 @@ class BoardCardLocalizer:
             int(tag_id),
             {
                 "nominal_length_px": None,
-                "design_width_px": None,
                 "anchor_px": None,
                 "axis_px": None,
                 "last_panel_z": None,
                 "missed": 0,
             },
         )
-
-    @staticmethod
-    def _edge_support(gray: np.ndarray, x: float, y0: float, y1: float) -> float:
-        height, width = gray.shape[:2]
-        x0 = max(1, int(round(x)) - 3)
-        x1 = min(width - 1, int(round(x)) + 4)
-        yy0 = max(1, int(round(y0)))
-        yy1 = min(height - 1, int(round(y1)))
-        if x1 - x0 < 3 or yy1 - yy0 < 8:
-            return 0.0
-        gradient = np.abs(
-            cv2.Sobel(gray[yy0:yy1, x0:x1], cv2.CV_32F, 1, 0, ksize=3)
-        )
-        return float(np.median(gradient.max(axis=1)))
-
-    def _correct_strip_width(
-        self, strip: dict, context: dict, design_width: float
-    ) -> None:
-        """Re-anchor a strip whose mask width disagrees with the card prior.
-
-        A shadowed blue card can expose only its dark contact strip, while a
-        loose threshold can also merge one side with the recess shadow.  Test
-        both width-prior hypotheses against the colour gradient and shift the
-        measured geometry onto the better-supported pair.
-        """
-
-        width = float(strip["width_px"])
-        if design_width <= 0 or abs(width - design_width) <= 0.25 * design_width:
-            return
-        left = float(strip["left_top_px"][0])
-        right = float(strip["right_top_px"][0])
-        top_y = float(strip["top_px"][1])
-        bottom_y = float(strip["bottom_px"][1])
-        y0 = top_y + 0.08 * max(1.0, bottom_y - top_y)
-        y1 = top_y + 0.85 * max(1.0, bottom_y - top_y)
-        gray = cv2.cvtColor(context["roi"], cv2.COLOR_BGR2GRAY)
-        image_width = gray.shape[1]
-        left_center = left + 0.5 * design_width
-        right_center = right - 0.5 * design_width
-        if not (5 <= left_center <= image_width - 5):
-            left_center = None
-        if not (5 <= right_center <= image_width - 5):
-            right_center = None
-        score_left = (
-            self._edge_support(gray, left + design_width, y0, y1)
-            if left_center is not None else -1.0
-        )
-        score_right = (
-            self._edge_support(gray, right - design_width, y0, y1)
-            if right_center is not None else -1.0
-        )
-        if max(score_left, score_right) < 6.0:
-            return
-        if score_left >= score_right * 1.10:
-            target_center = left_center
-            source = "left_edge_plus_width"
-        elif score_right >= score_left * 1.10:
-            target_center = right_center
-            source = "right_edge_minus_width"
-        else:
-            return
-        delta = float(target_center) - float(strip["top_px"][0])
-
-        def shift(name):
-            point = strip.get(name)
-            if point is not None:
-                strip[name] = (float(point[0]) + delta, float(point[1]))
-
-        for name in (
-            "top_px", "bottom_px", "visible_center_px",
-            "left_top_px", "right_top_px", "left_bottom_px", "right_bottom_px",
-        ):
-            shift(name)
-        bbox = strip.get("bbox")
-        if bbox is not None:
-            strip["bbox"] = (
-                float(bbox[0]) + delta, float(bbox[1]),
-                float(bbox[2]) + delta, float(bbox[3]),
-            )
-        strip["width_px"] = float(design_width)
-        strip["width_source"] = source
-        strip["edge_prior_delta"] = delta
-        strip["edge_prior_scores"] = (score_left, score_right)
 
     def observe(
         self,
@@ -1061,30 +971,16 @@ class BoardCardLocalizer:
             return _observation_to_image(observation, context, self.cfg)
 
         # Nominal full length is stable in the tag-normalised ROI because the
-        # tag homography removes camera distance.  A width change means a
-        # different card design, so the length memory is reset.
+        # tag homography removes camera distance.  Keep the longest reliable
+        # observation so a clipped bottom cannot shorten the canonical centre.
         nominal = state["nominal_length_px"]
-        design_width = state["design_width_px"]
-        base_width = (
-            float(self.cfg["blue_width_px"])
-            if float(strip.get("blue_ratio", 0.0))
-            >= float(self.cfg["blue_ratio_threshold"])
-            else float(self.cfg["black_width_px"])
-        )
-        if design_width is None or abs(design_width - base_width) > 0.25 * base_width:
-            nominal = None
-            design_width = base_width
-        self._correct_strip_width(strip, context, design_width)
         width = float(strip["width_px"])
-        if design_width is None:
-            design_width = width
         if not strip["clipped"]:
             if nominal is None or strip["visible_length_px"] > nominal:
                 nominal = float(strip["visible_length_px"])
         elif nominal is None:
             nominal = float(strip["visible_length_px"])
         state["nominal_length_px"] = nominal
-        state["design_width_px"] = design_width
         estimated = bool(strip["clipped"])
 
         # Top centre is the physical stable anchor.  Canonical centre uses the
@@ -1119,24 +1015,7 @@ class BoardCardLocalizer:
         center_roi = smooth_top + axis * (float(nominal) * 0.5)
         visible_center = np.asarray(strip["visible_center_px"], dtype=np.float64)
         ratio = float(strip["visible_length_px"]) / max(float(nominal), 1e-6)
-        pulled_by_bottom = False
-        # The narrow blue card body clears the slot bottom when it is pulled
-        # towards the camera.  The wide black handle already extends below the
-        # frame when seated, so this cue is only used for the narrow design.
-        if (
-            float(strip["width_px"]) < float(self.cfg["state_wide_width_px"])
-            and float(strip.get("blue_ratio", 0.0))
-            >= float(self.cfg["blue_ratio_threshold"])
-        ):
-            roi_height = float(context["roi"].shape[0])
-            bottom_ratio = float(strip["bottom_px"][1]) / max(roi_height, 1.0)
-            if bottom_ratio > float(self.cfg["state_pulled_bottom_roi_ratio"]):
-                pulled_by_bottom = True
-        if (
-            strip["clipped"]
-            or ratio < float(self.cfg["state_pulled_ratio"])
-            or pulled_by_bottom
-        ):
+        if strip["clipped"] or ratio < float(self.cfg["state_pulled_ratio"]):
             insertion_state = "pulled"
         elif ratio >= float(self.cfg["state_inserted_ratio"]):
             insertion_state = "inserted"

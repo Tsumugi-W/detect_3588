@@ -122,20 +122,12 @@ board_card_localizer:
   min_width_px: 18
   max_width_px: 150
   min_confidence: 0.30
-  blue_width_px: 58.0
-  black_width_px: 105.0
-  blue_ratio_threshold: 0.45
-  edge_width_ratio: 0.75
   plane_depth_gate_m: 0.12
   # Empty-slot anchor in tag-side units.
   slot_anchor_tag: [0.0, 6.0]
   # Stable centre / state logic.
-  nominal_length_memory: true
-  design_width_change_ratio: 0.30
   state_inserted_ratio: 0.85
   state_pulled_ratio: 0.72
-  state_pulled_bottom_roi_ratio: 0.78
-  state_wide_width_px: 80.0
   smooth_alpha: 0.35
   max_anchor_jump_px: 35.0
   tag_cache_frames: 12
