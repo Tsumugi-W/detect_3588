@@ -123,20 +123,20 @@ board_card_localizer:
   # A fully inserted card extends at least this far down the ROI.  A short
   # dark blob near the bottom of an empty recess is rejected.
   min_inserted_length_tag: 3.8
-  top_tag_y_range: [2.2, 4.4]
   # Reject the empty slot's blue backplane/connector and recess shadow: the
   # black card body must occupy most of the fitted polygon.
   min_black_fraction: 0.50
-  # Fixed full card length for this site (tag-side units).
-  card_length_tag: 7.13
-  # Robust tag-relative pose lock.
-  card_top_tag_prior: [0.23, 3.70]
+  # Robust tag-relative pose lock.  No absolute tag-relative position prior:
+  # the tag may be mounted with a different offset on another panel.
   pose_lock_frames: 5
   pose_lock_max_mad_tag: 0.30
-  pose_lock_prior_gate_tag: 0.80
   plane_depth_gate_m: 0.12
-  # Empty-slot anchor in tag-side units.
-  slot_anchor_tag: [0.0, 6.0]
+  # Empty-slot centre is measured from the blue backplane; no fixed
+  # tag-relative slot anchor is used.
+  slot_blue_h: [80, 138]
+  slot_blue_s_min: 70
+  slot_blue_v_min: 18
+  slot_min_blue_area: 300
   # Binary state confirmation.  Insertion motion is ignored.
   inserted_confirm_frames: 3
   empty_confirm_frames: 5

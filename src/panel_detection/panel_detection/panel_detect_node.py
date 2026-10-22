@@ -1851,6 +1851,14 @@ class PanelDetectionNode(Node):
                     }
                     payload['position_valid'] = True
                     features['refined_position'] = dict(payload['position'])
+                elif observation.get('position') is not None:
+                    # Empty slot: publish the measured slot centre on the
+                    # panel plane, but keep graspable=False.
+                    payload['position'] = {
+                        axis: round(float(value), 5)
+                        for axis, value in zip('xyz', observation['position'])
+                    }
+                    payload['position_valid'] = True
                 else:
                     payload['position'] = None
                     payload['position_valid'] = False

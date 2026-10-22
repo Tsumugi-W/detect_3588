@@ -52,16 +52,11 @@ DEFAULT_CONFIG = {
     "min_confidence": 0.30,
     "max_row_gap": 24,
     "min_inserted_length_tag": 3.8,
-    "top_tag_y_range": (2.2, 4.4),
     "min_black_fraction": 0.50,
-    # Full card length in tag-side units, measured once for the site.  It is
-    # used for the canonical centre even when the bottom edge is clipped.
-    "card_length_tag": 7.13,
-    # Site prior and robust tag-relative pose lock.
-    "card_top_tag_prior": (0.23, 3.70),
+    # Robust tag-relative pose lock.  No absolute tag-relative position prior:
+    # the tag may be mounted with a different offset on another panel.
     "pose_lock_frames": 5,
     "pose_lock_max_mad_tag": 0.30,
-    "pose_lock_prior_gate_tag": 0.80,
     # Binary state confirmation.  Insertion motion is out of scope, so only a
     # stable empty/inserted state is published.
     "inserted_confirm_frames": 3,
@@ -82,8 +77,12 @@ DEFAULT_CONFIG = {
     "smooth_alpha": 0.35,
     "max_anchor_jump_px": 35.0,
     "tag_cache_frames": 12,
-    # Empty-slot anchor in tag-side units (directly below the tag).
-    "slot_anchor_tag": (0.0, 6.0),
+    # Empty-slot centre is measured from the blue backplane; no fixed
+    # tag-relative slot anchor is used.
+    "slot_blue_h": (80, 138),
+    "slot_blue_s_min": 70,
+    "slot_blue_v_min": 18,
+    "slot_min_blue_area": 300,
     # Depth / plane fitting.
     "depth_min_m": 0.05,
     "depth_max_m": 2.0,
@@ -629,6 +628,53 @@ def locate_card_strip(
     }
 
 
+def _measure_slot_anchor(
+    roi: np.ndarray,
+    valid: Optional[np.ndarray],
+    context: dict,
+    cfg: Optional[dict] = None,
+) -> Optional[dict]:
+    """Find the empty slot centre from its blue backplane/connector."""
+
+    if roi is None or roi.size == 0:
+        return None
+    height, width = roi.shape[:2]
+    if valid is None:
+        valid = np.ones((height, width), dtype=bool)
+    else:
+        valid = np.asarray(valid, dtype=bool)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = cv2.split(hsv)
+    h_min, h_max = (int(v) for v in _cfg_value(cfg, "slot_blue_h"))
+    mask = (
+        (hue >= h_min)
+        & (hue <= h_max)
+        & (saturation > int(_cfg_value(cfg, "slot_blue_s_min")))
+        & (value > int(_cfg_value(cfg, "slot_blue_v_min")))
+        & valid
+    ).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
+    if count <= 1:
+        return None
+    best = max(
+        range(1, count),
+        key=lambda index: int(stats[index, cv2.CC_STAT_AREA]),
+    )
+    area = int(stats[best, cv2.CC_STAT_AREA])
+    if area < int(_cfg_value(cfg, "slot_min_blue_area")):
+        return None
+    centre = centroids[best]
+    anchor_roi = (float(centre[0]), float(centre[1]))
+    anchor_tag = _roi_point_to_tag(anchor_roi, context)
+    return {
+        "roi": anchor_roi,
+        "tag": anchor_tag,
+        "area": area,
+    }
+
+
 def _plane_from_points(points: np.ndarray, cfg: Optional[dict] = None) -> Optional[dict]:
     """RANSAC plane in camera coordinates; n.dot(X) = d."""
 
@@ -1109,20 +1155,16 @@ class BoardCardLocalizer:
         roi_height = context["roi"].shape[0]
         roi_y0, roi_y1 = (float(v) for v in self.cfg["roi_y"])
         tag_y_span = max(roi_y1 - roi_y0, 1e-6)
-        nominal = float(self.cfg["card_length_tag"]) * roi_height / tag_y_span
+        # No fixed card length: report the length actually measured this frame.
+        nominal = float(strip["visible_length_px"]) if strip is not None else 0.0
 
-        top_tag_y = None
         visible_length_tag = 0.0
         if strip is not None:
-            top_tag_y = roi_y0 + (float(strip["top_px"][1]) / roi_height) * tag_y_span
             visible_length_tag = float(strip["visible_length_px"]) * tag_y_span / roi_height
 
-        y_min, y_max = (float(v) for v in self.cfg["top_tag_y_range"])
         inserted_measurement = bool(
             strip is not None
             and strip["confidence"] >= float(self.cfg["min_confidence"])
-            and top_tag_y is not None
-            and y_min <= top_tag_y <= y_max
             and visible_length_tag >= float(self.cfg["min_inserted_length_tag"])
             and float(strip.get("black_fraction", 0.0))
             >= float(self.cfg["min_black_fraction"])
@@ -1196,8 +1238,14 @@ class BoardCardLocalizer:
             return _observation_to_image(observation, context, self.cfg)
 
         if stable_state == "empty":
-            anchor_roi = _tag_roi_point(
-                self.cfg["slot_anchor_tag"], context, self.cfg
+            slot_measure = _measure_slot_anchor(
+                context["roi"], context["valid"], context, self.cfg
+            )
+            anchor_roi = (
+                slot_measure["roi"] if slot_measure is not None else None
+            )
+            slot_tag = (
+                slot_measure["tag"] if slot_measure is not None else None
             )
             observation = {
                 "tag_id": tag_id,
@@ -1207,7 +1255,7 @@ class BoardCardLocalizer:
                 "stable": True,
                 "state_confidence": state_confidence,
                 "state_frames": int(state["candidate_count"]),
-                "anchor_source": "slot",
+                "anchor_source": "slot_blue" if anchor_roi is not None else "none",
                 "anchor_px": anchor_roi,
                 "center_px": None,
                 "top_px": None,
@@ -1225,8 +1273,9 @@ class BoardCardLocalizer:
                 "length_estimated": False,
                 "clipped": False,
                 "confidence": 0.0,
-                "source": "tag_slot_prior",
+                "source": "tag_slot_blue" if anchor_roi is not None else "tag_slot_unmeasured",
                 "slot_px": anchor_roi,
+                "slot_tag": slot_tag,
                 "position": None,
                 "slot_position": None,
                 "anchor_position": None,
@@ -1236,7 +1285,7 @@ class BoardCardLocalizer:
                 "plane_rms_m": None,
                 "depth_source": None,
             }
-            if camera_matrix is not None:
+            if camera_matrix is not None and anchor_roi is not None:
                 anchor_img = _to_image(anchor_roi, context["roi_to_image"])
                 slot_xyz = None
                 if panel is not None:
@@ -1260,6 +1309,11 @@ class BoardCardLocalizer:
                     observation["slot_position"] = tuple(
                         float(v) for v in slot_xyz
                     )
+                    # Empty state: the published position is the measured slot
+                    # centre on the panel plane, not a card position.
+                    observation["position"] = observation["slot_position"]
+                    observation["anchor_position"] = observation["slot_position"]
+                    observation["center_px"] = anchor_roi
             observation["plane"] = (
                 {
                     "normal": [float(v) for v in panel["normal"]],
@@ -1306,13 +1360,10 @@ class BoardCardLocalizer:
         if axis_tag is not None and axis_tag[1] < 0:
             axis_tag = -axis_tag
 
-        prior_top = np.asarray(self.cfg["card_top_tag_prior"], dtype=np.float64)
         pose_ok = bool(
             top_tag is not None
             and axis_tag is not None
             and float(strip["confidence"]) >= 0.45
-            and np.linalg.norm(np.asarray(top_tag) - prior_top)
-            <= float(self.cfg["pose_lock_prior_gate_tag"])
             and float(axis_tag[1]) > 0.7
         )
         if pose_ok:
@@ -1334,11 +1385,7 @@ class BoardCardLocalizer:
             spread = float(
                 np.median(np.linalg.norm(tops - top_med, axis=1))
             )
-            if (
-                spread <= float(self.cfg["pose_lock_max_mad_tag"])
-                and np.linalg.norm(top_med - prior_top)
-                <= float(self.cfg["pose_lock_prior_gate_tag"])
-            ):
+            if spread <= float(self.cfg["pose_lock_max_mad_tag"]):
                 state["pose_top_tag"] = tuple(float(v) for v in top_med)
                 state["pose_axis_tag"] = tuple(float(v) for v in axis_med)
                 state["pose_width_tag"] = float(np.median(widths))
@@ -1347,35 +1394,9 @@ class BoardCardLocalizer:
 
         if state["pose_locked"]:
             top_use = np.asarray(state["pose_top_tag"], dtype=np.float64)
-            axis = np.asarray(state["pose_axis_tag"], dtype=np.float64)
-            width_use = float(state["pose_width_tag"])
-            center_tag_use = top_use + axis * (float(self.cfg["card_length_tag"]) * 0.5)
             anchor_roi = _tag_roi_point(top_use, context, self.cfg)
-            center_roi = _tag_roi_point(center_tag_use, context, self.cfg)
-            axis_end_roi = _tag_roi_point(top_use + axis, context, self.cfg)
-            axis_vec = np.asarray(axis_end_roi) - np.asarray(anchor_roi)
-            norm = float(np.linalg.norm(axis_vec))
-            axis_px_use = axis_vec / norm if norm > 1e-9 else (0.0, 1.0)
-            half = 0.5 * width_use
-            perp = np.array([-axis[1], axis[0]], dtype=np.float64)
-            corners = [
-                top_use - perp * half,
-                top_use + perp * half,
-                center_tag_use + axis * (self.cfg["card_length_tag"] * 0.5) + perp * half,
-                center_tag_use + axis * (self.cfg["card_length_tag"] * 0.5) - perp * half,
-            ]
-            corners_roi = np.asarray(
-                [_tag_roi_point(p, context, self.cfg) for p in corners],
-                dtype=np.float64,
-            )
-            bbox = (
-                float(corners_roi[:, 0].min()),
-                float(corners_roi[:, 1].min()),
-                float(corners_roi[:, 0].max()),
-                float(corners_roi[:, 1].max()),
-            )
             top_px_use = anchor_roi
-            width_px_use = width_use * sx
+            axis_px_use = axis_roi_meas
             pose_locked = True
         else:
             previous_anchor = state.get("anchor_px")
@@ -1403,15 +1424,18 @@ class BoardCardLocalizer:
             state["anchor_px"] = tuple(float(v) for v in smooth_top)
             state["axis_px"] = tuple(float(v) for v in axis_roi_meas)
             anchor_roi = tuple(float(v) for v in smooth_top)
-            center_roi = (
-                float(smooth_top[0] + axis_roi_meas[0] * nominal * 0.5),
-                float(smooth_top[1] + axis_roi_meas[1] * nominal * 0.5),
-            )
             top_px_use = tuple(float(v) for v in top_roi)
             axis_px_use = tuple(float(v) for v in axis_roi_meas)
-            width_px_use = float(strip["width_px"])
-            bbox = strip["bbox"]
             pose_locked = False
+
+        # Position is the measured centre of the card's outer box, not a
+        # top-centre plus a fixed nominal length.
+        bbox = strip["bbox"]
+        center_roi = (
+            float((bbox[0] + bbox[2]) * 0.5),
+            float((bbox[1] + bbox[3]) * 0.5),
+        )
+        width_px_use = float(strip["width_px"])
 
         visible_center = np.asarray(strip["visible_center_px"], dtype=np.float64)
         observation = dict(strip)

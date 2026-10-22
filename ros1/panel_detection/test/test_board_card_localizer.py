@@ -81,7 +81,7 @@ class BoardCardStripTest(unittest.TestCase):
 
 
 class BoardCardLocalizerTest(unittest.TestCase):
-    def test_inserted_uses_fixed_card_length(self):
+    def test_inserted_center_is_measured_bbox_center(self):
         localizer = BoardCardLocalizer({"min_confidence": 0.1})
         marker = _Marker()
 
@@ -97,10 +97,10 @@ class BoardCardLocalizerTest(unittest.TestCase):
             self.assertIsNotNone(first)
             self.assertEqual(first["insertion_state"], "inserted")
             self.assertFalse(first["clipped"])
-            self.assertAlmostEqual(first["center_px"][1], 485.2, delta=2.0)
+            self.assertAlmostEqual(first["center_px"][1], 400.0, delta=2.0)
 
-            # Fully inserted card whose bottom is clipped by the image edge:
-            # still inserted, and the canonical centre stays fixed.
+            # A clipped bottom changes the measured visible centre; no fixed
+            # card length or tag-relative centre prior is applied.
             clipped, clipped_valid = _image(y1=520, valid_bottom=520)
             context = _context(clipped, clipped_valid)
             second = localizer.observe(clipped, marker=marker)
@@ -108,10 +108,7 @@ class BoardCardLocalizerTest(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertTrue(second["clipped"])
         self.assertFalse(second["length_estimated"])
-        self.assertAlmostEqual(second["center_px"][1], 485.2, delta=2.0)
-        self.assertAlmostEqual(
-            second["center_px"][1], first["center_px"][1], delta=2.0
-        )
+        self.assertAlmostEqual(second["center_px"][1], 360.0, delta=2.0)
         self.assertEqual(second["insertion_state"], "inserted")
 
     def test_empty_slot_requires_confirmation(self):
@@ -130,8 +127,36 @@ class BoardCardLocalizerTest(unittest.TestCase):
         self.assertEqual(states[4], "empty")
         self.assertFalse(observation["card_present"])
         self.assertIsNone(observation["position"])
-        self.assertIsNotNone(observation["slot_px"])
+        self.assertIsNone(observation["slot_px"])
+        self.assertIsNone(observation["slot_position"])
         self.assertTrue(observation["stable"])
+
+    def test_empty_slot_uses_blue_backplane(self):
+        image = np.full((800, 560, 3), 225, dtype=np.uint8)
+        cv2.rectangle(image, (250, 250), (330, 350), (120, 60, 20), -1)
+        valid = np.ones((800, 560), dtype=bool)
+        context = _context(image, valid)
+        depth = np.full((800, 560), 500, dtype=np.uint16)
+        intrinsics = {
+            "K": [500.0, 0.0, 280.0, 0.0, 500.0, 400.0, 0.0, 0.0, 1.0]
+        }
+        localizer = BoardCardLocalizer({"min_confidence": 0.1})
+        with patch(
+            "panel_detection.board_card_localizer.rectify_board_card_roi",
+            side_effect=lambda *args, **kwargs: context,
+        ):
+            for _ in range(5):
+                observation = localizer.observe(
+                    image, depth=depth, camera_info=intrinsics, marker=_Marker()
+                )
+        self.assertEqual(observation["insertion_state"], "empty")
+        self.assertFalse(observation["card_present"])
+        self.assertIsNotNone(observation["slot_px"])
+        self.assertAlmostEqual(observation["slot_px"][0], 290.0, delta=5.0)
+        self.assertAlmostEqual(observation["slot_px"][1], 300.0, delta=5.0)
+        self.assertIsNotNone(observation["position"])
+        self.assertEqual(observation["position"], observation["slot_position"])
+        self.assertAlmostEqual(observation["position"][2], 0.5, delta=0.01)
 
     def test_short_dark_blob_is_empty(self):
         image, valid = _image(y0=650, y1=750)

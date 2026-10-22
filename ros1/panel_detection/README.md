@@ -81,23 +81,26 @@ drives the state machine and the geometry.
 
 The node warps a fixed tag-relative slot ROI, builds a low-saturation black
 mask, and fits the card's long colour edges.  A frame is `inserted` only when
-the black body passes the tag-relative top/length gates, the black-body
-fraction, and the width gate.  The empty slot's blue backplane, white walls and
-recess shadow are therefore classified as `empty`, not as a card.
+the black body passes the measured length, black-body fraction and width gates.
+The empty slot's blue backplane, white walls and recess shadow are therefore
+classified as `empty`, not as a card.
 
 Production has only two stable states:
 
-- `empty`: `card_present=false`, `position=null`, `slot_position` is a slot
-  reference only;
-- `inserted`: `card_present=true`, `position` is the canonical card centre.
+- `empty`: `card_present=false`; `position` is the measured blue-backplane
+  slot centre on the panel plane, and `graspable=false`;
+- `inserted`: `card_present=true`; `position` is the measured centre of the
+  card's outer box.
 
 There is no `pulled`/`transition` state; insertion motion is out of scope.
 
 After `inserted` is confirmed, the localizer locks the robust median
 tag-relative `top_tag`/`axis_tag` pose.  The per-frame colour edges are used
 only for state confirmation and to feed the lock, never as the published
-centre.  The canonical centre uses the fixed site length
-(`card_length_tag`), so a clipped bottom cannot bias it.
+centre.  There is **no fixed tag-relative top/slot anchor and no fixed card
+length prior**: the tag may be mounted at a different offset on another panel.
+The empty-slot centre is measured from the blue backplane; the inserted centre
+is the measured outer-box centre.
 
 3D uses the **panel plane** around T07 plus a fixed card-thickness offset, not
 the black card's own depth (which is often a depth hole).  When T07 is
