@@ -74,24 +74,46 @@ can still rotate ID4 using its configured fallback direction.
 
 ## Board-card localization
 
-`board_card` uses the board-card Tag (T07 on `validation_site`) as a stable,
-scale-normalised frame. The node warps a fixed tag-relative slot ROI, fits the
-card's two long **colour** edges and its top/bottom endpoints inside that ROI,
-and uses depth only for the card plane and 3D projection. Depth edges are not
-used to fit the 2D card boundary.
+The detector class `board_card` is intentionally trained on **both** an empty
+slot and a fully inserted black card.  It only localises the slot region; it is
+not the state source.  T07 (or the configured `board_card_localizer.tag_id`)
+drives the state machine and the geometry.
 
-The published `position` is the canonical card centre: the stable top-centre
-plus half of the longest reliably observed card length. A clipped/occluded
-bottom therefore cannot drag the centre upward. `board_card.anchor_position`
-is the physical top-centre anchor (the best point for insertion/grasp), and
-`board_card.top_px` / `bottom_px` / `center_px` expose the image geometry.
-`insertion_state` is `inserted`, `pulled`, `empty`, or `transition`;
-`clipped` and `length_estimated` state whether the observed end is complete.
+The node warps a fixed tag-relative slot ROI, builds a low-saturation black
+mask, and fits the card's long colour edges.  A frame is `inserted` only when
+the black body passes the tag-relative top/length gates, the black-body
+fraction, and the width gate.  The empty slot's blue backplane, white walls and
+recess shadow are therefore classified as `empty`, not as a card.
+
+Production has only two stable states:
+
+- `empty`: `card_present=false`, `position=null`, `slot_position` is a slot
+  reference only;
+- `inserted`: `card_present=true`, `position` is the canonical card centre.
+
+There is no `pulled`/`transition` state; insertion motion is out of scope.
+
+After `inserted` is confirmed, the localizer locks the robust median
+tag-relative `top_tag`/`axis_tag` pose.  The per-frame colour edges are used
+only for state confirmation and to feed the lock, never as the published
+centre.  The canonical centre uses the fixed site length
+(`card_length_tag`), so a clipped bottom cannot bias it.
+
+3D uses the **panel plane** around T07 plus a fixed card-thickness offset, not
+the black card's own depth (which is often a depth hole).  When T07 is
+stationary for several frames, the final camera-frame 3D position is locked to
+a median and stops publishing residual depth/tag jitter; camera motion unlocks
+it again.
+
+`board_card` payload exposes `state`, `stable`, `pose_locked`, `position_stable`,
+`anchor_px`, `center_px`, `slot_px`, `anchor_position`, `position`,
+`slot_position`, `panel_plane_rms_m` and `depth_source`.  `insertion_state` is
+kept as a one-release compatibility alias.
 
 Configuration lives under `board_card_localizer:` in
-`config/panel_detection.yaml`. The default slot ROI is
+`config/panel_detection.yaml`.  The default slot ROI is
 `x=[-3.5,3.5]`, `y=[1,11]` tag-side units and assumes a 20 mm tag; all pixel
-gates scale with that ROI. Set `enable: false` to fall back to the YOLO box.
+gates scale with that ROI.  Set `enable: false` to fall back to the YOLO box.
 
 ## Model
 

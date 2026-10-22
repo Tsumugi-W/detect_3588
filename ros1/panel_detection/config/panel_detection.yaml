@@ -97,14 +97,14 @@ panel_apriltag:
   enable: true
 
 # Tag-relative board-card refinement.  T07 supplies a scale-normalised slot
-# frame; the card's two long edges and endpoints are fitted in colour, and
-# depth is used only to fit the card plane and to produce 3D points.  The
-# published `position` is the canonical card centre: the stable top-centre
-# plus half of the longest reliably observed card length, so a clipped bottom
-# cannot drag the centre upward.  `board_card.anchor_position` is the physical
-# top-centre anchor (best for insertion/grasp).
+# frame; the black card's two long edges and endpoints are fitted in colour.
+# Production has only two stable states: `empty` (white base only) and
+# `inserted` (black card fully seated).  Insertion motion is out of scope.
+# The canonical centre uses a fixed site card length, so a clipped bottom does
+# not bias the centre.  `board_card.anchor_position` is the physical top-centre.
 board_card_localizer:
   enable: true
+  tag_id: 7
   # Fixed tag-relative ROI: x right, y down, one unit = one tag side.
   roi_x: [-3.5, 3.5]
   roi_y: [1.0, 11.0]
@@ -112,29 +112,51 @@ board_card_localizer:
   # Central search band, in rectified-ROI fractions.
   slot_x: [0.36, 0.64]
   slot_y: [0.16, 0.99]
-  max_top_ratio: 0.45
   dark_v_max: 105
   dark_s_max: 165
-  blue_h: [80, 138]
-  blue_s_min: 70
-  blue_v_min: 18
   min_visible_rows: 30
-  min_width_px: 18
+  # Black card body is about 87-133 px wide in the normalised ROI; the empty
+  # slot's blue backplane is narrower.
+  min_width_px: 70
   max_width_px: 150
   min_confidence: 0.30
+  # A fully inserted card extends at least this far down the ROI.  A short
+  # dark blob near the bottom of an empty recess is rejected.
+  min_inserted_length_tag: 3.8
+  top_tag_y_range: [2.2, 4.4]
+  # Reject the empty slot's blue backplane/connector and recess shadow: the
+  # black card body must occupy most of the fitted polygon.
+  min_black_fraction: 0.50
+  # Fixed full card length for this site (tag-side units).
+  card_length_tag: 7.13
+  # Robust tag-relative pose lock.
+  card_top_tag_prior: [0.23, 3.70]
+  pose_lock_frames: 5
+  pose_lock_max_mad_tag: 0.20
+  pose_lock_prior_gate_tag: 0.80
   plane_depth_gate_m: 0.12
   # Empty-slot anchor in tag-side units.
   slot_anchor_tag: [0.0, 6.0]
-  # Stable centre / state logic.
-  state_inserted_ratio: 0.85
-  state_pulled_ratio: 0.72
+  # Binary state confirmation.  Insertion motion is ignored.
+  inserted_confirm_frames: 3
+  empty_confirm_frames: 5
   smooth_alpha: 0.35
   max_anchor_jump_px: 35.0
   tag_cache_frames: 12
-  # Depth plane fit (metres).
+  # Panel plane fit around T07 (metres).
+  panel_plane_radius_tag: 1.2
+  panel_plane_min_points: 60
+  panel_plane_min_inliers: 600
+  panel_z_range_m: [0.15, 1.20]
+  panel_depth_offset_m: 0.0
+  plane_hold_frames: 15
   depth_min_m: 0.05
   depth_max_m: 2.0
   plane_inlier_m: 0.004
   plane_iterations: 80
   plane_min_points: 40
+  # Final stillness-gated 3D position lock.
+  still_frames: 5
+  still_pixel_thresh: 2.0
+  still_window: 15
 
