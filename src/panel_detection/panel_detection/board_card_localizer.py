@@ -60,7 +60,7 @@ DEFAULT_CONFIG = {
     # Site prior and robust tag-relative pose lock.
     "card_top_tag_prior": (0.23, 3.70),
     "pose_lock_frames": 5,
-    "pose_lock_max_mad_tag": 0.20,
+    "pose_lock_max_mad_tag": 0.30,
     "pose_lock_prior_gate_tag": 0.80,
     # Binary state confirmation.  Insertion motion is out of scope, so only a
     # stable empty/inserted state is published.
