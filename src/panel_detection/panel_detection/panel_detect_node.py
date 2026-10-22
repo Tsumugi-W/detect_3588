@@ -184,13 +184,26 @@ def _board_card_observation_summary(observation):
 
     return {
         'card_present': bool(observation.get('card_present')),
+        'state': observation.get('state', observation.get('insertion_state', 'unknown')),
         'insertion_state': observation.get('insertion_state', 'unknown'),
+        'stable': bool(observation.get('stable', False)),
+        'graspable': bool(observation.get('card_present')),
+        'pose_locked': bool(observation.get('pose_locked', False)),
+        'pose_samples': int(observation.get('pose_samples', 0)),
+        'pose_spread_tag': (round(float(observation['pose_spread_tag']), 4)
+                            if observation.get('pose_spread_tag') is not None
+                            else None),
+        'position_stable': bool(observation.get('position_stable', False)),
         'anchor_source': observation.get('anchor_source'),
         'anchor_px': point(observation.get('anchor_px')),
         'top_px': point(observation.get('top_px')),
         'bottom_px': point(observation.get('bottom_px')),
         'center_px': point(observation.get('center_px')),
         'axis_px': point(observation.get('axis_px')),
+        'slot_px': point(observation.get('slot_px')),
+        'slot_position': ({axis: round(float(value), 5)
+                           for axis, value in zip('xyz', observation['slot_position'])}
+                          if observation.get('slot_position') is not None else None),
         'width_px': (round(float(observation['width_px']), 2)
                      if observation.get('width_px') is not None else None),
         'visible_length_px': round(
@@ -204,6 +217,9 @@ def _board_card_observation_summary(observation):
         'depth_source': observation.get('depth_source'),
         'plane_rms_m': (round(float(observation['plane_rms_m']), 5)
                         if observation.get('plane_rms_m') is not None else None),
+        'panel_plane_rms_m': (
+            round(float(observation['panel_plane_rms_m']), 5)
+            if observation.get('panel_plane_rms_m') is not None else None),
     }
 
 
@@ -1765,7 +1781,8 @@ class PanelDetectionNode(Node):
             self._publish_status('no_detection')
 
     def _publish_board_cards(self, detections, assignments, depth_image,
-                             intrin, stamp, color_image=None, canvas=None):
+                             intrin, stamp, color_image=None, canvas=None,
+                             panel_tag_markers=None):
         if self._board_cards_pub is None:
             return {}
         normal_valid = self._panel_normal_cache is not None
@@ -1773,27 +1790,50 @@ class PanelDetectionNode(Node):
                 if normal_valid else None)
         targets = []
         details = {}
+        board_tag_id = 7
+        state_observation = None
+        if self._board_card_localizer is not None and color_image is not None:
+            board_tag_id = int(self._board_card_localizer.cfg.get('tag_id', 7))
+            marker = next(
+                (item for item in (panel_tag_markers or [])
+                 if int(item.tag_id) == board_tag_id),
+                None,
+            )
+            # T07 drives state even when YOLO missed the slot.  Both empty and
+            # inserted slots are trained as board_card, so detection presence
+            # must not gate the localizer.
+            state_observation = self._board_card_localizer.observe(
+                color_image, depth_image, intrin,
+                marker=marker, tag_id=board_tag_id)
         for index, detection in enumerate(detections):
             if detection.class_name != 'board_card':
                 continue
-            observation = None
+            observation = state_observation
             assignment = assignments.get(index)
-            if self._board_card_localizer is not None and color_image is not None:
-                observation = self._board_card_localizer.observe(
-                    color_image,
-                    depth_image,
-                    intrin,
-                    marker=(assignment.marker if assignment is not None else None),
-                    tag_id=(assignment.tag_id if assignment is not None else None),
-                )
-            if observation is not None and observation.get('card_present'):
-                if observation.get('bbox'):
-                    detection.bbox = tuple(observation['bbox'])
+            if (observation is None or assignment is None or
+                    int(assignment.tag_id) != board_tag_id):
+                if self._board_card_localizer is not None and color_image is not None:
+                    observation = self._board_card_localizer.observe(
+                        color_image,
+                        depth_image,
+                        intrin,
+                        marker=(assignment.marker if assignment is not None else None),
+                        tag_id=(assignment.tag_id if assignment is not None else None),
+                    )
+            inserted = bool(
+                observation is not None and
+                observation.get('state') == 'inserted' and
+                observation.get('position') is not None
+            )
+            if inserted and observation.get('bbox'):
+                detection.bbox = tuple(observation['bbox'])
                 detection.center_x, detection.center_y = observation['anchor_px']
             _, _, xyz = _estimate_detection_point(
                 detection, depth_image, intrin, self._depth_scale)
-            if observation is not None and observation.get('position') is not None:
+            if inserted:
                 xyz = np.asarray(observation['position'], dtype=np.float64)
+            else:
+                xyz = None
             features = detect_board_features(
                 color_image, detection.bbox, self.cfg.get('board_features', {}))
             add_board_feature_depth(features, depth_image, intrin, self._depth_scale)
@@ -1803,19 +1843,53 @@ class PanelDetectionNode(Node):
                 summary = _board_card_observation_summary(observation)
                 features['board_card'] = summary
                 payload['board_card'] = summary
-                if observation.get('position') is not None:
+                payload['graspable'] = inserted
+                if inserted:
                     payload['position'] = {
-                        axis: round(float(value), 4)
+                        axis: round(float(value), 5)
                         for axis, value in zip('xyz', observation['position'])
                     }
                     payload['position_valid'] = True
                     features['refined_position'] = dict(payload['position'])
+                else:
+                    payload['position'] = None
+                    payload['position_valid'] = False
+            else:
+                payload['graspable'] = False
             payload.update(features)
             targets.append(payload)
             details[id(detection)] = features
             if canvas is not None:
                 draw_board_features(canvas, features, detection.bbox)
                 draw_board_card_observation(canvas, observation)
+        if state_observation is not None:
+            details['__t07__'] = state_observation
+        if (state_observation is not None and
+                state_observation.get('stable') and
+                state_observation.get('state') in ('empty', 'inserted') and
+                not any(item.get('class') == 'board_card' for item in targets)):
+            state_tag_id = int(state_observation.get('tag_id', board_tag_id))
+            position = state_observation.get('position')
+            summary = _board_card_observation_summary(state_observation)
+            targets.append({
+                'id': state_tag_id,
+                'class': 'board_card',
+                'tag_id': state_tag_id,
+                'classification_source': 't07_localizer',
+                'position': (
+                    {axis: round(float(value), 5)
+                     for axis, value in zip('xyz', position)}
+                    if position is not None else None),
+                'orientation': (
+                    {'x': quat[0], 'y': quat[1],
+                     'z': quat[2], 'w': quat[3]}
+                    if quat is not None else None),
+                'confidence': round(
+                    float(state_observation.get('state_confidence', 0.0)), 3),
+                'position_valid': position is not None,
+                'graspable': state_observation.get('state') == 'inserted',
+                'board_card': summary,
+            })
         msg = String()
         msg.data = json.dumps({
             'stamp': stamp.sec + stamp.nanosec * 1e-9,
@@ -2040,13 +2114,53 @@ class PanelDetectionNode(Node):
             ]
         active_xyxy_list = [det.bbox for det in frame_detections]
         if not frame_detections:
-            self._publish_board_cards([], {}, filtered_depth, deproj_intrin, stamp)
+            details = self._publish_board_cards(
+                [], {}, filtered_depth, deproj_intrin, stamp,
+                color_image, canvas, panel_tag_markers=panel_tag_markers)
             if self._panel_tags_enabled:
                 self._panel_tag_tracker.update([], panel_tag_markers)
                 draw_panel_tag_assignments(
                     canvas, panel_tag_markers, {}, [])
+            state_observation = (details.get('__t07__')
+                                 if isinstance(details, dict) else None)
+            published_state = False
+            if (state_observation is not None and
+                    state_observation.get('stable') and
+                    state_observation.get('state') in ('empty', 'inserted')):
+                state_tag_id = int(state_observation.get('tag_id', 7))
+                position = state_observation.get('position')
+                target = {
+                    'id': state_tag_id,
+                    'class': 'board_card',
+                    'tag_id': state_tag_id,
+                    'classification_source': 't07_localizer',
+                    'position': (
+                        {axis: round(float(value), 5)
+                         for axis, value in zip('xyz', position)}
+                        if position is not None else None),
+                    'orientation': (
+                        {'x': quat[0], 'y': quat[1],
+                         'z': quat[2], 'w': quat[3]}
+                        if quat is not None else None),
+                    'confidence': round(
+                        float(state_observation.get('state_confidence', 0.0)), 3),
+                    'position_valid': position is not None,
+                    'graspable': state_observation.get('state') == 'inserted',
+                    'board_card': _board_card_observation_summary(state_observation),
+                }
+                if self._targets_pub is not None:
+                    msg = String()
+                    msg.data = json.dumps({
+                        'stamp': stamp.sec + stamp.nanosec * 1e-9,
+                        'frame_id': (self._topic_color_frame_id
+                                     if self._use_topic else
+                                     'camera_color_optical_frame'),
+                        'targets': [target],
+                    }, ensure_ascii=False)
+                    self._targets_pub.publish(msg)
+                published_state = True
             self._update_display_frame(canvas, color_stamp)
-            self._publish_status('no_detection')
+            self._publish_status('registered' if published_state else 'no_detection')
             return
 
         panel_tag_assignments = {}
@@ -2069,7 +2183,8 @@ class PanelDetectionNode(Node):
 
         board_feature_details = self._publish_board_cards(
             frame_detections, panel_tag_assignments, filtered_depth,
-            deproj_intrin, stamp, color_image, canvas)
+            deproj_intrin, stamp, color_image, canvas,
+            panel_tag_markers=panel_tag_markers)
 
         nut_localizations = {}
         for i, det in enumerate(frame_detections):
@@ -2248,6 +2363,11 @@ class PanelDetectionNode(Node):
         position_measurements = []
 
         for target_id, det in matched:
+            if det.class_name == 'board_card':
+                board_summary = board_feature_details.get(
+                    id(det), {}).get('board_card', {})
+                if board_summary.get('state') != 'inserted':
+                    continue
             ux, uy, xyz = _estimate_detection_point(
                 det, filtered_depth, deproj_intrin, self._depth_scale,
                 knob_quantile=self._knob_depth_quantile,
@@ -2265,6 +2385,11 @@ class PanelDetectionNode(Node):
         for target_id, det in matched:
             xyz = stable_xyz.get(target_id, matched_xyz[target_id])
             matched_xyz[target_id] = xyz
+            if det.class_name == 'board_card':
+                board_summary = board_feature_details.get(
+                    id(det), {}).get('board_card', {})
+                if board_summary.get('state') != 'inserted':
+                    continue
             if det.class_name == 'board_card' and not _valid_point_3d(xyz):
                 continue
             tag_assignment = tag_assignment_by_detection.get(id(det))
@@ -2297,6 +2422,55 @@ class PanelDetectionNode(Node):
 
             # 兼容旧话题
             _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
+
+        # Publish exactly one board-card state target per frame.  The T07
+        # observation is available even when YOLO missed the slot; empty slots
+        # carry position=None and are not graspable.
+        state_observation = (board_feature_details.get('__t07__')
+                             if isinstance(board_feature_details, dict) else None)
+        if (state_observation is not None and
+                state_observation.get('stable') and
+                state_observation.get('state') in ('empty', 'inserted')):
+            state_tag_id = int(state_observation.get('tag_id', 7))
+            summary = _board_card_observation_summary(state_observation)
+            existing = next(
+                (item for item in targets_output
+                 if item.get('class') == 'board_card' and
+                 (item.get('tag_id') == state_tag_id or
+                  item.get('id') == state_tag_id)),
+                None,
+            )
+            if existing is None:
+                position = state_observation.get('position')
+                target_info = {
+                    'id': state_tag_id,
+                    'class': 'board_card',
+                    'tag_id': state_tag_id,
+                    'classification_source': 't07_localizer',
+                    'position': (
+                        {axis: round(float(value), 5)
+                         for axis, value in zip('xyz', position)}
+                        if position is not None else None),
+                    'orientation': (
+                        {'x': quat[0], 'y': quat[1],
+                         'z': quat[2], 'w': quat[3]}
+                        if quat is not None else None),
+                    'confidence': round(
+                        float(state_observation.get('state_confidence', 0.0)), 3),
+                    'position_valid': position is not None,
+                    'graspable': state_observation.get('state') == 'inserted',
+                    'board_card': summary,
+                }
+                targets_output.append(target_info)
+            else:
+                existing['id'] = state_tag_id
+                existing['tag_id'] = state_tag_id
+                existing['board_card'] = summary
+                existing['graspable'] = (
+                    state_observation.get('state') == 'inserted')
+                if state_observation.get('state') == 'empty':
+                    existing['position'] = None
+                    existing['position_valid'] = False
 
         # Angle is a visual observation and must not disappear merely because
         # a Tag is outside the view. Keep the legacy numbered topic unchanged.
