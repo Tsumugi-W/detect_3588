@@ -3237,10 +3237,15 @@ class PanelDetectionNode(Node):
                         (ux - 10, uy - 15), 0, 0.6,
                         (0, 255, 0), 2, cv2.LINE_AA)
 
-            xyz = matched_xyz[target_id]
-            cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
-                        (ux + 10, uy + 5), 0, 0.4,
-                        (225, 255, 255), 1, cv2.LINE_AA)
+            xyz = matched_xyz.get(target_id)
+            if xyz is None:
+                cv2.putText(canvas, 'no 3D',
+                            (ux + 10, uy + 5), 0, 0.4,
+                            (0, 200, 255), 1, cv2.LINE_AA)
+            else:
+                cv2.putText(canvas, f'({xyz[0]:.2f},{xyz[1]:.2f},{xyz[2]:.2f})',
+                            (ux + 10, uy + 5), 0, 0.4,
+                            (225, 255, 255), 1, cv2.LINE_AA)
 
             if self._debug_depth_roi and det.class_name in (
                     'button', 'door_button', 'knob'):
