@@ -421,43 +421,6 @@ def _match_individual(observed: List[Tuple[str, str]]) -> List[int]:
     return result
 
 
-def _match_individual_allowed(
-    observed: List[Tuple[str, str]],
-    allowed_ids: List[int],
-) -> List[int]:
-    """Match a restricted camera view only against explicitly allowed IDs.
-
-    This is used by the right wrist camera, whose valid physical targets are
-    ID5/6. It prevents a solitary red ID5 button from being assigned to the
-    first red button in the full-panel layout (ID1).
-    """
-
-    used_ids = set()
-    result = []
-    for observed_class, observed_color in observed:
-        candidates = [
-            target_id
-            for target_id in allowed_ids
-            if target_id not in used_ids
-            and PANEL_LAYOUT_BY_ID[target_id][0] == observed_class
-        ]
-        color_candidates = [
-            target_id
-            for target_id in candidates
-            if PANEL_LAYOUT_BY_ID[target_id][1] == observed_color
-        ]
-        if len(color_candidates) == 1:
-            target_id = color_candidates[0]
-        elif len(candidates) == 1:
-            target_id = candidates[0]
-        else:
-            target_id = -1
-        if target_id >= 0:
-            used_ids.add(target_id)
-        result.append(target_id)
-    return result
-
-
 class TargetRegistry:
     """Assign stable absolute IDs to the visible panel row."""
 
@@ -478,15 +441,10 @@ class TargetRegistry:
         )
         self._color_minimum_ratio = float(color_minimum_ratio)
         self._match_distance_thresh = float(match_distance_thresh)
-        self._allowed_ids = [int(value) for value in (allowed_ids or [])]
-        if (
-            len(set(self._allowed_ids)) != len(self._allowed_ids)
-            or any(
-                target_id not in ROW1_IDS
-                for target_id in self._allowed_ids
-            )
-        ):
-            raise ValueError("allowed_ids must be unique main-row IDs in 0..6")
+        # Backward-compatible argument only: perception always sees all targets.
+        if allowed_ids:
+            import warnings
+            warnings.warn("allowed_ids is ignored; select executor targets downstream", DeprecationWarning, stacklevel=2)
         self._has_complete_reference = False
         self._last_by_id: Dict[int, RegisteredTarget] = {}
         self._registered: List[RegisteredTarget] = []
@@ -550,10 +508,7 @@ class TargetRegistry:
             )
             for det in sorted_detections
         ]
-        if self._allowed_ids:
-            ids = _match_individual_allowed(observed, self._allowed_ids)
-        else:
-            ids = self._match_contiguous_ids(sorted_detections, observed)
+        ids = self._match_contiguous_ids(sorted_detections, observed)
         matched = [
             (target_id, det)
             for target_id, det in zip(ids, sorted_detections)

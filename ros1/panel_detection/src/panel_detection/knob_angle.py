@@ -86,10 +86,10 @@ def observe_knob(image, detection, target_id, mode, stabilizer, cfg=None):
     x1, y1, x2, y2 = map(int, detection.bbox)
     roi = image[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
     pointer = 'white_line' if mode == 1 else (
-        'red_handle' if target_id == 4 else 'white_tape')
+        'red_handle' if target_id == 3 else 'white_tape')
     angle_range = None
     if mode == 2 and target_id is not None:
-        angle_range = (180., 270.) if target_id == 4 else (0., 90.)
+        angle_range = (180., 270.) if target_id == 3 else (0., 90.)
     raw, debug = estimate_knob_angle(
         roi, binary_thresh=cfg.get('binary_thresh', 180),
         circle_mask_ratio=cfg.get('circle_mask_ratio', .85),

@@ -132,7 +132,7 @@ def test_tags_above_components_are_associated_one_to_one():
 
     assert set(assignments) == {0, 1, 2}
     assert [(item.target_id, item.forced_class) for item in assignments.values()] == [
-        (1, 'button'), (4, 'knob'), (13, 'light'),
+        (0, 'button'), (3, 'knob'), (12, 'light'),
     ]
     assert all(item.source == 'apriltag_36h11'
                for item in assignments.values())
@@ -221,7 +221,7 @@ def test_validation_tag07_assigns_board_identity_without_class_correction():
     assert detection.class_name == 'board_card'
     assert changed == []
     assert assignments[0].tag_id == 7
-    assert assignments[0].target_id == 8
+    assert assignments[0].target_id == 7
     canvas = np.zeros((180, 240, 3), dtype=np.uint8)
     draw_panel_tag_assignments(canvas, [_marker(7, 100.0)], assignments, [detection])
     assert canvas.any()

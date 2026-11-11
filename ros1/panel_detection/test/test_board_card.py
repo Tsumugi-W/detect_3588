@@ -10,7 +10,7 @@ def detection():
 def test_board_pose_includes_tag_identity_and_yolo_class():
     a = SimpleNamespace(target_id=8, tag_id=7, source='apriltag_36h11')
     p = board_card_target(detection(), a, [.1, .2, 1.], [0., 0., 0., 1.], True)
-    assert p['id'] == 8 and p['tag_id'] == 7
+    assert p['id'] == 7 and p['tag_id'] == 7
     assert p['class'] == 'board_card' and p['classification_source'] == 'yolo'
     assert p['identity_source'] == 'apriltag_36h11'
     assert p['position'] == {'x': .1, 'y': .2, 'z': 1.}
@@ -36,5 +36,5 @@ def test_invalid_depth_never_becomes_a_zero_or_nonfinite_pose():
 def test_tag_dropout_keeps_tracked_identity_and_yolo_class():
     a = SimpleNamespace(target_id=8, tag_id=7, source='apriltag_track')
     p = board_card_target(detection(), a, [0., 0., 1.], None, False)
-    assert p['id'] == 8 and p['identity_source'] == 'apriltag_track'
+    assert p['id'] == 7 and p['identity_source'] == 'apriltag_track'
     assert p['classification_source'] == 'yolo'

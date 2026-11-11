@@ -28,7 +28,7 @@ def test_shared_rules_match_previous_node_sequence_across_tag_dropout():
             assert shared[0].class_name == 'light'
             assert not assignments
         else:
-            assert assignments[0].target_id == 1
+            assert assignments[0].target_id == 0
 
 
 def test_empty_detections_and_unmatched_button():

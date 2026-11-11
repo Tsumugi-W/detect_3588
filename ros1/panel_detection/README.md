@@ -148,63 +148,22 @@ ONNX Runtime is not provided by ROS Noetic:
 python3 -m pip install --user onnxruntime
 ```
 
-## Absolute target IDs
+## Global panel identity
 
-The ROS1 node now uses the same panel-layout logic as the ROS2 package:
+ROS1 and ROS2 publish the original Tag ID on every camera: T00=0, T02=2,
+T03=3, T07=7. An untagged detection is retained with `id=null`. Layout guesses
+and arm-specific subsets never become public identities. `registry_target_ids`
+and the legacy registry `allowed_ids` argument are accepted but ignored.
 
-| ID | Class | Colour |
-|---:|---|---|
-| 1 | button | green |
-| 2 | button | red |
-| 3 | button | red |
-| 4 | knob | red |
-| 5 | knob | black |
-| 6 | button | red |
-| 7 | button | green |
+The public JSON uses schema version 2, with `camera_id`, `frame_id`, sensor
+`stamp`, `identity_valid`, `position_valid`, and `measurement_ready`. Execution
+selection and permission belong downstream; `graspable` is no longer a public
+panel field. Invalid depth leaves a 2D target with a null position.
 
-Visible button/knob detections are sorted along the physical panel axis and
-matched to a contiguous window of this layout. This means `/panel/targets`
-contains absolute IDs even when only part of the panel is visible. Show the
-camera the complete seven-target row once after startup whenever possible:
-that seeds a position cache which disambiguates a single knob or other narrow
-views. The panel-axis direction is also cached, so the row can be relocated
-after camera translation.
-
-Square/circular `light` detections on the panel row are treated as buttons to
-recover a missed button classification. Elongated indicator lights are
-excluded by their aspect ratio. Tune `registry_*` and `panel_line_*` in
-`config/panel_detection.yaml` if the camera resolution or panel scale changes.
-
-For a camera dedicated to a known physical subset, set
-`registry_target_ids`. The dual-arm launch uses `[5, 6]` for the right wrist,
-so a solitary red right-side button is ID5 rather than being matched to the
-first red button ID1. Ambiguous unknown-colour detections are not assigned.
-
-### Knob-free wrist views
-
-The row axis is normally bootstrapped from two visible knobs. The right wrist
-only ever sees the ID5/ID6 buttons and therefore contains no knob, so that
-bootstrap can never run there. Previously every frame of that view fell through
-to the cold-start path: detections were ordered by raw image `x` and matched by
-colour alone, so a colour misread, a `light` reading of a square button, or a
-mirrored camera image changed the IDs between the two arms.
-
-`button_axis_bootstrap` (default `1` whenever `registry_target_ids` is not
-empty) makes such a view fit the row from its own button-like detections. The
-same axis then drives the row filtering, the image-order sorting and the
-`light` -> `button` promotion, so both arms number the same physical targets.
-
-The full-panel detector additionally publishes its fitted row direction on
-`panel_axis_topic` (`geometry_msgs/Vector3Stamped`, latched). A restricted
-detector can adopt it with `external_panel_axis:=true`, but the published
-vector is expressed in the publishing camera's image plane, so only enable it
-when both wrist cameras share an image orientation. The local bootstrap is the
-default and needs no cross-camera assumption.
-
-Two instances can run in one ROS master by giving them different
-`detection_node_name`, output topics and `class_topic_prefix`. The visual-servo
-dual launch does this automatically, publishing `/panel/left/*` and
-`/panel/right/*` without mixing measurements from the two optical frames.
+See [PERCEPTION_API.md](../../PERCEPTION_API.md) for the full migration contract.
+Multiple camera instances may use different topic prefixes while sharing the
+same physical target IDs. The default row-axis bootstrap uses local image
+features; cross-camera image-axis sharing is disabled by default.
 
 ## Run
 

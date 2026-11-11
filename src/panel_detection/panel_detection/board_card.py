@@ -9,7 +9,7 @@ def board_card_target(detection, assignment, xyz, quaternion, orientation_valid)
                              len(quaternion) == 4 and
                              all(math.isfinite(float(v)) for v in quaternion))
     return {
-        'id': assignment.target_id if assignment is not None else None,
+        'id': assignment.tag_id if assignment is not None else None,
         'tag_id': assignment.tag_id if assignment is not None else None,
         'class': 'board_card',
         'classification_source': 'yolo',

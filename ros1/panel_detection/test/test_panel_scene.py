@@ -27,7 +27,7 @@ def test_tag02_final_class_and_stable_target_id(scene, expected):
     det=FrameDetection('knob',100.,130.,(75.,100.,125.,160.),.9)
     assignments,_=apply_panel_tag_rules([det],[marker],PanelAprilTagTracker({'scene':scene}))
     assert det.class_name == expected
-    assert assignments[0].target_id == 3
+    assert assignments[0].target_id == 2
 
 
 @pytest.mark.parametrize('cfg', [ {'scene':'typo'}, {'tag_classes':{}}, {'tag_classes':{40:'button'}}, {'tag_classes':{2:'bad'}}, {'tag_classes':{2:'knob','02':'button'}} ])

@@ -5,6 +5,7 @@ The node consumes a color image, depth registered to that color image and the
 color CameraInfo. It publishes the same JSON contract used by the ROS2
 visual-servo package on ``/panel/targets``.
 """
+from .perception_contract import panel_matches, panel_payload
 import json
 import os
 import threading
@@ -33,7 +34,6 @@ from panel_detection.position_stabilizer import PositionStabilizer
 from panel_detection.target_registry import (
     FrameDetection,
     PersistentPanelAxis,
-    TargetRegistry,
 )
 from panel_detection.panel_apriltag import (
     PanelAprilTagTracker,
@@ -179,32 +179,11 @@ class PanelDetectionNode:
             iou_threshold=float(rospy.get_param("~iou_threshold", 0.01)),
             threads=int(rospy.get_param("~onnx_threads", 8)),
         )
-        registry_target_ids = rospy.get_param("~registry_target_ids", [])
-        if not isinstance(registry_target_ids, (list, tuple)):
-            raise rospy.ROSInitException(
-                "registry_target_ids must be a YAML list"
-        )
-        self.registry_target_ids = [
-            int(value) for value in registry_target_ids
-        ]
-        try:
-            self.registry = TargetRegistry(
-                stable_frames=int(
-                    rospy.get_param("~registry_stable_frames", 15)
-                ),
-                green_hue_range=tuple(
-                    rospy.get_param("~registry_green_hue_range", [35, 85])
-                ),
-                match_distance_thresh=float(
-                    rospy.get_param("~registry_match_distance_px", 80.0)
-                ),
-                color_minimum_ratio=float(
-                    rospy.get_param("~registry_color_minimum_ratio", 0.15)
-                ),
-                allowed_ids=self.registry_target_ids,
-            )
-        except ValueError as error:
-            raise rospy.ROSInitException(str(error))
+        # Deprecated launch arguments are accepted but cannot restrict perception.
+        if rospy.get_param("~registry_target_ids", []):
+            rospy.logwarn("registry_target_ids is ignored; choose execution targets downstream")
+        self.registry_target_ids = []
+        self.camera_id = str(rospy.get_param("~camera_id", self.camera_frame))
         board_card_config = rospy.get_param("~board_card_localizer", {})
         if not isinstance(board_card_config, dict):
             raise rospy.ROSInitException(
@@ -374,7 +353,7 @@ class PanelDetectionNode:
             rospy.get_param("~panel_axis_topic", "/panel/panel_axis")
         )
         self.publish_panel_axis = bool(
-            rospy.get_param("~publish_panel_axis", True)
+            rospy.get_param("~publish_panel_axis", False)
         ) and not self.registry_target_ids
         self.panel_axis_pub = (
             rospy.Publisher(
@@ -392,7 +371,7 @@ class PanelDetectionNode:
         # button-like detections instead.
         self.allow_button_axis = bool(
             rospy.get_param(
-                "~button_axis_bootstrap", bool(self.registry_target_ids)
+                "~button_axis_bootstrap", True
             )
         )
         self.external_panel_axis = bool(
@@ -454,7 +433,7 @@ class PanelDetectionNode:
             model_path,
         )
         rospy.loginfo(
-            "panel target-ID restriction: %s",
+            "panel identity: global Tag IDs, camera subset restriction disabled: %s",
             self.registry_target_ids or "full layout 0..6",
         )
         rospy.loginfo(
@@ -609,6 +588,11 @@ class PanelDetectionNode:
             for index, assignment in panel_tag_assignments.items()
             if 0 <= index < len(detections)
         }
+        tag_source_by_object = {
+            id(detections[index]): assignment.source
+            for index, assignment in panel_tag_assignments.items()
+            if 0 <= index < len(detections)
+        }
         board_card_observations = {}
         board_card_observation = None
         board_card_tag_id = 7
@@ -672,43 +656,8 @@ class PanelDetectionNode:
             panel_axis_origin,
             panel_axis_vector,
         ) = self._select_panel_row(detections)
-        matched = dict(
-            self.registry.identify(
-                panel_detections,
-                color,
-                axis_origin=panel_axis_origin,
-                axis_vector=panel_axis_vector,
-            )
-        )
-        # Lower row (IDs 8..10).  Only detections the main row did NOT use are
-        # candidates, so main-row IDs 0..6 can never be stolen.  "light" is
-        # included because round panel buttons are frequently detected as light.
-        main_row_used = {id(detection) for detection in matched.values()}
-        second_row_candidates = [
-            detection
-            for detection in detections
-            if id(detection) not in main_row_used
-            and detection.class_name in ("button", "knob", "light")
-        ]
-        if second_row_candidates:
-            diag = self.registry.classify_lower_row(second_row_candidates, color)
-            rospy.loginfo_throttle(
-                5.0,
-                "lower-row candidates (class,colour): %s",
-                [(class_name, colour) for _, class_name, colour in diag],
-            )
-            for target_id, detection in self.registry.identify_second_row(
-                second_row_candidates, color
-            ):
-                if target_id not in matched:
-                    matched[target_id] = detection
-            lower_ids = sorted(
-                target_id for target_id in (8, 9, 10) if target_id in matched
-            )
-            if lower_ids:
-                rospy.loginfo_throttle(
-                    2.0, "Lower-row targets matched: %s", lower_ids
-                )
+        # Identity does not depend on a camera's view or an executor's arm.
+        matched = dict(panel_matches(detections, panel_tag_assignments))
 
         targets = []
         valid_depths = []
@@ -730,40 +679,37 @@ class PanelDetectionNode:
                 point = np.asarray(observation["position"], dtype=np.float64)
             else:
                 point = self._point_from_detection(detection, depth, info)
-            if point is None:
-                continue
             matched_points[target_id] = point
-            position_measurements.append(
-                (target_id, detection.center, point)
-            )
+            if target_id >= 0 and point is not None:
+                position_measurements.append((target_id, detection.center, point))
         stable_points = self.position_stabilizer.update(
             position_measurements, time.time()
         )
         active_angle_ids = [
             target_id
             for target_id, detection in matched.items()
-            if self._should_estimate_angle(target_id, detection)
+            if target_id >= 0 and self._should_estimate_angle(target_id, detection)
         ]
         self.knob_angle_stabilizer.prune(active_angle_ids)
         for target_id, detection in sorted(matched.items()):
-            if target_id not in matched_points:
-                continue
-            point = np.asarray(
-                stable_points.get(target_id, matched_points[target_id]),
-                dtype=np.float64,
-            )
-            valid_depths.append(point[2])
+            current_point = matched_points.get(target_id)
+            point = (np.asarray(stable_points.get(target_id, current_point), dtype=np.float64)
+                     if current_point is not None else None)
+            if point is not None:
+                valid_depths.append(point[2])
             tag_id = tag_id_by_object.get(id(detection))
             output_id = (int(tag_id)) if tag_id is not None else None
             target = {
                 "id": output_id,
                 "class": detection.class_name,
                 "tag_id": tag_id,
-                "position": {
+                "identity_source": tag_source_by_object.get(id(detection)),
+                "position": ({
                     "x": round(float(point[0]), 5),
                     "y": round(float(point[1]), 5),
                     "z": round(float(point[2]), 5),
-                },
+                } if point is not None else None),
+                "bbox": [float(v) for v in detection.bbox],
                 "orientation": {
                     "x": 0.0,
                     "y": 0.0,
@@ -785,10 +731,13 @@ class PanelDetectionNode:
                     color, target_id, detection
                 )
                 mode_0_90 = self.knob_angle_constraint_mode == 1
-                if mode_0_90:
+                if mode_0_90 and target_id >= 0:
                     output_angle = self.knob_angle_stabilizer.update(
                         target_id, raw_angle
                     )
+                elif mode_0_90 and raw_angle is not None:
+                    line_angle = float(raw_angle) % 180.0
+                    output_angle = 0 if min(line_angle, 180.0-line_angle) <= 45 else 90
                 else:
                     output_angle = raw_angle
                 if output_angle is not None:
@@ -799,7 +748,7 @@ class PanelDetectionNode:
                     angle_entry = {
                         "id": output_id,
                         "class": detection.class_name,
-                        "position": dict(target["position"]),
+                        "position": dict(target["position"]) if target["position"] is not None else None,
                         "angle": output_angle,
                         "confidence": round(float(detection.confidence), 4),
                     }
@@ -835,6 +784,7 @@ class PanelDetectionNode:
                 "id": output_id,
                 "class": detection.class_name,
                 "tag_id": tag_id,
+                "identity_source": tag_source_by_object.get(id(detection)),
                 "position": {
                     "x": round(float(point[0]), 5),
                     "y": round(float(point[1]), 5),
@@ -914,11 +864,7 @@ class PanelDetectionNode:
         ]
 
         if targets:
-            payload = {
-                "stamp": color_msg.header.stamp.to_sec(),
-                "frame_id": color_msg.header.frame_id or self.camera_frame,
-                "targets": targets,
-            }
+            payload = panel_payload(color_msg.header.stamp.to_sec(), color_msg.header.frame_id or self.camera_frame, targets, getattr(self, 'camera_id', None))
             self.targets_pub.publish(
                 String(data=json.dumps(payload, ensure_ascii=False))
             )
@@ -937,6 +883,9 @@ class PanelDetectionNode:
                 )
             self._publish_status("registered")
         else:
+            self.targets_pub.publish(String(data=json.dumps(panel_payload(
+                color_msg.header.stamp.to_sec(), color_msg.header.frame_id or self.camera_frame,
+                [], getattr(self, 'camera_id', None)), ensure_ascii=False)))
             self._publish_status("no_targets")
         if knob_angles:
             self.knob_angle_pub.publish(
@@ -946,6 +895,7 @@ class PanelDetectionNode:
                             "stamp": color_msg.header.stamp.to_sec(),
                             "frame_id": color_msg.header.frame_id
                             or self.camera_frame,
+                            "camera_id": getattr(self, 'camera_id', None) or color_msg.header.frame_id or self.camera_frame,
                             "knob_angles": knob_angles,
                         },
                         ensure_ascii=False,
@@ -979,7 +929,7 @@ class PanelDetectionNode:
         if x2 <= x1 or y2 <= y1:
             return None
         mode_0_90 = self.knob_angle_constraint_mode == 1
-        # ID 4 is the red long-handle knob in every mode.  In discrete mode
+        # Global Tag 3 is the red long-handle knob in the validation scene.  In discrete mode
         # its directional red-handle estimate is subsequently reduced to the
         # stable, unoriented 0/90 state by DiscreteAngleStabilizer.  This keeps
         # the ROS2 red-handle detector active while preserving the ROS1
@@ -991,7 +941,7 @@ class PanelDetectionNode:
         else:
             pointer_color = "white_tape"
         angle_range = None
-        if self.knob_angle_constraint_mode == 2:
+        if self.knob_angle_constraint_mode == 2 and target_id >= 0:
             angle_range = (
                 (180.0, 270.0)
                 if int(target_id) == 3
@@ -1012,8 +962,7 @@ class PanelDetectionNode:
         cached direction is reused and its parallel line is relocated from the
         currently visible detections.
 
-        A restricted wrist view (``registry_target_ids`` set, for example the
-        right arm with the ID5/ID6 buttons) may never contain a knob at all, so
+        A partial camera view may never contain a knob at all, so
         ``button_axis_bootstrap`` lets it fit the row from its own button-like
         detections instead.  Without an axis that view would be ordered by raw
         image x, which is what made its IDs unstable.

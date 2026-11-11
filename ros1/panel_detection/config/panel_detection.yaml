@@ -24,23 +24,12 @@ registry_stable_frames: 15
 registry_match_distance_px: 80.0
 registry_green_hue_range: [35, 85]
 registry_color_minimum_ratio: 0.15
-# Empty uses the full seven-target layout. A wrist camera dedicated to a
-# physical subset can override this (the dual-arm launch uses [5, 6] on right).
-registry_target_ids: []
-
-# Panel-row axis handling.  The defaults are derived per node and are normally
-# left unset:
-#   button_axis_bootstrap  defaults to 1 when registry_target_ids is not empty.
-#                          The right wrist only sees the ID5/ID6 buttons, so it
-#                          has no knob to anchor the row and must fit the row
-#                          from its own detections.  Leave unset.
-#   publish_panel_axis     the full-panel detector publishes its fitted row
-#                          direction on panel_axis_topic (latched, default 1).
-#   panel_axis_topic       shared row-direction topic, default /panel/panel_axis.
-#   external_panel_axis    a restricted detector may adopt the shared direction
-#                          (default 0).  Only valid when both wrist cameras have
-#                          the same image orientation; the local bootstrap above
-#                          is preferred.
+# Global identities follow decoded Tag IDs on every camera. No arm-specific subset.
+camera_id: ""  # Empty falls back to the message's optical frame_id.
+button_axis_bootstrap: true
+publish_panel_axis: false
+# Image-plane directions are local to each camera; sharing is opt-in.
+external_panel_axis: false
 
 # Panel-row extraction. Two visible knobs bootstrap the axis; afterwards its
 # direction is cached so that a translated/narrow camera view still works.

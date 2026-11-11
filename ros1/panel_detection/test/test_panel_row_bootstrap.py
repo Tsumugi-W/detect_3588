@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Regression tests for the knob-free panel-row bootstrap.
 
-The right wrist camera only ever sees the ID5/ID6 buttons, so the two-knob row
-fit can never run there and the detector used to fall back to sorting by image
-x.  These tests pin the button-based bootstrap that gives that view a real
-panel axis.
+A partial camera view may contain no knobs. These tests verify that local
+button geometry can bootstrap its image axis without an executor assignment.
 """
 
 import ast

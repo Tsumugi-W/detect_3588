@@ -14,6 +14,7 @@ ROS2 面板检测节点
 """
 import os
 import math
+from .perception_contract import panel_matches, panel_payload
 import json
 import time
 import threading
@@ -1919,13 +1920,10 @@ class PanelDetectionNode(Node):
                 'board_card': summary,
             })
         msg = String()
-        msg.data = json.dumps({
-            'stamp': stamp.sec + stamp.nanosec * 1e-9,
-            'frame_id': (self._topic_color_frame_id if self._use_topic
-                         else 'camera_color_optical_frame'),
-            'targets': targets,
-        }, ensure_ascii=False)
+        msg.data = json.dumps(panel_payload(stamp.sec + stamp.nanosec * 1e-9, self._topic_color_frame_id if self._use_topic
+                         else 'camera_color_optical_frame', targets, self.cfg.get('camera_id')), ensure_ascii=False)
         self._board_cards_pub.publish(msg)
+        details['__targets__'] = targets
         return details
 
     def _detection_callback(self):
@@ -2023,9 +2021,19 @@ class PanelDetectionNode(Node):
                         tipLength=0.3)
 
         if not xyxy_list:
-            self._publish_board_cards([], {}, depth_image, deproj_intrin,
+            details = self._publish_board_cards([], {}, depth_image, deproj_intrin,
                                       color_stamp if color_stamp is not None
-                                      else self.get_clock().now().to_msg())
+                                      else self.get_clock().now().to_msg(),
+                                      color_image=color_image, canvas=canvas,
+                                      panel_tag_markers=panel_tag_markers)
+            if self._targets_pub is not None:
+                stamp = color_stamp if color_stamp is not None else self.get_clock().now().to_msg()
+                message = String()
+                message.data = json.dumps(panel_payload(
+                    stamp.sec + stamp.nanosec * 1e-9,
+                    self._topic_color_frame_id if self._use_topic else 'camera_color_optical_frame',
+                    details.get('__targets__', []), self.cfg.get('camera_id')), ensure_ascii=False)
+                self._targets_pub.publish(message)
             if self._panel_tags_enabled:
                 self._panel_tag_tracker.update([], panel_tag_markers)
                 draw_panel_tag_assignments(
@@ -2178,13 +2186,9 @@ class PanelDetectionNode(Node):
                 }
                 if self._targets_pub is not None:
                     msg = String()
-                    msg.data = json.dumps({
-                        'stamp': stamp.sec + stamp.nanosec * 1e-9,
-                        'frame_id': (self._topic_color_frame_id
+                    msg.data = json.dumps(panel_payload(stamp.sec + stamp.nanosec * 1e-9, self._topic_color_frame_id
                                      if self._use_topic else
-                                     'camera_color_optical_frame'),
-                        'targets': [target],
-                    }, ensure_ascii=False)
+                                     'camera_color_optical_frame', [target], self.cfg.get('camera_id')), ensure_ascii=False)
                     self._targets_pub.publish(msg)
                 published_state = True
             self._update_display_frame(canvas, color_stamp)
@@ -2359,26 +2363,9 @@ class PanelDetectionNode(Node):
                                     if d.class_name in ('button', 'knob')]
 
         if self._process_panel_controls:
-            direct_matches = [
-                (assignment.target_id, frame_detections[det_index])
-                for det_index, assignment in panel_tag_assignments.items()
-            ]
-            fallback_detections = [
-                detection for detection in panel_detections
-                if id(detection) not in tagged_detection_ids
-            ]
-            fallback_matches = self._registry.identify(
-                fallback_detections, color_image,
-                axis_origin=panel_axis_origin,
-                axis_vector=panel_axis_vector) if (
-                    not self._panel_tags_enabled or self._panel_layout_fallback) else []
-            direct_target_ids = {target_id for target_id, _ in direct_matches}
-            fallback_matches = [
-                item for item in fallback_matches
-                if item[0] not in direct_target_ids
-            ]
-            matched = sorted(
-                direct_matches + fallback_matches, key=lambda item: item[0])
+            # Public IDs come only from Tags. Every untagged panel detection
+            # is still processed, using a private frame-local tracking key.
+            matched = panel_matches(frame_detections, panel_tag_assignments)
 
         tag_assignment_by_detection = {
             id(frame_detections[det_index]): assignment
@@ -2408,20 +2395,20 @@ class PanelDetectionNode(Node):
                 det, filtered_depth, deproj_intrin, self._depth_scale,
                 knob_quantile=self._knob_depth_quantile,
                 knob_offset_m=self._knob_depth_offset_m)
-            matched_xyz[target_id] = xyz
-            position_measurements.append((target_id, (ux, uy), xyz))
+            matched_xyz[target_id] = xyz if _valid_point_3d(xyz) else None
+            if target_id >= 0 and _valid_point_3d(xyz):
+                position_measurements.append((target_id, (ux, uy), xyz))
 
         stable_xyz = self._position_stabilizer.update(position_measurements, time.time())
         active_knob_ids = [
             target_id for target_id, det in matched
-            if det.class_name == self._angle_knob_class
+            if target_id >= 0 and det.class_name == self._angle_knob_class
         ]
         self._knob_angle_stabilizer.prune(active_knob_ids)
 
         for target_id, det in matched:
-            xyz = stable_xyz.get(target_id, matched_xyz.get(target_id))
-            if xyz is None:
-                continue
+            current_xyz = matched_xyz.get(target_id)
+            xyz = stable_xyz.get(target_id, current_xyz) if current_xyz is not None else None
             matched_xyz[target_id] = xyz
             board_detail = {}
             board_summary = {}
@@ -2430,7 +2417,7 @@ class PanelDetectionNode(Node):
                 board_summary = board_detail.get('board_card', {})
                 state = board_summary.get('state')
                 if state not in ('empty', 'inserted'):
-                    continue
+                    xyz = None  # retain the recognized card while geometry is unconfirmed
             tag_assignment = tag_assignment_by_detection.get(id(det))
 
             target_info = {
@@ -2442,9 +2429,10 @@ class PanelDetectionNode(Node):
                     'yolo' if det.class_name == 'board_card' else
                     tag_assignment.source
                     if tag_assignment is not None else 'yolo_layout'),
-                'position': {'x': round(xyz[0], 4),
-                             'y': round(xyz[1], 4),
-                             'z': round(xyz[2], 4)},
+                'position': ({'x': round(float(xyz[0]), 4),
+                              'y': round(float(xyz[1]), 4),
+                              'z': round(float(xyz[2]), 4)} if xyz is not None else None),
+                'bbox': [float(v) for v in det.bbox],
                 'orientation': {'x': quat[0], 'y': quat[1],
                                 'z': quat[2], 'w': quat[3]},
                 'confidence': round(det.confidence, 3),
@@ -2461,7 +2449,7 @@ class PanelDetectionNode(Node):
             targets_output.append(target_info)
 
             # 兼容旧话题；空槽位不是可抓取板卡，不发布 board_card 位姿
-            if not (det.class_name == 'board_card' and state == 'empty'):
+            if xyz is not None and not (det.class_name == 'board_card' and state == 'empty'):
                 _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, quat)
 
         # Publish exactly one board-card state target per frame.  The T07
@@ -2528,13 +2516,15 @@ class PanelDetectionNode(Node):
             for det in frame_detections:
                 if det.class_name != self._angle_knob_class:
                     continue
-                target_id = numbered.get(id(det))
+                tracking_key = numbered.get(id(det))
+                assignment = tag_assignment_by_detection.get(id(det))
+                target_id = assignment.tag_id if assignment is not None else None
                 observation = observe_knob(
                     color_image, det, target_id, self._angle_constraint_mode,
                     self._knob_angle_stabilizer, self.cfg.get('knob_angle', {}))
                 assignment = tag_assignment_by_detection.get(id(det))
                 observation['tag_id'] = assignment.tag_id if assignment else None
-                xyz = matched_xyz.get(target_id)
+                xyz = matched_xyz.get(tracking_key)
                 observation['position_valid'] = bool(_valid_point_3d(xyz)) if xyz is not None else False
                 observation['position'] = (
                     {axis: round(float(v), 4) for axis, v in zip('xyz', xyz)}
@@ -2549,6 +2539,8 @@ class PanelDetectionNode(Node):
             msg = String()
             msg.data = json.dumps({
                 'stamp': stamp.sec + stamp.nanosec * 1e-9,
+                'frame_id': (self._topic_color_frame_id if self._use_topic else 'camera_color_optical_frame'),
+                'camera_id': self.cfg.get('camera_id') or (self._topic_color_frame_id if self._use_topic else 'camera_color_optical_frame'),
                 'knobs': knob_observations,
             }, ensure_ascii=False)
             self._knob_observations_pub.publish(msg)
@@ -3169,20 +3161,14 @@ class PanelDetectionNode(Node):
             _publish_pose(self._pose_pubs.get(det.class_name), stamp, xyz, pose_quat)
 
         # 发布目标结果：面板模式保持原编号格式；对象模式只包含对应类别。
-        if self._process_panel_controls and targets_output and self._targets_pub is not None:
+        if self._process_panel_controls and self._targets_pub is not None:
             msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp.sec + stamp.nanosec * 1e-9,
-                'targets': targets_output,
-            }, ensure_ascii=False)
+            msg.data = json.dumps(panel_payload(stamp.sec + stamp.nanosec * 1e-9, (self._topic_color_frame_id if self._use_topic else 'camera_color_optical_frame'), targets_output, self.cfg.get('camera_id')), ensure_ascii=False)
             self._targets_pub.publish(msg)
         elif (not self._process_panel_controls and object_targets_output and
               self._targets_pub is not None):
             msg = String()
-            msg.data = json.dumps({
-                'stamp': stamp.sec + stamp.nanosec * 1e-9,
-                'targets': object_targets_output,
-            }, ensure_ascii=False)
+            msg.data = json.dumps(panel_payload(stamp.sec + stamp.nanosec * 1e-9, (self._topic_color_frame_id if self._use_topic else 'camera_color_optical_frame'), object_targets_output, self.cfg.get('camera_id')), ensure_ascii=False)
             self._targets_pub.publish(msg)
 
         stamp_value = stamp.sec + stamp.nanosec * 1e-9
@@ -3233,7 +3219,8 @@ class PanelDetectionNode(Node):
             uy = int(det.center_y)
             cv2.circle(canvas, (ux, uy), 4, (255, 255, 255), -1)
 
-            cv2.putText(canvas, f'#{target_id}',
+            label = f'#{target_id}' if target_id >= 0 else 'unassigned'
+            cv2.putText(canvas, label,
                         (ux - 10, uy - 15), 0, 0.6,
                         (0, 255, 0), 2, cv2.LINE_AA)
 

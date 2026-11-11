@@ -283,7 +283,7 @@ class PanelAprilTagTracker:
         return PanelTagAssignment(
             detection_index=detection_index,
             tag_id=int(tag_id),
-            target_id=int(tag_id) + 1,
+            target_id=int(tag_id),
             forced_class=self.tag_classes[tag_id],
             source=source,
             marker=marker,

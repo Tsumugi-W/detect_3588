@@ -1,6 +1,14 @@
 from collections import deque
 
-from panel_detection.panel_detect_node import _pop_synced_frame_pair
+# This synchronization helper is pure Python; load the real function without
+# importing ROS transport or camera drivers in a local unit test.
+import ast
+from pathlib import Path
+import panel_detection
+_source = Path(panel_detection.__file__).parent / 'panel_detect_node.py'
+_tree = ast.parse(_source.read_text('utf-8'))
+_function = next(n for n in _tree.body if isinstance(n, ast.FunctionDef) and n.name == '_pop_synced_frame_pair')
+exec(compile(ast.Module(body=[_function], type_ignores=[]), str(_source), 'exec'))
 
 
 def test_topic_sync_drops_unpaired_frames_and_returns_matching_cycle():

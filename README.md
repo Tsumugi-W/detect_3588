@@ -202,7 +202,7 @@ ros2 launch panel_detection camera.launch.py
 ros2 launch panel_detection panel_controls.launch.py
 ```
 
-启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 同时运行 YOLO 和 tag36h11 检测，默认使用验证场配置：T02/T03 对应旋钮，T00/T01/T04/T05/T06 对应按钮，T07 仅给 YOLO 板卡关联编号 8。板卡类别始终来自 YOLO；验证场默认关闭旧布局编号回退。`valve_detection.launch.py` 直接发布阀门结果；`fastener_detection.launch.py` 会对同一安装面的螺栓/螺母建立局部 4 槽位编号。按 `q` 或 `ESC` 退出。
+启动后检测节点会弹出可视化窗口。`panel_controls.launch.py` 同时运行 YOLO 和 tag36h11 检测，默认使用验证场配置：T02/T03 对应旋钮，T00/T01/T04/T05/T06 对应按钮，T07 仅给 YOLO 板卡关联编号 7。板卡类别始终来自 YOLO；验证场默认关闭旧布局编号回退。`valve_detection.launch.py` 直接发布阀门结果；`fastener_detection.launch.py` 会对同一安装面的螺栓/螺母建立局部 4 槽位编号。按 `q` 或 `ESC` 退出。
 
 ## 启动方式与参数配置
 
@@ -396,9 +396,9 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 
 | Tag ID | 验证场类别 | 关联规则 | 下游目标编号 |
 |--------|------------|----------|--------------|
-| 00、01、04、05、06 | `button` | 成功关联后修正类别 | Tag ID + 1 |
-| 02、03 | `knob` | 成功关联后修正类别 | 3、4 |
-| 07 | `board_card` | 只关联 YOLO 板卡，不修改任何目标类别 | 8 |
+| 00、01、04、05、06 | `button` | 成功关联后修正类别 | 原始 Tag ID |
+| 02、03 | `knob` | 成功关联后修正类别 | 2、3 |
+| 07 | `board_card` | 只关联 YOLO 板卡，不修改任何目标类别 | 7 |
 | 08–39 | — | 不参与验证场关联 | — |
 
 测试场 `test_site` 保留旧映射：00/01/02/05/06 为按钮，03/04 为旋钮，07–39 为灯。
@@ -416,11 +416,15 @@ echo "source ~/ros2_ws/install/setup.bash" >> ~/.bashrc
 不影响 `door_button`、`knob`、`board_card` 或其他任务模式；`use_panel_tags:=false` 时仍保留
 旧的无 Tag 分类和布局回退行为。
 
-验证场默认关闭布局编号回退；测试场开启。关闭 Tag 识别时可使用旧布局编号流程。板卡不参与按钮/旋钮的行布局拟合和回退编号。可视化中 `Txx` 是原始 Tag ID，`#n` 是发布给下游的目标 ID，连线表示 Tag 与元器件的关联。使用无 Tag 的旧面板时可启动：
+公开编号在所有场景中统一为原始Tag ID。关闭Tag识别时仍保留检测，但编号为null；旧布局推断不再作为公开编号。板卡不参与按钮/旋钮的行布局拟合和回退编号。可视化中 `Txx` 是原始 Tag ID，`#n` 是发布给下游的目标 ID，连线表示 Tag 与元器件的关联。使用无 Tag 的旧面板时可启动：
 
 ```bash
 ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 ```
+
+## 识别接口 v2
+
+面板编号在所有相机上统一为 `id = tag_id`，未关联目标为null。识别端不限制左右臂范围，也不授权执行。顶层包含 `schema_version: 2`、`camera_id`、`frame_id`、传感器 `stamp`；每个目标提供身份与测量有效性。接口不再公开 `graspable`。详细迁移规则见 [PERCEPTION_API.md](PERCEPTION_API.md)。以下示例的可选字段可能省略。
 
 ## 发布话题
 
@@ -431,7 +435,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
   "stamp": 1716192000.123,
   "targets": [
     {
-      "id": 1,
+      "id": 0,
       "class": "button",
       "tag_id": 0,
       "classification_source": "apriltag_36h11",
@@ -441,7 +445,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
       "confidence": 0.92
     },
     {
-      "id": 4,
+      "id": 3,
       "class": "knob",
       "tag_id": 3,
       "classification_source": "apriltag_track",
@@ -454,7 +458,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 }
 ```
 
-位置单位：**米 (m)**，相机坐标系。`tag_id` 为成功关联的原始 Tag 编号，无 Tag 回退时为 `null`。`classification_source` 对原有元件为 `apriltag_36h11`、`apriltag_track` 或 `yolo_layout`。板卡固定为 `yolo`，关联来源另见 `identity_source`；只有已关联编号且深度有效的板卡进入此话题。板卡位姿有效性字段与 `/panel/board_cards` 一致。
+位置单位：**米 (m)**，相机坐标系。`tag_id` 为成功关联的原始 Tag 编号，无 Tag 回退时为 `null`。`classification_source` 对原有元件为 `apriltag_36h11`、`apriltag_track` 或 `yolo_layout`。板卡固定为 `yolo`，关联来源另见 `identity_source`；目标不因缺少编号或深度而隐藏；深度无效时position为null。板卡位姿有效性字段与 `/panel/board_cards` 一致。
 
 ### /panel/board_cards (String, JSON) — 板卡检测与位姿
 
@@ -467,7 +471,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
   "frame_id": "camera_color_optical_frame",
   "targets": [
     {
-      "id": 8,
+      "id": 7,
       "tag_id": 7,
       "class": "board_card",
       "classification_source": "yolo",
@@ -486,9 +490,9 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 
 | 字段 / 情况 | 含义 |
 |-------------|------|
-| `id` / `tag_id` | 验证场 T07 对应编号 8；无有效关联时均为 null |
+| `id` / `tag_id` | 验证场 T07 对应编号 7；无有效关联时均为 null |
 | `classification_source` | 固定 `yolo`；有无 Tag 均不改板卡类别 |
-| `identity_source` | 直接 Tag 为 `apriltag_36h11`，短暂丢失跟踪为 `apriltag_track`，无关联为 null |
+| `identity_source` | 直接 Tag 为 `apriltag_36h11`，短暂丢失跟踪为 `apriltag_track`，无关联为 `unassigned` |
 | `bbox` | 原图像素坐标 `[x1, y1, x2, y2]` |
 | `position` | 深度反投影得到的检测框中心位置，单位米，坐标系由顶层 `frame_id` 指定 |
 | `position_valid: false` | 有效深度缺失，`position` 为 null，不能作为有效位置使用 |
@@ -498,7 +502,7 @@ ros2 launch panel_detection panel_controls.launch.py use_panel_tags:=false
 
 没有 Tag 关联仍发布板卡框和有效位姿；超过跟踪期限后编号清空，不会改为按钮或灯。
 位置与姿态独立标明有效性：有效深度缺失时，之前获得的面板法向仍可能有效。
-有编号且深度有效的板卡同时进入 `/panel/targets`。
+公开主话题保留无编号或无有效深度的二维识别结果，并标明测量有效性。
 开启 `publish_legacy_topics:=true` 后另发 `/panel/board_card_pose`（PoseStamped）；
 该兼容话题没有身份和有效性字段，多目标或姿态有效性判断应使用 JSON 话题。
 
@@ -541,7 +545,7 @@ ros2 launch panel_detection panel_controls.launch.py publish_legacy_topics:=true
   "stamp": 1716192000.123,
   "knob_angles": [
     {
-      "id": 4,
+      "id": 3,
       "position": {"x": 0.32, "y": -0.04, "z": 0.85},
       "angle": 171.5,
       "confidence": 0.92

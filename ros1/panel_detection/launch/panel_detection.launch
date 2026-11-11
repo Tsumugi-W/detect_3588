@@ -11,6 +11,7 @@
   <arg name="knob_angle_topic" default="/panel/knob_angles"/>
   <arg name="button_topic" default="/panel/buttons"/>
   <arg name="debug_image_topic" default="/panel/debug_image"/>
+  <!-- Deprecated, ignored: target selection belongs to the downstream executor. -->
   <arg name="registry_target_ids" default="[]"/>
   <arg name="class_topic_prefix" default=""/>
   <arg name="max_processing_fps" default="0"/>
@@ -46,9 +47,6 @@
     <param name="knob_angle_topic" value="$(arg knob_angle_topic)"/>
     <param name="button_topic" value="$(arg button_topic)"/>
     <param name="debug_image_topic" value="$(arg debug_image_topic)"/>
-    <rosparam param="registry_target_ids" subst_value="true">
-      $(arg registry_target_ids)
-    </rosparam>
     <param name="class_topic_prefix" value="$(arg class_topic_prefix)"/>
   </node>
 </launch>
